@@ -13,6 +13,50 @@ namespace {
 constexpr size_t kMaxQueuedLines = 384;
 constexpr size_t kMaxLogChars = 48000;
 
+class Handle {
+public:
+    Handle() = default;
+    explicit Handle(HANDLE h) : h_(h) {}
+    ~Handle() { reset(); }
+
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+
+    Handle(Handle&& other) noexcept : h_(other.h_) { other.h_ = nullptr; }
+    Handle& operator=(Handle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            h_ = other.h_;
+            other.h_ = nullptr;
+        }
+        return *this;
+    }
+
+    HANDLE get() const { return h_; }
+    explicit operator bool() const { return h_ != nullptr; }
+
+    HANDLE release() {
+        HANDLE tmp = h_;
+        h_ = nullptr;
+        return tmp;
+    }
+
+    void reset(HANDLE h = nullptr) {
+        if (h_) {
+            CloseHandle(h_);
+        }
+        h_ = h;
+    }
+
+private:
+    HANDLE h_{nullptr};
+};
+
+std::wstring NormalizeForDisplay(const std::wstring& text);
+std::vector<std::wstring> SplitLogLines(const std::wstring& text);
+void TrimLogWindow();
+bool ContainsInsensitive(const std::string& haystack, const std::string& needle);
+
 struct PartitionOption {
     bool flash{true};
     bool erase{true};
@@ -238,6 +282,73 @@ bool FileExistsA(const std::string& path) {
     }
     const DWORD attr = GetFileAttributesA(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring NormalizeForDisplay(const std::wstring& text) {
+    std::wstring out;
+    out.reserve(text.size());
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        const wchar_t ch = text[i];
+        if (ch == L'\r') {
+            if (i + 1 < text.size() && text[i + 1] == L'\n') {
+                continue;
+            }
+            out.push_back(L'\n');
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    if (text.empty()) {
+        return lines;
+    }
+
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t end = text.find(L'\n', start);
+        std::wstring line = (end == std::wstring::npos) ? text.substr(start) : text.substr(start, end - start);
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        lines.push_back(std::move(line));
+        if (end == std::wstring::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return lines;
+}
+
+bool ContainsInsensitive(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    if (haystack.empty() || haystack.size() < needle.size()) {
+        return false;
+    }
+
+    auto lower = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                          [&](char a, char b) { return lower(static_cast<unsigned char>(a)) == lower(static_cast<unsigned char>(b)); });
+    return it != haystack.end();
+}
+
+void TrimLogWindow() {
+    if (!hLog) {
+        return;
+    }
+    const int len = GetWindowTextLengthW(hLog);
+    if (len <= static_cast<int>(kMaxLogChars)) {
+        return;
+    }
+    const int removeCount = len - static_cast<int>(kMaxLogChars);
+    SendMessageW(hLog, EM_SETSEL, 0, removeCount);
+    SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
 }
 
 std::string RomDir() {
