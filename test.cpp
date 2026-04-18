@@ -579,7 +579,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         };
 
         hLblTitle = MkCtrl(L"STATIC", L"a05bd フラッシャー", 0, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
-        hLblSub   = MkCtrl(L"STATIC", L"端末確認と書き込みを整理した一体型ツール", 0, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
+        hLblSub   = MkCtrl(L"STATIC", L"簡易書き込みツール", 0, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
         hLblStatus = MkCtrl(L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
         hLblHint   = MkCtrl(L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = MkCtrl(L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
@@ -750,11 +750,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UpdateStatusUI(L"検証完了");
                 UpdateDeviceUI(L"確認済み");
                 UpdateHintUI(L"書き込みを開始できます。");
-                MessageBoxW(hwnd, L"端末を確認しました。unlock も確認済みです。", L"確認完了", MB_ICONINFORMATION);
+                MessageBoxW(hwnd, L"端末を確認しました。unlocked も確認済みです。", L"確認完了", MB_ICONINFORMATION);
             } else {
                 EnableWindow(hBtnFlash, FALSE);
                 UpdateStatusUI(L"検証失敗");
-                UpdateHintUI(L"端末が見つからないか、unlock 条件を満たしていません。");
+                UpdateHintUI(L"端末が見つからないか、条件を満たしていません。");
                 if (!g_Unlocked) {
                     MessageBoxW(hwnd, L"先にアンロックをしてください！", L"アンロックが必要です", MB_ICONWARNING);
                 } else {
