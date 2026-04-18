@@ -659,20 +659,20 @@ void FlashThread(uint32_t token) {
         return;
     }
 
-    const auto steps = BuildFlashSteps();
-    for (const auto& step : steps) {
-        if (step.asset && !FileExistsA(AssetPath(step.asset))) {
-            QueueLog(token, L"エラー: 画像ファイルが見つかりません。");
-            QueueLog(token, L"不足: " + ToWide(AssetPath(step.asset)));
-            QueueDone(token, false, true);
-            return;
-        }
-    }
+    std::string iniPath = WideToAnsi(ModuleDirW() + L"\\option.ini");
+    auto GetOpt = [&](const char* key) {
+        if (!FileExistsA(iniPath)) return true;
+        return GetPrivateProfileIntA("Partitions", key, 1, iniPath.c_str()) != 0;
+    };
 
-    QueueProgress(token, 0, static_cast<WORD>(steps.size() + 1));
+    const auto steps = BuildFlashSteps();
+    bool doReboot = GetOpt("reboot");
+
+    int totalSteps = static_cast<int>(steps.size()) + (doReboot ? 1 : 0);
+    QueueProgress(token, 0, static_cast<WORD>(totalSteps));
 
     for (size_t i = 0; i < steps.size(); ++i) {
-        std::wstring prefix = std::to_wstring(i) + L"/" + std::to_wstring(steps.size() + 1) + L"  ";
+        std::wstring prefix = std::to_wstring(i) + L"/" + std::to_wstring(totalSteps) + L"  ";
         QueueLog(token, prefix + steps[i].desc);
         auto r = Exec(steps[i].cmd);
         if (!r.launchError.empty()) {
@@ -689,28 +689,32 @@ void FlashThread(uint32_t token) {
             QueueDone(token, false, true);
             return;
         }
-        QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(steps.size() + 1));
+        QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(totalSteps));
     }
 
-    std::wstring finalPrefix = std::to_wstring(steps.size()) + L"/" + std::to_wstring(steps.size() + 1) + L"  ";
-    QueueLog(token, finalPrefix + L"最終処理: reboot-recovery");
-    auto end = Exec(FB("oem reboot-recovery"));
-    if (!end.launchError.empty()) {
-        QueueLog(token, L"失敗  起動エラー");
-        QueueLog(token, L"原因: " + end.launchError);
-        QueueDone(token, false, true);
-        return;
-    }
-    if (end.exitCode != 0) {
-        QueueLog(token, L"失敗  終了コード=" + std::to_wstring(end.exitCode));
-        if (!end.output.empty()) {
-            QueueLog(token, L"出力: " + ToWide(end.output));
+    if (doReboot) {
+        std::wstring finalPrefix = std::to_wstring(steps.size()) + L"/" + std::to_wstring(totalSteps) + L"  ";
+        QueueLog(token, finalPrefix + L"最終処理: reboot-recovery");
+        auto end = Exec(FB("oem reboot-recovery"));
+        if (!end.launchError.empty()) {
+            QueueLog(token, L"失敗  起動エラー");
+            QueueLog(token, L"原因: " + end.launchError);
+            QueueDone(token, false, true);
+            return;
         }
-        QueueDone(token, false, true);
-        return;
+        if (end.exitCode != 0) {
+            QueueLog(token, L"失敗  終了コード=" + std::to_wstring(end.exitCode));
+            if (!end.output.empty()) {
+                QueueLog(token, L"出力: " + ToWide(end.output));
+            }
+            QueueDone(token, false, true);
+            return;
+        }
+        QueueProgress(token, static_cast<WORD>(totalSteps), static_cast<WORD>(totalSteps));
+    } else {
+        QueueLog(token, L"最終処理: スキップされました (option.ini)");
     }
 
-    QueueProgress(token, static_cast<WORD>(steps.size() + 1), static_cast<WORD>(steps.size() + 1));
     QueueLog(token, L"==============================");
     QueueLog(token, L"すべての書き込みに成功しました。");
     QueueDone(token, true, true);
