@@ -56,14 +56,7 @@ struct ExecResult {
     std::wstring launchError;
 };
 
-enum class FlashAction {
-    Flash,
-    Erase,
-};
-
 struct FlashStep {
-    std::string partition;
-    FlashAction action{};
     std::string cmd;
     std::wstring desc;
     const char* asset;
