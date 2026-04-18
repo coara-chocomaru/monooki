@@ -29,12 +29,16 @@ HBRUSH g_brTransparent{};
 std::atomic<bool> g_DeviceVerified{false};
 std::atomic<bool> g_Busy{false};
 std::atomic<bool> g_Unlocked{false};
+std::atomic<uint32_t> g_CurrentOperationToken{0};
 
 std::wstring g_StatusText = L"待機中";
 std::wstring g_DeviceText = L"未確認";
 std::wstring g_FastbootText = L".\\platform-tools\\fastboot.exe";
-std::wstring g_RomText = L"書き込み用フォルダ";
+std::wstring g_RomText = L"TAB-A05-BD";
 std::wstring g_StepsText = L"wipe / flash / erase / reboot";
 std::wstring g_HintText = L"端末を fastboot モードで接続してから「端末確認」を押してください。";
 
 Layout g_layout{};
+std::mutex g_LogMutex;
+std::deque<LogLine> g_LogQueue;
+std::atomic<bool> g_LogFlushPending{false};

@@ -6,7 +6,9 @@ static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWOR
                        int x, int y, int w, int h, int id, HFONT font) {
     HWND c = CreateWindowExW(exStyle, cls, txt, WS_VISIBLE | WS_CHILD | style,
                              x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)), nullptr, nullptr);
-    if (c && font) SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    if (c && font) {
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    }
     return c;
 }
 
@@ -43,7 +45,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
                           WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
-
         SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
         SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
 
@@ -52,19 +53,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateHintUI(L"端末を fastboot モードで接続してから「端末確認」を押してください。");
         UpdateStepsUI(L"wipe / flash / erase / reboot");
 
-        AppendLog(L"fastboot    : .\\platform-tools\\fastboot.exe");
-        AppendLog(L"ROMフォルダ : TAB-A05-BD");
-        AppendLog(L"確認手順    : fastboot devices / getvar product / getvar unlocked");
-        AppendLog(L"処理方式    : 個別 partition に flash / erase を順次実行");
-        AppendLog(L"--------------------------------------------------------------");
-        AppendLog(L"端末を fastboot モードで接続し、「端末確認」を押してください。");
+        AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
+                       L"ROMフォルダ : TAB-A05-BD\r\n"
+                       L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
+                       L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
+                       L"--------------------------------------------------------------\r\n"
+                       L"端末を fastboot モードで接続し、「端末確認」を押してください。\r\n");
 
         if (!FileExistsA(FASTBOOT_EXE())) {
             UpdateStatusUI(L"fastboot 未検出");
             UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
-            AppendLog(L"警告: fastboot.exe が見つかりません。");
+            AppendLogBlock(L"警告: fastboot.exe が見つかりません。\r\n");
         }
 
         LayoutControls(hwnd);
@@ -73,7 +74,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SIZE:
         LayoutControls(hwnd);
-        InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
 
     case WM_GETMINMAXINFO: {
@@ -84,34 +84,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
-        if (g_Busy) break;
+        if (g_Busy.load(std::memory_order_acquire)) {
+            break;
+        }
         if (LOWORD(wp) == ID_BTN_CHECK) {
             g_DeviceVerified = false;
             g_Unlocked = false;
             g_Busy = true;
+            const uint32_t token = BeginOperation();
             UpdateStatusUI(L"端末確認中");
             UpdateDeviceUI(L"確認中…");
             UpdateHintUI(L"端末情報を取得しています。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
             SendMessageW(hProgressBar, PBM_SETPOS, 0, 0);
-            std::thread(CheckThread).detach();
+            std::thread([token]() { CheckThread(token); }).detach();
         } else if (LOWORD(wp) == ID_BTN_FLASH && g_DeviceVerified && g_Unlocked) {
             g_Busy = true;
+            const uint32_t token = BeginOperation();
             UpdateStatusUI(L"書き込み中");
             UpdateHintUI(L"書き込み処理を実行しています。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
-            std::thread(FlashThread).detach();
+            std::thread([token]() { FlashThread(token); }).detach();
         }
         return 0;
 
     case WM_DRAWITEM: {
         auto* dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lp);
-        if (dis->CtlType != ODT_BUTTON) break;
-        bool enabled = IsWindowEnabled(dis->hwndItem) != FALSE;
-        bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-        bool hot = (dis->itemState & ODS_HOTLIGHT) != 0;
+        if (dis->CtlType != ODT_BUTTON) {
+            break;
+        }
+        const bool enabled = IsWindowEnabled(dis->hwndItem) != FALSE;
+        const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+        const bool hot = (dis->itemState & ODS_HOTLIGHT) != 0;
         DrawButtonFace(dis, hot, pressed, enabled);
         return TRUE;
     }
@@ -162,36 +168,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_LOG_POST: {
-        auto* p = reinterpret_cast<wchar_t*>(lp);
-        AppendLog(p);
-        delete[] p;
+    case WM_LOG_FLUSH:
+        FlushLogQueue();
         return 0;
-    }
 
     case WM_TEXT_SET: {
-        auto* p = reinterpret_cast<wchar_t*>(lp);
-        if (!p) return 0;
-        if (wp == 0) UpdateStatusUI(p);
-        else if (wp == 1) UpdateDeviceUI(p);
-        else if (wp == 2) UpdateHintUI(p);
-        else if (wp == 3) UpdateStepsUI(p);
-        delete[] p;
-        InvalidateRect(hwnd, nullptr, TRUE);
+        auto* msgp = reinterpret_cast<TextMessage*>(wp);
+        if (!msgp) {
+            return 0;
+        }
+        if (msgp->token == g_CurrentOperationToken.load(std::memory_order_acquire)) {
+            if (msgp->kind == 0) UpdateStatusUI(msgp->text);
+            else if (msgp->kind == 1) UpdateDeviceUI(msgp->text);
+            else if (msgp->kind == 2) UpdateHintUI(msgp->text);
+            else if (msgp->kind == 3) UpdateStepsUI(msgp->text);
+        }
+        delete msgp;
         return 0;
     }
 
     case WM_PROG_SET: {
-        WORD pos = LOWORD(wp);
-        WORD rng = HIWORD(wp);
+        const uint32_t token = static_cast<uint32_t>(wp);
+        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        const WORD pos = LOWORD(lp);
+        const WORD rng = HIWORD(lp);
         SendMessageW(hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, rng));
         SendMessageW(hProgressBar, PBM_SETPOS, pos, 0);
         return 0;
     }
 
     case WM_OP_DONE: {
-        bool ok = (wp != 0);
-        bool flashMode = (lp != 0);
+        const uint32_t token = static_cast<uint32_t>(wp);
+        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) {
+            return 0;
+        }
+
+        const bool ok = (lp & 1) != 0;
+        const bool flashMode = (lp & 2) != 0;
 
         g_Busy = false;
         EnableWindow(hBtnCheck, TRUE);
@@ -200,13 +215,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EnableWindow(hBtnFlash, FALSE);
             UpdateStatusUI(L"fastboot 未検出");
             UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
-            InvalidateRect(hwnd, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
 
         if (!flashMode) {
             g_DeviceVerified = ok;
-            if (ok && g_Unlocked) {
+            g_Unlocked = ok;
+            if (ok) {
                 EnableWindow(hBtnFlash, TRUE);
                 UpdateStatusUI(L"検証完了");
                 UpdateDeviceUI(L"確認済み");
@@ -240,7 +256,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        InvalidateRect(hwnd, nullptr, TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
@@ -267,8 +283,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
-    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.1",
-                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.2",
+                              WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
                               CW_USEDEFAULT, CW_USEDEFAULT, 920, 720,
                               nullptr, nullptr, hInst, nullptr);
 

@@ -1,9 +1,13 @@
 #pragma once
+
 #include <windows.h>
 #include <commctrl.h>
+
+#include <atomic>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <atomic>
 
 #ifndef EM_SETBKGNDCOLOR
 #define EM_SETBKGNDCOLOR 0x0443
@@ -22,10 +26,10 @@ constexpr int ID_LBL_HINT   = 110;
 constexpr int ID_LBL_TITLE  = 111;
 constexpr int ID_LBL_SUB    = 112;
 
-constexpr UINT WM_LOG_POST  = WM_APP + 1;
+constexpr UINT WM_LOG_FLUSH = WM_APP + 1;
 constexpr UINT WM_PROG_SET  = WM_APP + 2;
 constexpr UINT WM_OP_DONE   = WM_APP + 3;
-constexpr UINT WM_TEXT_SET  = WM_APP + 4;
+constexpr UINT WM_TEXT_SET   = WM_APP + 4;
 
 extern const wchar_t APP_CLASS[];
 
@@ -43,8 +47,8 @@ constexpr COLORREF C_DANGER   = RGB(255, 92, 92);
 constexpr COLORREF C_BTN      = RGB(39, 49, 72);
 constexpr COLORREF C_BTN_HOV  = RGB(52, 63, 92);
 constexpr COLORREF C_BTN_DN   = RGB(26, 37, 60);
-constexpr COLORREF C_BTN_EDGE = RGB(86, 102, 138);
-constexpr COLORREF C_EDIT_BG  = RGB(17, 21, 31);
+constexpr COLORREF C_BTN_EDGE  = RGB(86, 102, 138);
+constexpr COLORREF C_EDIT_BG   = RGB(17, 21, 31);
 
 struct ExecResult {
     DWORD exitCode{};
@@ -56,6 +60,17 @@ struct FlashStep {
     std::string cmd;
     std::wstring desc;
     const char* asset;
+};
+
+struct TextMessage {
+    uint32_t token{};
+    UINT kind{};
+    std::wstring text;
+};
+
+struct LogLine {
+    uint32_t token{};
+    std::wstring text;
 };
 
 struct Layout {
@@ -92,6 +107,7 @@ extern HBRUSH g_brTransparent;
 extern std::atomic<bool> g_DeviceVerified;
 extern std::atomic<bool> g_Busy;
 extern std::atomic<bool> g_Unlocked;
+extern std::atomic<uint32_t> g_CurrentOperationToken;
 
 extern std::wstring g_StatusText;
 extern std::wstring g_DeviceText;
@@ -101,14 +117,14 @@ extern std::wstring g_StepsText;
 extern std::wstring g_HintText;
 
 extern Layout g_layout;
+extern std::mutex g_LogMutex;
+extern std::deque<LogLine> g_LogQueue;
+extern std::atomic<bool> g_LogFlushPending;
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ToWide(const std::string& s);
 std::wstring Win32ErrorText(DWORD err);
 bool FileExistsA(const std::string& path);
-void AppendLog(const wchar_t* text);
-void PostLog(const std::wstring& msg);
-void PostText(UINT kind, const std::wstring& msg);
 std::string RomDir();
 std::string FASTBOOT_EXE();
 std::string FB(const std::string& args);
@@ -116,6 +132,11 @@ std::string AssetPath(const char* filename);
 std::string Img(const char* filename);
 ExecResult Exec(const std::string& cmdLine);
 HFONT MakeFont(const wchar_t* face, int size, int weight = FW_NORMAL, BOOL italic = FALSE);
+uint32_t BeginOperation();
+void QueueLog(uint32_t token, const std::wstring& msg);
+void QueueText(uint32_t token, UINT kind, const std::wstring& msg);
+void QueueProgress(uint32_t token, WORD pos, WORD rng);
+void QueueDone(uint32_t token, bool ok, bool flashMode);
 void UpdateText(HWND hwnd, const std::wstring& text);
 void UpdateStatusUI(const std::wstring& text);
 void UpdateDeviceUI(const std::wstring& text);
@@ -125,9 +146,10 @@ void LayoutControls(HWND hwnd);
 void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int radius = 18);
 void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text);
 void PaintMain(HDC hdc, const RECT& rc);
-void PostDone(bool ok, bool flashMode);
-void CheckThread();
-void FlashThread();
 void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled);
+void AppendLogBlock(const std::wstring& text);
+void FlushLogQueue();
 void CleanupGdi();
 std::vector<FlashStep> BuildFlashSteps();
+void CheckThread(uint32_t token);
+void FlashThread(uint32_t token);

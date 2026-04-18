@@ -2,10 +2,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <memory>
-#include <thread>
+#include <string_view>
+#include <vector>
 
 namespace {
+constexpr size_t kMaxQueuedLines = 384;
+constexpr size_t kMaxLogChars = 48000;
+
 struct Handle {
     HANDLE h{nullptr};
     Handle() = default;
@@ -24,38 +29,124 @@ struct Handle {
     ~Handle() { reset(); }
     HANDLE get() const noexcept { return h; }
     void reset(HANDLE v = nullptr) noexcept {
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (h && h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
         h = v;
     }
-    explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
 };
+
+std::wstring NormalizeForDisplay(const std::wstring& src) {
+    std::wstring out;
+    out.reserve(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        wchar_t ch = src[i];
+        if (ch == L'\r') {
+            continue;
+        }
+        if (ch == L'\n') {
+            if (out.empty() || out.back() != L'\n') {
+                out.push_back(L'\n');
+            }
+            continue;
+        }
+        if (ch < 0x20 && ch != L'\t') {
+            continue;
+        }
+        out.push_back(ch);
+    }
+    return out;
 }
 
+std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    lines.reserve(1);
+    std::wstring current;
+    current.reserve(text.size());
+
+    for (wchar_t ch : text) {
+        if (ch == L'\r') {
+            continue;
+        }
+        if (ch == L'\n') {
+            lines.push_back(current);
+            current.clear();
+            continue;
+        }
+        if (ch < 0x20 && ch != L'\t') {
+            continue;
+        }
+        current.push_back(ch);
+    }
+    lines.push_back(current);
+    return lines;
+}
+
+bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+        [](char a, char b) {
+            return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a))) ==
+                   static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b)));
+        });
+    return it != haystack.end();
+}
+
+void TrimLogWindow(size_t limitChars = kMaxLogChars) {
+    if (!hLog) {
+        return;
+    }
+    const int len = GetWindowTextLengthW(hLog);
+    if (len <= static_cast<int>(limitChars)) {
+        return;
+    }
+    const int removeChars = len - static_cast<int>(limitChars);
+    SendMessageW(hLog, EM_SETSEL, 0, removeChars);
+    SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+}
+
+} // namespace
+
 void SafeDeleteObject(HGDIOBJ obj) {
-    if (obj) DeleteObject(obj);
+    if (obj) {
+        DeleteObject(obj);
+    }
 }
 
 std::wstring ToWide(const std::string& s) {
-    if (s.empty()) return {};
+    if (s.empty()) {
+        return {};
+    }
+
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), -1, nullptr, 0);
     if (n > 0) {
         std::wstring w(static_cast<size_t>(n - 1), L'\0');
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
         return w;
     }
+
     n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0) return {};
+    if (n <= 0) {
+        return {};
+    }
+
     std::wstring w(static_cast<size_t>(n - 1), L'\0');
     MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
     return w;
 }
 
 std::wstring Win32ErrorText(DWORD err) {
-    if (!err) return L"";
+    if (!err) {
+        return L"";
+    }
+
     LPWSTR buffer = nullptr;
-    DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-    DWORD len = FormatMessageW(flags, nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                               reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD len = FormatMessageW(flags, nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                                     reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+
     std::wstring out;
     if (len && buffer) {
         out.assign(buffer, buffer + len);
@@ -63,7 +154,9 @@ std::wstring Win32ErrorText(DWORD err) {
             out.pop_back();
         }
     }
-    if (buffer) LocalFree(buffer);
+    if (buffer) {
+        LocalFree(buffer);
+    }
     if (out.empty()) {
         out = L"Win32 error " + std::to_wstring(err);
     }
@@ -71,36 +164,11 @@ std::wstring Win32ErrorText(DWORD err) {
 }
 
 bool FileExistsA(const std::string& path) {
-    if (path.empty()) return false;
-    DWORD attr = GetFileAttributesA(path.c_str());
+    if (path.empty()) {
+        return false;
+    }
+    const DWORD attr = GetFileAttributesA(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
-}
-
-void AppendLog(const wchar_t* text) {
-    if (!hLog || !text) return;
-    int i = GetWindowTextLengthW(hLog);
-    SendMessageW(hLog, EM_SETSEL, static_cast<WPARAM>(i), static_cast<LPARAM>(i));
-    SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text));
-    SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L"\r\n"));
-    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
-}
-
-void PostLog(const std::wstring& msg) {
-    auto p = std::make_unique<wchar_t[]>(msg.size() + 1);
-    wmemcpy(p.get(), msg.c_str(), msg.size() + 1);
-    if (!PostMessageW(g_hMain, WM_LOG_POST, 0, reinterpret_cast<LPARAM>(p.get()))) {
-        return;
-    }
-    p.release();
-}
-
-void PostText(UINT kind, const std::wstring& msg) {
-    auto p = std::make_unique<wchar_t[]>(msg.size() + 1);
-    wmemcpy(p.get(), msg.c_str(), msg.size() + 1);
-    if (!PostMessageW(g_hMain, WM_TEXT_SET, kind, reinterpret_cast<LPARAM>(p.get()))) {
-        return;
-    }
-    p.release();
 }
 
 std::string RomDir() {
@@ -124,7 +192,8 @@ std::string Img(const char* filename) {
 }
 
 ExecResult Exec(const std::string& cmdLine) {
-    ExecResult r{1, {}, {}};
+    ExecResult r{};
+    r.exitCode = 1;
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -136,8 +205,8 @@ ExecResult Exec(const std::string& cmdLine) {
         r.launchError = Win32ErrorText(GetLastError());
         return r;
     }
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
     Handle readHandle(hRead);
     Handle writeHandle(hWrite);
 
@@ -166,8 +235,10 @@ ExecResult Exec(const std::string& cmdLine) {
     char buf[4096];
     DWORD n = 0;
     for (;;) {
-        BOOL ok = ReadFile(readHandle.get(), buf, static_cast<DWORD>(sizeof(buf)), &n, nullptr);
-        if (!ok || n == 0) break;
+        const BOOL ok = ReadFile(readHandle.get(), buf, static_cast<DWORD>(sizeof(buf)), &n, nullptr);
+        if (!ok || n == 0) {
+            break;
+        }
         out.append(buf, buf + n);
     }
 
@@ -179,15 +250,71 @@ ExecResult Exec(const std::string& cmdLine) {
 
 HFONT MakeFont(const wchar_t* face, int size, int weight, BOOL italic) {
     HDC hdc = GetDC(nullptr);
-    int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+    const int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
     ReleaseDC(nullptr, hdc);
     return CreateFontW(-MulDiv(size, dpi, 72), 0, 0, 0, weight, italic, FALSE, FALSE,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
+uint32_t BeginOperation() {
+    const uint32_t token = g_CurrentOperationToken.fetch_add(1, std::memory_order_acq_rel) + 1;
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        g_LogQueue.clear();
+    }
+    g_LogFlushPending.store(false, std::memory_order_release);
+    return token;
+}
+
+void QueueLog(uint32_t token, const std::wstring& msg) {
+    const auto lines = SplitLogLines(NormalizeForDisplay(msg));
+
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        for (const auto& line : lines) {
+            if (g_LogQueue.size() >= kMaxQueuedLines) {
+                g_LogQueue.pop_front();
+            }
+            g_LogQueue.push_back(LogLine{token, line});
+        }
+    }
+
+    bool expected = false;
+    if (g_LogFlushPending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        if (!PostMessageW(g_hMain, WM_LOG_FLUSH, 0, 0)) {
+            g_LogFlushPending.store(false, std::memory_order_release);
+        }
+    }
+}
+
+void QueueText(uint32_t token, UINT kind, const std::wstring& msg) {
+    auto* p = new TextMessage{};
+    p->token = token;
+    p->kind = kind;
+    p->text = msg;
+    if (!PostMessageW(g_hMain, WM_TEXT_SET, reinterpret_cast<WPARAM>(p), 0)) {
+        delete p;
+    }
+}
+
+void QueueProgress(uint32_t token, WORD pos, WORD rng) {
+    if (!PostMessageW(g_hMain, WM_PROG_SET, static_cast<WPARAM>(token), MAKELPARAM(pos, rng))) {
+        return;
+    }
+}
+
+void QueueDone(uint32_t token, bool ok, bool flashMode) {
+    const LPARAM flags = (ok ? 1 : 0) | (flashMode ? 2 : 0);
+    if (!PostMessageW(g_hMain, WM_OP_DONE, static_cast<WPARAM>(token), flags)) {
+        return;
+    }
+}
+
 void UpdateText(HWND hwnd, const std::wstring& text) {
-    if (hwnd) SetWindowTextW(hwnd, text.c_str());
+    if (hwnd) {
+        SetWindowTextW(hwnd, text.c_str());
+    }
 }
 
 void UpdateStatusUI(const std::wstring& text) {
@@ -210,8 +337,184 @@ void UpdateStepsUI(const std::wstring& text) {
     UpdateText(hLblSteps, text);
 }
 
-void PostDone(bool ok, bool flashMode) {
-    PostMessageW(g_hMain, WM_OP_DONE, ok ? 1 : 0, flashMode ? 1 : 0);
+void AppendLogBlock(const std::wstring& text) {
+    if (!hLog || text.empty()) {
+        return;
+    }
+
+    SendMessageW(hLog, WM_SETREDRAW, FALSE, 0);
+
+    const int len = GetWindowTextLengthW(hLog);
+    SendMessageW(hLog, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
+    SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+    TrimLogWindow();
+
+    SendMessageW(hLog, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(hLog, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
+}
+
+void FlushLogQueue() {
+    std::deque<LogLine> items;
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        items.swap(g_LogQueue);
+    }
+    g_LogFlushPending.store(false, std::memory_order_release);
+
+    if (items.empty()) {
+        return;
+    }
+
+    const uint32_t current = g_CurrentOperationToken.load(std::memory_order_acquire);
+    std::wstring batch;
+    batch.reserve(2048);
+
+    for (const auto& item : items) {
+        if (item.token != current) {
+            continue;
+        }
+        if (!item.text.empty()) {
+            batch.append(item.text);
+        }
+        batch.append(L"\r\n");
+    }
+
+    if (!batch.empty()) {
+        AppendLogBlock(batch);
+    }
+}
+
+void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int radius) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text) {
+    RECT rc{x, y, x + w, y + h};
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, C_TEXT);
+    SelectObject(hdc, g_hFontBody);
+    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void PaintMain(HDC hdc, const RECT& rc) {
+    HBRUSH bg = CreateSolidBrush(C_BG);
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+
+    RECT header = {rc.left, rc.top, rc.right, rc.top + 124};
+    TRIVERTEX v[2]{};
+    v[0].x = header.left;
+    v[0].y = header.top;
+    v[0].Red = GetRValue(C_BG2) << 8;
+    v[0].Green = GetGValue(C_BG2) << 8;
+    v[0].Blue = GetBValue(C_BG2) << 8;
+    v[0].Alpha = 0xff00;
+    v[1].x = header.right;
+    v[1].y = header.bottom;
+    v[1].Red = GetRValue(RGB(24, 31, 50)) << 8;
+    v[1].Green = GetGValue(RGB(24, 31, 50)) << 8;
+    v[1].Blue = GetBValue(RGB(24, 31, 50)) << 8;
+    v[1].Alpha = 0xff00;
+    GRADIENT_RECT gr{0, 1};
+    GradientFill(hdc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V);
+
+    DrawRoundCard(hdc, g_layout.leftCard, C_PANEL, C_LINE);
+    DrawRoundCard(hdc, g_layout.rightCard, C_PANEL, C_LINE);
+    DrawRoundCard(hdc, g_layout.logCard, C_PANEL2, C_LINE);
+
+    RECT accent = {rc.left + 18, 122, rc.right - 18, 124};
+    HBRUSH accentBr = CreateSolidBrush(C_ACCENT);
+    FillRect(hdc, &accent, accentBr);
+    DeleteObject(accentBr);
+
+    SelectObject(hdc, g_hFontTitle);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, C_TEXT);
+    RECT titleRc = g_layout.header;
+    titleRc.left += 2;
+    titleRc.top += 4;
+    titleRc.bottom = titleRc.top + 34;
+    DrawTextW(hdc, L"a05bd フラッシャー", -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, g_hFontSub);
+    SetTextColor(hdc, C_MUTED);
+    RECT subRc = g_layout.header;
+    subRc.left += 2;
+    subRc.top += 42;
+    subRc.bottom = subRc.top + 24;
+    DrawTextW(hdc, L"簡易書き込みツール", -1, &subRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    DrawChip(hdc, rc.right - 170, 24, 140, 26, RGB(34, 44, 68), C_LINE, L"fastboot utility");
+
+    RECT logTitle = g_layout.logCard;
+    logTitle.left += 16;
+    logTitle.top += 12;
+    logTitle.right -= 16;
+    logTitle.bottom = logTitle.top + 22;
+    SelectObject(hdc, g_hFontBody);
+    SetTextColor(hdc, C_TEXT);
+    DrawTextW(hdc, L"実行ログ", -1, &logTitle, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT logSub = g_layout.logCard;
+    logSub.left += 88;
+    logSub.top += 12;
+    logSub.right -= 16;
+    logSub.bottom = logSub.top + 22;
+    SetTextColor(hdc, C_MUTED);
+    DrawTextW(hdc, L"fastboot の出力と進行状況を表示します。", -1, &logSub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+}
+
+void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled) {
+    RECT rc = dis->rcItem;
+    const COLORREF fill = enabled ? (pressed ? C_BTN_DN : (hot ? C_BTN_HOV : C_BTN)) : RGB(33, 39, 54);
+    const COLORREF edge = enabled ? C_BTN_EDGE : RGB(68, 78, 103);
+
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(dis->hDC, br);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
+    SelectObject(dis->hDC, oldPen);
+    SelectObject(dis->hDC, oldBr);
+    DeleteObject(br);
+    DeleteObject(pen);
+
+    wchar_t text[256]{};
+    GetWindowTextW(dis->hwndItem, text, static_cast<int>(std::size(text)));
+    RECT trc = rc;
+    SetTextColor(dis->hDC, enabled ? C_TEXT : C_MUTED);
+    SelectObject(dis->hDC, g_hFontBody);
+    DrawTextW(dis->hDC, text, -1, &trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void CleanupGdi() {
+    SafeDeleteObject(g_hFontTitle);
+    SafeDeleteObject(g_hFontSub);
+    SafeDeleteObject(g_hFontBody);
+    SafeDeleteObject(g_hFontMono);
+    SafeDeleteObject(g_brPanel);
+    SafeDeleteObject(g_brPanel2);
+    SafeDeleteObject(g_brEdit);
 }
 
 std::vector<FlashStep> BuildFlashSteps() {
@@ -253,161 +556,145 @@ std::vector<FlashStep> BuildFlashSteps() {
     return steps;
 }
 
-void CheckThread() {
-    PostText(0, L"端末確認中");
-    PostText(1, L"検出中");
-    PostText(2, L"fastboot の応答を確認しています。");
-    PostLog(L"━━ 端末確認 ━━");
+void CheckThread(uint32_t token) {
+    QueueText(token, 0, L"端末確認中");
+    QueueText(token, 1, L"検出中");
+    QueueText(token, 2, L"fastboot の応答を確認しています。");
+    QueueLog(token, L"━━ 端末確認 ━━");
 
     if (!FileExistsA(FASTBOOT_EXE())) {
-        PostLog(L"エラー: fastboot.exe が見つかりません。");
-        PostLog(L"配置先: .\\platform-tools\\fastboot.exe");
-        PostDone(false, false);
-        g_Busy = false;
+        QueueLog(token, L"エラー: fastboot.exe が見つかりません。");
+        QueueLog(token, L"配置先: .\\platform-tools\\fastboot.exe");
+        QueueDone(token, false, false);
         return;
     }
 
-    PostLog(L"fastboot.exe を起動します…");
+    QueueLog(token, L"fastboot.exe を起動します…");
     auto d = Exec(FB("devices"));
     if (!d.launchError.empty()) {
-        PostLog(L"エラー: fastboot.exe の起動に失敗しました。");
-        PostLog(L"原因: " + d.launchError);
-        PostDone(false, false);
-        g_Busy = false;
+        QueueLog(token, L"エラー: fastboot.exe の起動に失敗しました。");
+        QueueLog(token, L"原因: " + d.launchError);
+        QueueDone(token, false, false);
         return;
     }
 
-    std::string dl = d.output;
-    std::transform(dl.begin(), dl.end(), dl.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!d.output.empty()) {
+        QueueLog(token, L"応答: " + ToWide(d.output));
+    }
 
-    if (dl.find("fastboot") == std::string::npos) {
-        PostLog(L"エラー: fastboot モードの端末が検出されません。");
-        if (!d.output.empty()) PostLog(L"返答: " + ToWide(d.output));
-        PostDone(false, false);
-        g_Busy = false;
+    if (!ContainsInsensitive(d.output, "fastboot")) {
+        QueueLog(token, L"エラー: fastboot モードの端末が検出されません。");
+        QueueDone(token, false, false);
         return;
     }
 
-    PostLog(L"端末を検出しました。product を確認しています…");
+    QueueLog(token, L"端末を検出しました。product を確認しています…");
     auto v = Exec(FB("getvar product"));
     if (!v.launchError.empty()) {
-        PostLog(L"エラー: product 取得に失敗しました。");
-        PostLog(L"原因: " + v.launchError);
-        PostDone(false, false);
-        g_Busy = false;
+        QueueLog(token, L"エラー: product 取得に失敗しました。");
+        QueueLog(token, L"原因: " + v.launchError);
+        QueueDone(token, false, false);
         return;
     }
 
-    std::string vl = v.output;
-    std::transform(vl.begin(), vl.end(), vl.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!v.output.empty()) {
+        QueueLog(token, L"product 応答: " + ToWide(v.output));
+    }
 
-    if (vl.find("a05bd") == std::string::npos) {
-        g_DeviceVerified = false;
-        PostLog(L"エラー: モデル不一致。期待値: a05bd");
-        if (!v.output.empty()) PostLog(L"返答: " + ToWide(v.output));
-        PostDone(false, false);
-        g_Busy = false;
+    if (!ContainsInsensitive(v.output, "a05bd")) {
+        QueueLog(token, L"エラー: モデル不一致。期待値: a05bd");
+        QueueDone(token, false, false);
         return;
     }
 
-    PostLog(L"端末を確認しました。unlocked を確認しています…");
+    QueueLog(token, L"端末を確認しました。unlocked を確認しています…");
     auto u = Exec(FB("getvar unlocked"));
     if (!u.launchError.empty()) {
-        PostLog(L"エラー: unlocked 取得に失敗しました。");
-        PostLog(L"原因: " + u.launchError);
-        PostDone(false, false);
-        g_Busy = false;
+        QueueLog(token, L"エラー: unlocked 取得に失敗しました。");
+        QueueLog(token, L"原因: " + u.launchError);
+        QueueDone(token, false, false);
         return;
     }
 
-    std::string ul = u.output;
-    std::transform(ul.begin(), ul.end(), ul.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (!u.output.empty()) {
+        QueueLog(token, L"unlocked 応答: " + ToWide(u.output));
+    }
 
-    bool unlocked = (ul.find("yes") != std::string::npos);
+    const bool unlocked = ContainsInsensitive(u.output, "yes");
     if (!unlocked) {
-        g_DeviceVerified = false;
-        g_Unlocked = false;
-        PostLog(L"エラー: unlocked が yes ではありません。");
-        if (!u.output.empty()) PostLog(L"返答: " + ToWide(u.output));
-        PostLog(L"先にアンロックをしてください！");
-        PostDone(false, false);
-        g_Busy = false;
+        QueueLog(token, L"エラー: unlocked が yes ではありません。");
+        QueueLog(token, L"先にアンロックをしてください！");
+        QueueDone(token, false, false);
         return;
     }
 
-    g_DeviceVerified = true;
-    g_Unlocked = true;
-    PostLog(L"確認済み: a05bd");
-    PostLog(L"unlocked: yes");
-    PostDone(true, false);
-    g_Busy = false;
+    QueueLog(token, L"確認済み: a05bd");
+    QueueLog(token, L"unlocked: yes");
+    QueueDone(token, true, false);
 }
 
-void FlashThread() {
-    PostText(0, L"書き込み中");
-    PostText(2, L"書き込み処理を実行しています。");
-    PostLog(L"━━ 書き込み開始 ━━");
+void FlashThread(uint32_t token) {
+    QueueText(token, 0, L"書き込み中");
+    QueueText(token, 2, L"書き込み処理を実行しています。");
+    QueueLog(token, L"━━ 書き込み開始 ━━");
 
     if (!FileExistsA(FASTBOOT_EXE())) {
-        PostLog(L"エラー: fastboot.exe が見つかりません。");
-        PostDone(false, true);
-        g_Busy = false;
+        QueueLog(token, L"エラー: fastboot.exe が見つかりません。");
+        QueueDone(token, false, true);
         return;
     }
 
-    auto steps = BuildFlashSteps();
+    const auto steps = BuildFlashSteps();
     for (const auto& step : steps) {
         if (step.asset && !FileExistsA(AssetPath(step.asset))) {
-            PostLog(L"エラー: 画像ファイルが見つかりません。");
-            PostLog(L"不足: " + ToWide(AssetPath(step.asset)));
-            PostDone(false, true);
-            g_Busy = false;
+            QueueLog(token, L"エラー: 画像ファイルが見つかりません。");
+            QueueLog(token, L"不足: " + ToWide(AssetPath(step.asset)));
+            QueueDone(token, false, true);
             return;
         }
     }
 
-    PostMessageW(g_hMain, WM_PROG_SET, MAKEWPARAM(0, static_cast<WORD>(steps.size() + 1)), 0);
+    QueueProgress(token, 0, static_cast<WORD>(steps.size() + 1));
 
     for (size_t i = 0; i < steps.size(); ++i) {
-        PostLog(steps[i].desc);
+        QueueLog(token, steps[i].desc);
         auto r = Exec(steps[i].cmd);
         if (!r.launchError.empty()) {
-            PostLog(L"失敗  起動エラー");
-            PostLog(L"原因: " + r.launchError);
-            PostDone(false, true);
-            g_Busy = false;
+            QueueLog(token, L"失敗  起動エラー");
+            QueueLog(token, L"原因: " + r.launchError);
+            QueueDone(token, false, true);
             return;
         }
         if (r.exitCode != 0) {
-            PostLog(L"失敗  終了コード=" + std::to_wstring(r.exitCode));
-            if (!r.output.empty()) PostLog(L"出力: " + ToWide(r.output));
-            PostDone(false, true);
-            g_Busy = false;
+            QueueLog(token, L"失敗  終了コード=" + std::to_wstring(r.exitCode));
+            if (!r.output.empty()) {
+                QueueLog(token, L"出力: " + ToWide(r.output));
+            }
+            QueueDone(token, false, true);
             return;
         }
-        PostMessageW(g_hMain, WM_PROG_SET, MAKEWPARAM(static_cast<WORD>(i + 1), static_cast<WORD>(steps.size() + 1)), 0);
+        QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(steps.size() + 1));
     }
 
-    PostLog(L"最終処理: reboot-recovery");
+    QueueLog(token, L"最終処理: reboot-recovery");
     auto end = Exec(FB("oem reboot-recovery"));
     if (!end.launchError.empty()) {
-        PostLog(L"失敗  起動エラー");
-        PostLog(L"原因: " + end.launchError);
-        PostDone(false, true);
-        g_Busy = false;
+        QueueLog(token, L"失敗  起動エラー");
+        QueueLog(token, L"原因: " + end.launchError);
+        QueueDone(token, false, true);
         return;
     }
     if (end.exitCode != 0) {
-        PostLog(L"失敗  終了コード=" + std::to_wstring(end.exitCode));
-        if (!end.output.empty()) PostLog(L"出力: " + ToWide(end.output));
-        PostDone(false, true);
-        g_Busy = false;
+        QueueLog(token, L"失敗  終了コード=" + std::to_wstring(end.exitCode));
+        if (!end.output.empty()) {
+            QueueLog(token, L"出力: " + ToWide(end.output));
+        }
+        QueueDone(token, false, true);
         return;
     }
 
-    PostMessageW(g_hMain, WM_PROG_SET, MAKEWPARAM(static_cast<WORD>(steps.size() + 1), static_cast<WORD>(steps.size() + 1)), 0);
-    PostLog(L"==============================");
-    PostLog(L"すべての書き込みに成功しました。");
-    PostDone(true, true);
-    g_Busy = false;
+    QueueProgress(token, static_cast<WORD>(steps.size() + 1), static_cast<WORD>(steps.size() + 1));
+    QueueLog(token, L"==============================");
+    QueueLog(token, L"すべての書き込みに成功しました。");
+    QueueDone(token, true, true);
 }
