@@ -49,11 +49,13 @@ constexpr COLORREF C_EDIT_BG  = RGB(17, 21, 31);
 struct ExecResult {
     DWORD exitCode{};
     std::string output;
+    std::wstring launchError;
 };
 
-struct StepItem {
+struct FlashStep {
     std::string cmd;
     std::wstring desc;
+    const char* asset;
 };
 
 struct Layout {
@@ -102,12 +104,15 @@ extern Layout g_layout;
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ToWide(const std::string& s);
+std::wstring Win32ErrorText(DWORD err);
+bool FileExistsA(const std::string& path);
 void AppendLog(const wchar_t* text);
 void PostLog(const std::wstring& msg);
 void PostText(UINT kind, const std::wstring& msg);
 std::string RomDir();
 std::string FASTBOOT_EXE();
 std::string FB(const std::string& args);
+std::string AssetPath(const char* filename);
 std::string Img(const char* filename);
 ExecResult Exec(const std::string& cmdLine);
 HFONT MakeFont(const wchar_t* face, int size, int weight = FW_NORMAL, BOOL italic = FALSE);
@@ -125,4 +130,4 @@ void CheckThread();
 void FlashThread();
 void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled);
 void CleanupGdi();
-std::vector<StepItem> BuildFlashSteps();
+std::vector<FlashStep> BuildFlashSteps();

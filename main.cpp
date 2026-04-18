@@ -31,7 +31,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
         hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
-        hLblRom = CreateCtrl(hwnd, L"STATIC", L"書き込み用フォルダ", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
+        hLblRom = CreateCtrl(hwnd, L"STATIC", L"TAB-A05-BD", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
         hLblSteps = CreateCtrl(hwnd, L"STATIC", L"wipe / flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
         hBtnCheck = CreateCtrl(hwnd, L"BUTTON", L"端末確認", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_CHECK, g_hFontBody);
@@ -53,10 +53,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStepsUI(L"wipe / flash / erase / reboot");
 
         AppendLog(L"fastboot    : .\\platform-tools\\fastboot.exe");
-        AppendLog(L"書き込み元 : 内部定義");
-        AppendLog(L"対象処理   : wipe / flash / erase / reboot");
+        AppendLog(L"ROMフォルダ : TAB-A05-BD");
+        AppendLog(L"確認手順    : fastboot devices / getvar product / getvar unlocked");
+        AppendLog(L"処理方式    : 個別 partition に flash / erase を順次実行");
         AppendLog(L"--------------------------------------------------------------");
         AppendLog(L"端末を fastboot モードで接続し、「端末確認」を押してください。");
+
+        if (!FileExistsA(FASTBOOT_EXE())) {
+            UpdateStatusUI(L"fastboot 未検出");
+            UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
+            EnableWindow(hBtnCheck, FALSE);
+            EnableWindow(hBtnFlash, FALSE);
+            AppendLog(L"警告: fastboot.exe が見つかりません。");
+        }
 
         LayoutControls(hwnd);
         return 0;
@@ -116,6 +125,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_StatusText.find(L"書き込み中") != std::wstring::npos) SetTextColor(hdc, C_WARNING);
             else if (g_StatusText.find(L"失敗") != std::wstring::npos) SetTextColor(hdc, C_DANGER);
             else if (g_StatusText.find(L"完了") != std::wstring::npos || g_StatusText.find(L"確認済み") != std::wstring::npos) SetTextColor(hdc, C_SUCCESS);
+            else if (g_StatusText.find(L"未検出") != std::wstring::npos) SetTextColor(hdc, C_DANGER);
             else SetTextColor(hdc, C_ACCENT);
         } else if (ctrl == hLblHint || ctrl == hLblSteps) {
             SetTextColor(hdc, C_MUTED);
@@ -183,7 +193,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         bool ok = (wp != 0);
         bool flashMode = (lp != 0);
 
+        g_Busy = false;
         EnableWindow(hBtnCheck, TRUE);
+
+        if (!FileExistsA(FASTBOOT_EXE())) {
+            EnableWindow(hBtnFlash, FALSE);
+            UpdateStatusUI(L"fastboot 未検出");
+            UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
 
         if (!flashMode) {
             g_DeviceVerified = ok;
@@ -248,7 +267,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
-    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.0",
+    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.1",
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                               CW_USEDEFAULT, CW_USEDEFAULT, 920, 720,
                               nullptr, nullptr, hInst, nullptr);
