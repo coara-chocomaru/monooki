@@ -271,7 +271,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    g_hMain = CreateWindowA("A05BDFlasher", "a05bd Flasher v3.0",
+    g_hMain = CreateWindowA("A05BDFlasher", "a05bd Flasher v1.0",
                             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             CW_USEDEFAULT, CW_USEDEFAULT, 504, 390,
                             nullptr, nullptr, hInst, nullptr);
