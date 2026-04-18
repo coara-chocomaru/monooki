@@ -52,7 +52,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main3' || github.ref == 'refs/heads/master')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main6' || github.ref == 'refs/heads/master')
 
     steps:
       - name: Download x64 artifact
