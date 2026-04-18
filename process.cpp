@@ -547,7 +547,7 @@ std::vector<FlashStep> BuildFlashSteps() {
     if (opt("protect1_erase")) steps.push_back({FB("erase protect1"), L"PROTECT1 消去中…", nullptr});
     if (opt("protect2_erase")) steps.push_back({FB("erase protect2"), L"PROTECT2 消去中…", nullptr});
     if (opt("nvram_erase")) steps.push_back({FB("erase nvram"), L"NVRAM 消去中…", nullptr});
-    if (opt("nvram_flash")) steps.push_back({FB("flash nvram " + Img("nvram.img")), L"NVRAM 書き込み中…", "nvram.img"});
+    if (opt("nvram")) steps.push_back({FB("flash nvram " + Img("nvram.img")), L"NVRAM 書き込み中…", "nvram.img"});
     if (opt("lk")) steps.push_back({FB("flash lk " + Img("lk.img")), L"LK 書き込み中…", "lk.img"});
     if (opt("lk2")) steps.push_back({FB("flash lk2 " + Img("lk2.img")), L"LK2 書き込み中…", "lk2.img"});
     if (opt("boot")) steps.push_back({FB("flash boot " + Img("boot.img")), L"BOOT 書き込み中…", "boot.img"});
