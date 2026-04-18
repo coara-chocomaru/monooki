@@ -36,7 +36,7 @@ jobs:
                  /DUNICODE /D_UNICODE ^
                  /EHsc /std:c++17 /permissive- ^
                  /O2 /Oi /GL /Gw /Gy /MT /GS /sdl /W3 /MP ^
-                 test.cpp ^
+                 main.cpp globals.cpp ui.cpp process.cpp ^
                  /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS ^
                  comctl32.lib msimg32.lib kernel32.lib user32.lib gdi32.lib ^
                  /OUT:a05bd_flasher_${{ matrix.arch }}.exe
