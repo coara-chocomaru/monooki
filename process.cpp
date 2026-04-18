@@ -414,21 +414,9 @@ void PaintMain(HDC hdc, const RECT& rc) {
     DeleteObject(bg);
 
     RECT header = {rc.left, rc.top, rc.right, rc.top + 124};
-    TRIVERTEX v[2]{};
-    v[0].x = header.left;
-    v[0].y = header.top;
-    v[0].Red = GetRValue(C_BG2) << 8;
-    v[0].Green = GetGValue(C_BG2) << 8;
-    v[0].Blue = GetBValue(C_BG2) << 8;
-    v[0].Alpha = 0xff00;
-    v[1].x = header.right;
-    v[1].y = header.bottom;
-    v[1].Red = GetRValue(RGB(24, 31, 50)) << 8;
-    v[1].Green = GetGValue(RGB(24, 31, 50)) << 8;
-    v[1].Blue = GetBValue(RGB(24, 31, 50)) << 8;
-    v[1].Alpha = 0xff00;
-    GRADIENT_RECT gr{0, 1};
-    GradientFill(hdc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V);
+    HBRUSH headerBr = CreateSolidBrush(C_BG2);
+    FillRect(hdc, &header, headerBr);
+    DeleteObject(headerBr);
 
     DrawRoundCard(hdc, g_layout.leftCard, C_PANEL, C_LINE);
     DrawRoundCard(hdc, g_layout.rightCard, C_PANEL, C_LINE);

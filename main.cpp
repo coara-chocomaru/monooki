@@ -32,7 +32,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hLblStatus = CreateCtrl(hwnd, L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
         hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
-        hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\.\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
+        hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
         hLblRom = CreateCtrl(hwnd, L"STATIC", L"./TAB-A05-BD", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
         hLblSteps = CreateCtrl(hwnd, L"STATIC", L"wipe / flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
@@ -53,7 +53,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateHintUI(L"端末を fastboot モードで接続してから「端末確認」を押してください。");
         UpdateStepsUI(L"wipe / flash / erase / reboot");
 
-        AppendLogBlock(L"fastboot    : .\\.\\platform-tools\\fastboot.exe\r\n"
+        AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
                        L"ROMフォルダ : ./TAB-A05-BD\r\n"
                        L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
                        L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
@@ -125,24 +125,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC: {
         HDC hdc = reinterpret_cast<HDC>(wp);
         HWND ctrl = reinterpret_cast<HWND>(lp);
-        SetBkMode(hdc, TRANSPARENT);
+
+        COLORREF bg = C_PANEL;
+        COLORREF fg = C_TEXT;
 
         if (ctrl == hLblStatus) {
-            if (g_StatusText.find(L"書き込み中") != std::wstring::npos) SetTextColor(hdc, C_WARNING);
-            else if (g_StatusText.find(L"失敗") != std::wstring::npos) SetTextColor(hdc, C_DANGER);
-            else if (g_StatusText.find(L"完了") != std::wstring::npos || g_StatusText.find(L"確認済み") != std::wstring::npos) SetTextColor(hdc, C_SUCCESS);
-            else if (g_StatusText.find(L"未検出") != std::wstring::npos) SetTextColor(hdc, C_DANGER);
-            else SetTextColor(hdc, C_ACCENT);
+            if (g_StatusText.find(L"書き込み中") != std::wstring::npos) fg = C_WARNING;
+            else if (g_StatusText.find(L"失敗") != std::wstring::npos) fg = C_DANGER;
+            else if (g_StatusText.find(L"完了") != std::wstring::npos || g_StatusText.find(L"確認済み") != std::wstring::npos) fg = C_SUCCESS;
+            else if (g_StatusText.find(L"未検出") != std::wstring::npos) fg = C_DANGER;
+            else fg = C_ACCENT;
         } else if (ctrl == hLblHint || ctrl == hLblSteps) {
-            SetTextColor(hdc, C_MUTED);
+            fg = C_MUTED;
         } else {
-            SetTextColor(hdc, C_TEXT);
+            fg = C_TEXT;
         }
-        return reinterpret_cast<LRESULT>(g_brTransparent);
+
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, bg);
+        SetTextColor(hdc, fg);
+        return reinterpret_cast<LRESULT>(g_brPanel);
     }
 
     case WM_CTLCOLOREDIT: {
         HDC hdc = reinterpret_cast<HDC>(wp);
+        SetBkMode(hdc, OPAQUE);
         SetBkColor(hdc, C_EDIT_BG);
         SetTextColor(hdc, C_TEXT);
         return reinterpret_cast<LRESULT>(g_brEdit);
@@ -150,9 +157,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLORBTN: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, TRANSPARENT);
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, C_PANEL);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brTransparent);
+        return reinterpret_cast<LRESULT>(g_brPanel);
     }
 
     case WM_ERASEBKGND:
@@ -277,14 +285,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = APP_CLASS;
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
     g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.2",
-                              WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
+                              WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                               CW_USEDEFAULT, CW_USEDEFAULT, 920, 720,
                               nullptr, nullptr, hInst, nullptr);
 
