@@ -34,7 +34,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
         hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
         hLblRom = CreateCtrl(hwnd, L"STATIC", L"./TAB-A05-BD", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
-        hLblSteps = CreateCtrl(hwnd, L"STATIC", L"wipe / flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
+        hLblSteps = CreateCtrl(hwnd, L"STATIC", L"flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
         hBtnCheck = CreateCtrl(hwnd, L"BUTTON", L"端末確認", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_CHECK, g_hFontBody);
         hBtnFlash = CreateCtrl(hwnd, L"BUTTON", L"ROM 書き込み", BS_OWNERDRAW | BS_PUSHBUTTON | WS_DISABLED, 0, 0, 0, 0, 0, ID_BTN_FLASH, g_hFontBody);
@@ -51,7 +51,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStatusUI(L"待機中");
         UpdateDeviceUI(L"未確認");
         UpdateHintUI(L"端末を fastboot モードで接続してから「端末確認」を押してください。");
-        UpdateStepsUI(L"wipe / flash / erase / reboot");
+        UpdateStepsUI(L"flash / erase / reboot");
 
         AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
                        L"ROMフォルダ : ./TAB-A05-BD\r\n"
