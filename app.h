@@ -9,11 +9,6 @@
 #include <string>
 #include <vector>
 
-enum class StepKind {
-    Flash,
-    Erase,
-};
-
 #ifndef EM_SETBKGNDCOLOR
 #define EM_SETBKGNDCOLOR 0x0443
 #endif
@@ -61,12 +56,17 @@ struct ExecResult {
     std::wstring launchError;
 };
 
+enum class FlashAction {
+    Flash,
+    Erase,
+};
+
 struct FlashStep {
+    std::string partition;
+    FlashAction action{};
     std::string cmd;
     std::wstring desc;
     const char* asset;
-    const char* partition;
-    StepKind kind;
 };
 
 struct TextMessage {
