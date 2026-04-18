@@ -2,9 +2,9 @@ name: Build a05bd Flasher
 
 on:
   push:
-    branches: ["main3", "master"]
+    branches: ["main5", "master"]
   pull_request:
-    branches: ["main3", "master"]
+    branches: ["main5", "master"]
   workflow_dispatch:
 
 permissions:
@@ -28,16 +28,17 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
 
-      - name: Compile test.cpp
+      - name: Build fastboot flasher
         shell: cmd
         run: |
           cl.exe /nologo ^
                  /utf-8 ^
+                 /DUNICODE /D_UNICODE ^
                  /EHsc /std:c++17 /permissive- ^
-                 /O2 /Oi /GL /MT /GS /sdl /W3 ^
+                 /O2 /Oi /GL /Gw /Gy /MT /GS /sdl /W3 /MP ^
                  test.cpp ^
-                 /link /LTCG /SUBSYSTEM:WINDOWS ^
-                 comctl32.lib kernel32.lib user32.lib gdi32.lib ^
+                 /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS ^
+                 comctl32.lib msimg32.lib kernel32.lib user32.lib gdi32.lib ^
                  /OUT:a05bd_flasher_${{ matrix.arch }}.exe
 
       - name: Upload build artifact
@@ -51,18 +52,20 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main3' || github.ref == 'refs/heads/master')
 
     steps:
       - name: Download x64 artifact
         uses: actions/download-artifact@v4
         with:
           name: a05bd-flasher-x64
+          path: dist/x64
 
       - name: Download x86 artifact
         uses: actions/download-artifact@v4
         with:
           name: a05bd-flasher-x86
+          path: dist/x86
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -71,5 +74,5 @@ jobs:
           name: Build ${{ github.run_number }}
           generate_release_notes: true
           files: |
-            a05bd_flasher_x64.exe
-            a05bd_flasher_x86.exe
+            dist/x64/a05bd_flasher_x64.exe
+            dist/x86/a05bd_flasher_x86.exe
