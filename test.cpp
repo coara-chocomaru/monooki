@@ -100,8 +100,8 @@ void CheckThread() {
         PostMessageW(g_hMain, WM_OP_DONE, 0, 0);
         g_Busy = false; return;
     }
-
-    PostLog(L"\u7AEF\u672B\u3092\u691C\u51FA\u3057\u307E\u3057\u305F\u3002\u88FD\u54C1 ID \u3092\u78BA\u8A8D\u4E2D\u2026");
+    
+    PostLog(L"\u7AEF\u672B\u3092\u691C\u51FA\u3057\u307E\u3057\u305F\u3002Product \u3092\u78BA\u8A8D\u4E2D\u2026");
     auto v = Exec(FB("getvar product"));
     std::string vl = v.output;
     std::transform(vl.begin(), vl.end(), vl.begin(),
