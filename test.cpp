@@ -1,5 +1,9 @@
 #include <windows.h>
 #include <commctrl.h>
+
+#ifndef EM_SETBKGNDCOLOR
+#define EM_SETBKGNDCOLOR 0x0443
+#endif
 #include <string>
 #include <vector>
 #include <thread>
