@@ -532,13 +532,13 @@ void CleanupGdi() {
 std::vector<FlashStep> BuildFlashSteps() {
     std::vector<FlashStep> steps;
     steps.reserve(33);
-    steps.push_back({FB("-w"), L"0/34  Wipe 実行中…", nullptr});
-    steps.push_back({FB("flash nvram " + Img("nvranm.img")), L"1/34  NVRAM 書き込み中…", "nvranm.img"});
+    steps.push_back({FB("flash partition " + Img("pgpt.img")), L"0/34  PGPT 書き込み中…", "pgpt.img"});
+    steps.push_back({FB("flash nvram " + Img("nvram.img")), L"1/34  NVRAM 書き込み中…", "nvram.img"});
     steps.push_back({FB("flash nvcfg " + Img("nvcfg.img")), L"2/34  NVCFG 書き込み中…", "nvcfg.img"});
     steps.push_back({FB("flash nvdata " + Img("nvdata.img")), L"3/34  NVDATA 書き込み中…", "nvdata.img"});
     steps.push_back({FB("flash persist " + Img("persist.img")), L"4/34  PERSIST 書き込み中…", "persist.img"});
-    steps.push_back({FB("flash preloader " + Img("preloader.img")), L"5/34  PRELOADER 書き込み中…", "preloader.img"});
-    steps.push_back({FB("flash partition " + Img("pgpt.img")), L"6/34  PGPT 書き込み中…", "pgpt.img"});
+    steps.push_back({FB("flash preloader " + Img("preloader.img")), L"5/34  preloader書き込み中…", "preloader.img"});
+    steps.push_back({FB("flash preloader2 " + Img("preloader.img")), L"6/34  preloader2書き込み中…", "preloader.img"});
     steps.push_back({FB("flash boot_para " + Img("boot_para.img")), L"7/34  BOOT_PARA 書き込み中…", "boot_para.img"});
     steps.push_back({FB("flash cam_vpu1 " + Img("cam_vpu1.img")), L"8/34  CAM_VPU1 書き込み中…", "cam_vpu1.img"});
     steps.push_back({FB("flash cam_vpu2 " + Img("cam_vpu2.img")), L"9/34  CAM_VPU2 書き込み中…", "cam_vpu2.img"});
