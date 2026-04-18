@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cwctype>
 #include <deque>
 #include <string_view>
 #include <vector>
@@ -106,7 +105,35 @@ void TrimLogWindow(size_t limitChars = kMaxLogChars) {
     SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
 }
 
-} // namespace
+std::wstring ModuleDirW() {
+    wchar_t buffer[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+    if (len == 0 || len >= (sizeof(buffer) / sizeof(buffer[0]))) {
+        return L".";
+    }
+    std::wstring path(buffer, buffer + len);
+    const size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        return L".";
+    }
+    path.resize(pos);
+    return path;
+}
+
+std::string WideToAnsi(const std::wstring& s) {
+    if (s.empty()) {
+        return {};
+    }
+    const int need = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(need - 1), '\0');
+    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+}
 
 void SafeDeleteObject(HGDIOBJ obj) {
     if (obj) {
@@ -162,36 +189,6 @@ std::wstring Win32ErrorText(DWORD err) {
     return out;
 }
 
-namespace {
-std::wstring ModuleDirW() {
-    wchar_t buffer[MAX_PATH * 4]{};
-    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
-    if (len == 0 || len >= (sizeof(buffer) / sizeof(buffer[0]))) {
-        return L".";
-    }
-    std::wstring path(buffer, buffer + len);
-    const size_t pos = path.find_last_of(L"\\/");
-    if (pos == std::wstring::npos) {
-        return L".";
-    }
-    path.resize(pos);
-    return path;
-}
-
-std::string WideToAnsi(const std::wstring& s) {
-    if (s.empty()) {
-        return {};
-    }
-    const int need = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (need <= 0) {
-        return {};
-    }
-    std::string out(static_cast<size_t>(need - 1), '\0');
-    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, out.data(), need, nullptr, nullptr);
-    return out;
-}
-} // namespace
-
 bool FileExistsA(const std::string& path) {
     if (path.empty()) {
         return false;
@@ -207,7 +204,6 @@ std::string RomDir() {
 std::string FASTBOOT_EXE() {
     return WideToAnsi(ModuleDirW() + L"\\platform-tools\\fastboot.exe");
 }
-
 
 std::string FB(const std::string& args) {
     return std::string("\"") + FASTBOOT_EXE() + "\" " + args;
@@ -520,7 +516,6 @@ void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled) 
     DrawTextW(dis->hDC, text, -1, &trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-
 void CleanupGdi() {
     SafeDeleteObject(g_hFontTitle);
     SafeDeleteObject(g_hFontSub);
@@ -533,179 +528,126 @@ void CleanupGdi() {
 
 std::vector<FlashStep> BuildFlashSteps() {
     std::vector<FlashStep> steps;
-    steps.reserve(33);
-    steps.push_back({FB("flash partition " + Img("pgpt.img")), L"0/34  PGPT 書き込み中…", "pgpt.img"});
-    steps.push_back({FB("flash nvram " + Img("nvram.img")), L"1/34  NVRAM 書き込み中…", "nvram.img"});
-    steps.push_back({FB("flash nvcfg " + Img("nvcfg.img")), L"2/34  NVCFG 書き込み中…", "nvcfg.img"});
-    steps.push_back({FB("flash nvdata " + Img("nvdata.img")), L"3/34  NVDATA 書き込み中…", "nvdata.img"});
-    steps.push_back({FB("flash persist " + Img("persist.img")), L"4/34  PERSIST 書き込み中…", "persist.img"});
-    steps.push_back({FB("flash preloader " + Img("preloader.img")), L"5/34  preloader書き込み中…", "preloader.img"});
-    steps.push_back({FB("flash boot_para " + Img("boot_para.img")), L"6/34  BOOT_PARA 書き込み中…", "boot_para.img"});
-    steps.push_back({FB("flash cam_vpu1 " + Img("cam_vpu1.img")), L"7/34  CAM_VPU1 書き込み中…", "cam_vpu1.img"});
-    steps.push_back({FB("flash cam_vpu2 " + Img("cam_vpu2.img")), L"8/34  CAM_VPU2 書き込み中…", "cam_vpu2.img"});
-    steps.push_back({FB("flash cam_vpu3 " + Img("cam_vpu3.img")), L"9/34  CAM_VPU3 書き込み中…", "cam_vpu3.img"});
-    steps.push_back({FB("erase protect1"), L"10/34  PROTECT1 消去中…", nullptr});
-    steps.push_back({FB("erase protect2"), L"11/34  PROTECT2 消去中…", nullptr});
-    steps.push_back({FB("erase nvram"), L"12/34  NVRAM 消去中…", nullptr});
-    steps.push_back({FB("flash nvram " + Img("nvram.img")), L"13/34  NVRAM 書き込み中…", "nvram.img"});
-    steps.push_back({FB("flash lk " + Img("lk.img")), L"14/34  LK 書き込み中…", "lk.img"});
-    steps.push_back({FB("flash lk2 " + Img("lk2.img")), L"15/34  LK2 書き込み中…", "lk2.img"});
-    steps.push_back({FB("flash boot " + Img("boot.img")), L"16/34  BOOT 書き込み中…", "boot.img"});
-    steps.push_back({FB("flash recovery " + Img("recovery.img")), L"17/34  RECOVERY 書き込み中…", "recovery.img"});
-    steps.push_back({FB("flash logo " + Img("logo.img")), L"18/34  LOGO 書き込み中…", "logo.img"});
-    steps.push_back({FB("flash dtbo " + Img("dtbo.img")), L"19/34  DTBO 書き込み中…", "dtbo.img"});
-    steps.push_back({FB("erase expdb"), L"20/34  EXPDB 消去中…", nullptr});
-    steps.push_back({FB("flash frp " + Img("frp.img")), L"21/34  FRP 書き込み中…", "frp.img"});
-    steps.push_back({FB("erase para"), L"22/34  PARA 消去中…", nullptr});
-    steps.push_back({FB("flash tee1 " + Img("tee.img")), L"23/34  TEE1 書き込み中…", "tee.img"});
-    steps.push_back({FB("flash tee2 " + Img("tee.img")), L"24/34  TEE2 書き込み中…", "tee.img"});
-    steps.push_back({FB("erase kb"), L"25/34  KB 消去中…", nullptr});
-    steps.push_back({FB("erase dkb"), L"26/34  DKB 消去中…", nullptr});
-    steps.push_back({FB("erase metadata"), L"27/34  METADATA 消去中…", nullptr});
-    steps.push_back({FB("flash vbmeta " + Img("vbmeta.img")), L"28/34  VBMETA 書き込み中…", "vbmeta.img"});
-    steps.push_back({FB("flash system " + Img("system.img")), L"29/34  SYSTEM 書き込み中…", "system.img"});
-    steps.push_back({FB("flash vendor " + Img("vendor.img")), L"30/34  VENDOR 書き込み中…", "vendor.img"});
-    steps.push_back({FB("flash factory " + Img("factory.img")), L"31/34  FACTORY 書き込み中…", "factory.img"});
-    steps.push_back({FB("flash cache " + Img("cache.img")), L"32/34  CACHE 書き込み中…", "cache.img"});
-    return steps;
-}
+    std::string iniPath = WideToAnsi(ModuleDirW() + L"\\option.ini");
 
-namespace {
-
-enum class StepAction {
-    Flash,
-    Erase,
-};
-
-struct PlannedStep {
-    std::string cmd;
-    std::wstring desc;
-    const char* asset;
-    std::string partition;
-    StepAction action;
-};
-
-std::wstring OptionIniPathW() {
-    return ModuleDirW() + L"\\TAB-A05-BD\\option.ini";
-}
-
-std::wstring TrimCopy(std::wstring s) {
-    const auto is_space = [](wchar_t ch) {
-        return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n' || ch == L'\f' || ch == L'\v';
+    auto opt = [&](const char* key) {
+        if (!FileExistsA(iniPath)) return true;
+        return GetPrivateProfileIntA("Partitions", key, 1, iniPath.c_str()) != 0;
     };
-    size_t begin = 0;
-    while (begin < s.size() && is_space(s[begin])) {
-        ++begin;
-    }
-    size_t end = s.size();
-    while (end > begin && is_space(s[end - 1])) {
-        --end;
-    }
-    return s.substr(begin, end - begin);
-}
 
-std::wstring ToLowerCopy(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return s;
-}
+    if (opt("pgpt")) steps.push_back({FB("flash partition " + Img("pgpt.img")), L"PGPT 書き込み中…", "pgpt.img"});
+    if (opt("nvram_flash1")) steps.push_back({FB("flash nvram " + Img("nvram.img")), L"NVRAM 書き込み中…", "nvram.img"});
+    if (opt("nvcfg")) steps.push_back({FB("flash nvcfg " + Img("nvcfg.img")), L"NVCFG 書き込み中…", "nvcfg.img"});
+    if (opt("nvdata")) steps.push_back({FB("flash nvdata " + Img("nvdata.img")), L"NVDATA 書き込み中…", "nvdata.img"});
+    if (opt("persist")) steps.push_back({FB("flash persist " + Img("persist.img")), L"PERSIST 書き込み中…", "persist.img"});
+    if (opt("preloader")) steps.push_back({FB("flash preloader " + Img("preloader.img")), L"preloader書き込み中…", "preloader.img"});
+    if (opt("boot_para")) steps.push_back({FB("flash boot_para " + Img("boot_para.img")), L"BOOT_PARA 書き込み中…", "boot_para.img"});
+    if (opt("cam_vpu1")) steps.push_back({FB("flash cam_vpu1 " + Img("cam_vpu1.img")), L"CAM_VPU1 書き込み中…", "cam_vpu1.img"});
+    if (opt("cam_vpu2")) steps.push_back({FB("flash cam_vpu2 " + Img("cam_vpu2.img")), L"CAM_VPU2 書き込み中…", "cam_vpu2.img"});
+    if (opt("cam_vpu3")) steps.push_back({FB("flash cam_vpu3 " + Img("cam_vpu3.img")), L"CAM_VPU3 書き込み中…", "cam_vpu3.img"});
+    if (opt("protect1_erase")) steps.push_back({FB("erase protect1"), L"PROTECT1 消去中…", nullptr});
+    if (opt("protect2_erase")) steps.push_back({FB("erase protect2"), L"PROTECT2 消去中…", nullptr});
+    if (opt("nvram_erase")) steps.push_back({FB("erase nvram"), L"NVRAM 消去中…", nullptr});
+    if (opt("nvram_flash2")) steps.push_back({FB("flash nvram " + Img("nvram.img")), L"NVRAM 書き込み中…", "nvram.img"});
+    if (opt("lk")) steps.push_back({FB("flash lk " + Img("lk.img")), L"LK 書き込み中…", "lk.img"});
+    if (opt("lk2")) steps.push_back({FB("flash lk2 " + Img("lk2.img")), L"LK2 書き込み中…", "lk2.img"});
+    if (opt("boot")) steps.push_back({FB("flash boot " + Img("boot.img")), L"BOOT 書き込み中…", "boot.img"});
+    if (opt("recovery")) steps.push_back({FB("flash recovery " + Img("recovery.img")), L"RECOVERY 書き込み中…", "recovery.img"});
+    if (opt("logo")) steps.push_back({FB("flash logo " + Img("logo.img")), L"LOGO 書き込み中…", "logo.img"});
+    if (opt("dtbo")) steps.push_back({FB("flash dtbo " + Img("dtbo.img")), L"DTBO 書き込み中…", "dtbo.img"});
+    if (opt("expdb_erase")) steps.push_back({FB("erase expdb"), L"EXPDB 消去中…", nullptr});
+    if (opt("frp")) steps.push_back({FB("flash frp " + Img("frp.img")), L"FRP 書き込み中…", "frp.img"});
+    if (opt("para_erase")) steps.push_back({FB("erase para"), L"PARA 消去中…", nullptr});
+    if (opt("tee1")) steps.push_back({FB("flash tee1 " + Img("tee.img")), L"TEE1 書き込み中…", "tee.img"});
+    if (opt("tee2")) steps.push_back({FB("flash tee2 " + Img("tee.img")), L"TEE2 書き込み中…", "tee.img"});
+    if (opt("kb_erase")) steps.push_back({FB("erase kb"), L"KB 消去中…", nullptr});
+    if (opt("dkb_erase")) steps.push_back({FB("erase dkb"), L"DKB 消去中…", nullptr});
+    if (opt("metadata_erase")) steps.push_back({FB("erase metadata"), L"METADATA 消去中…", nullptr});
+    if (opt("vbmeta")) steps.push_back({FB("flash vbmeta " + Img("vbmeta.img")), L"VBMETA 書き込み中…", "vbmeta.img"});
+    if (opt("system")) steps.push_back({FB("flash system " + Img("system.img")), L"SYSTEM 書き込み中…", "system.img"});
+    if (opt("vendor")) steps.push_back({FB("flash vendor " + Img("vendor.img")), L"VENDOR 書き込み中…", "vendor.img"});
+    if (opt("factory")) steps.push_back({FB("flash factory " + Img("factory.img")), L"FACTORY 書き込み中…", "factory.img"});
+    if (opt("cache")) steps.push_back({FB("flash cache " + Img("cache.img")), L"CACHE 書き込み中…", "cache.img"});
 
-bool ParseIniBool(const std::wstring& raw, bool defaultValue) {
-    const std::wstring v = ToLowerCopy(TrimCopy(raw));
-    if (v.empty()) {
-        return defaultValue;
-    }
-    if (v == L"1" || v == L"true" || v == L"yes" || v == L"on" || v == L"enable" || v == L"enabled") {
-        return true;
-    }
-    if (v == L"0" || v == L"false" || v == L"no" || v == L"off" || v == L"disable" || v == L"disabled") {
-        return false;
-    }
-    return defaultValue;
-}
-
-bool ReadIniBool(const std::wstring& iniPath, const wchar_t* section, const wchar_t* key, bool defaultValue) {
-    wchar_t buffer[64]{};
-    const wchar_t* def = defaultValue ? L"1" : L"0";
-    GetPrivateProfileStringW(section, key, def, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), iniPath.c_str());
-    return ParseIniBool(buffer, defaultValue);
-}
-
-struct StepRule {
-    bool flash{true};
-    bool erase{true};
-    bool img{true};
-};
-
-StepRule LoadRule(const std::wstring& iniPath, const std::string& partition) {
-    const std::wstring sec = ToWide(partition);
-    StepRule rule{};
-    rule.flash = ReadIniBool(iniPath, sec.c_str(), L"flash", true);
-    rule.erase = ReadIniBool(iniPath, sec.c_str(), L"erase", true);
-    rule.img = ReadIniBool(iniPath, sec.c_str(), L"img", true);
-    return rule;
-}
-
-std::vector<PlannedStep> BuildPlannedSteps() {
-    std::vector<PlannedStep> steps;
-    steps.reserve(33);
-
-    steps.push_back({FB("flash partition " + Img("pgpt.img")), L"0/34  PGPT 書き込み中…", "pgpt.img", "pgpt", StepAction::Flash});
-    steps.push_back({FB("flash nvram " + Img("nvram.img")), L"1/34  NVRAM 書き込み中…", "nvram.img", "nvram", StepAction::Flash});
-    steps.push_back({FB("flash nvcfg " + Img("nvcfg.img")), L"2/34  NVCFG 書き込み中…", "nvcfg.img", "nvcfg", StepAction::Flash});
-    steps.push_back({FB("flash nvdata " + Img("nvdata.img")), L"3/34  NVDATA 書き込み中…", "nvdata.img", "nvdata", StepAction::Flash});
-    steps.push_back({FB("flash persist " + Img("persist.img")), L"4/34  PERSIST 書き込み中…", "persist.img", "persist", StepAction::Flash});
-    steps.push_back({FB("flash preloader " + Img("preloader.img")), L"5/34  preloader書き込み中…", "preloader.img", "preloader", StepAction::Flash});
-    steps.push_back({FB("flash boot_para " + Img("boot_para.img")), L"6/34  BOOT_PARA 書き込み中…", "boot_para.img", "boot_para", StepAction::Flash});
-    steps.push_back({FB("flash cam_vpu1 " + Img("cam_vpu1.img")), L"7/34  CAM_VPU1 書き込み中…", "cam_vpu1.img", "cam_vpu1", StepAction::Flash});
-    steps.push_back({FB("flash cam_vpu2 " + Img("cam_vpu2.img")), L"8/34  CAM_VPU2 書き込み中…", "cam_vpu2.img", "cam_vpu2", StepAction::Flash});
-    steps.push_back({FB("flash cam_vpu3 " + Img("cam_vpu3.img")), L"9/34  CAM_VPU3 書き込み中…", "cam_vpu3.img", "cam_vpu3", StepAction::Flash});
-    steps.push_back({FB("erase protect1"), L"10/34  PROTECT1 消去中…", nullptr, "protect1", StepAction::Erase});
-    steps.push_back({FB("erase protect2"), L"11/34  PROTECT2 消去中…", nullptr, "protect2", StepAction::Erase});
-    steps.push_back({FB("erase nvram"), L"12/34  NVRAM 消去中…", nullptr, "nvram", StepAction::Erase});
-    steps.push_back({FB("flash nvram " + Img("nvram.img")), L"13/34  NVRAM 書き込み中…", "nvram.img", "nvram", StepAction::Flash});
-    steps.push_back({FB("flash lk " + Img("lk.img")), L"14/34  LK 書き込み中…", "lk.img", "lk", StepAction::Flash});
-    steps.push_back({FB("flash lk2 " + Img("lk2.img")), L"15/34  LK2 書き込み中…", "lk2.img", "lk2", StepAction::Flash});
-    steps.push_back({FB("flash boot " + Img("boot.img")), L"16/34  BOOT 書き込み中…", "boot.img", "boot", StepAction::Flash});
-    steps.push_back({FB("flash recovery " + Img("recovery.img")), L"17/34  RECOVERY 書き込み中…", "recovery.img", "recovery", StepAction::Flash});
-    steps.push_back({FB("flash logo " + Img("logo.img")), L"18/34  LOGO 書き込み中…", "logo.img", "logo", StepAction::Flash});
-    steps.push_back({FB("flash dtbo " + Img("dtbo.img")), L"19/34  DTBO 書き込み中…", "dtbo.img", "dtbo", StepAction::Flash});
-    steps.push_back({FB("erase expdb"), L"20/34  EXPDB 消去中…", nullptr, "expdb", StepAction::Erase});
-    steps.push_back({FB("flash frp " + Img("frp.img")), L"21/34  FRP 書き込み中…", "frp.img", "frp", StepAction::Flash});
-    steps.push_back({FB("erase para"), L"22/34  PARA 消去中…", nullptr, "para", StepAction::Erase});
-    steps.push_back({FB("flash tee1 " + Img("tee.img")), L"23/34  TEE1 書き込み中…", "tee.img", "tee1", StepAction::Flash});
-    steps.push_back({FB("flash tee2 " + Img("tee.img")), L"24/34  TEE2 書き込み中…", "tee.img", "tee2", StepAction::Flash});
-    steps.push_back({FB("erase kb"), L"25/34  KB 消去中…", nullptr, "kb", StepAction::Erase});
-    steps.push_back({FB("erase dkb"), L"26/34  DKB 消去中…", nullptr, "dkb", StepAction::Erase});
-    steps.push_back({FB("erase metadata"), L"27/34  METADATA 消去中…", nullptr, "metadata", StepAction::Erase});
-    steps.push_back({FB("flash vbmeta " + Img("vbmeta.img")), L"28/34  VBMETA 書き込み中…", "vbmeta.img", "vbmeta", StepAction::Flash});
-    steps.push_back({FB("flash system " + Img("system.img")), L"29/34  SYSTEM 書き込み中…", "system.img", "system", StepAction::Flash});
-    steps.push_back({FB("flash vendor " + Img("vendor.img")), L"30/34  VENDOR 書き込み中…", "vendor.img", "vendor", StepAction::Flash});
-    steps.push_back({FB("flash factory " + Img("factory.img")), L"31/34  FACTORY 書き込み中…", "factory.img", "factory", StepAction::Flash});
-    steps.push_back({FB("flash cache " + Img("cache.img")), L"32/34  CACHE 書き込み中…", "cache.img", "cache", StepAction::Flash});
     return steps;
 }
 
-bool StepEnabledForRule(const PlannedStep& step, const StepRule& rule) {
-    return (step.action == StepAction::Flash) ? rule.flash : rule.erase;
-}
+void CheckThread(uint32_t token) {
+    QueueText(token, 0, L"端末確認中");
+    QueueText(token, 1, L"検出中");
+    QueueText(token, 2, L"fastboot の応答を確認しています。");
+    QueueLog(token, L"━━ 端末確認 ━━");
 
-std::wstring MakeSkipMessage(const PlannedStep& step) {
-    std::wstring out = L"スキップ: ";
-    out += step.desc;
-    out += L" [";
-    out += ToWide(step.partition);
-    out += L"]";
-    return out;
-}
+    if (!FileExistsA(FASTBOOT_EXE())) {
+        QueueLog(token, L"エラー: fastboot.exe が見つかりません。");
+        QueueLog(token, L"配置先: .\\platform-tools\\fastboot.exe");
+        QueueDone(token, false, false);
+        return;
+    }
 
-std::wstring MakeImageCheckDisabledMessage(const PlannedStep& step) {
-    std::wstring out = L"補足: img チェック無効 [";
-    out += ToWide(step.partition);
-    out += L"]";
-    return out;
-}
+    QueueLog(token, L"fastboot.exe を起動します…");
+    auto d = Exec(FB("devices"));
+    if (!d.launchError.empty()) {
+        QueueLog(token, L"エラー: fastboot.exe の起動に失敗しました。");
+        QueueLog(token, L"原因: " + d.launchError);
+        QueueDone(token, false, false);
+        return;
+    }
 
-} // namespace
+    if (!d.output.empty()) {
+        QueueLog(token, L"応答: " + ToWide(d.output));
+    }
+
+    if (!ContainsInsensitive(d.output, "fastboot")) {
+        QueueLog(token, L"エラー: fastboot モードの端末が検出されません。");
+        QueueDone(token, false, false);
+        return;
+    }
+
+    QueueLog(token, L"端末を検出しました。product を確認しています…");
+    auto v = Exec(FB("getvar product"));
+    if (!v.launchError.empty()) {
+        QueueLog(token, L"エラー: product 取得に失敗しました。");
+        QueueLog(token, L"原因: " + v.launchError);
+        QueueDone(token, false, false);
+        return;
+    }
+
+    if (!v.output.empty()) {
+        QueueLog(token, L"product 応答: " + ToWide(v.output));
+    }
+
+    if (!ContainsInsensitive(v.output, "a05bd")) {
+        QueueLog(token, L"エラー: モデル不一致。期待値: a05bd");
+        QueueDone(token, false, false);
+        return;
+    }
+
+    QueueLog(token, L"端末を確認しました。unlocked を確認しています…");
+    auto u = Exec(FB("getvar unlocked"));
+    if (!u.launchError.empty()) {
+        QueueLog(token, L"エラー: unlocked 取得に失敗しました。");
+        QueueLog(token, L"原因: " + u.launchError);
+        QueueDone(token, false, false);
+        return;
+    }
+
+    if (!u.output.empty()) {
+        QueueLog(token, L"unlocked 応答: " + ToWide(u.output));
+    }
+
+    const bool unlocked = ContainsInsensitive(u.output, "yes");
+    if (!unlocked) {
+        QueueLog(token, L"エラー: unlocked が yes ではありません。");
+        QueueLog(token, L"先にアンロックをしてください！");
+        QueueDone(token, false, false);
+        return;
+    }
+
+    QueueLog(token, L"確認済み: a05bd");
+    QueueLog(token, L"unlocked: yes");
+    QueueDone(token, true, false);
+}
 
 void FlashThread(uint32_t token) {
     QueueText(token, 0, L"書き込み中");
@@ -718,44 +660,22 @@ void FlashThread(uint32_t token) {
         return;
     }
 
-    const std::wstring iniPath = OptionIniPathW();
-    const bool hasIni = GetFileAttributesW(iniPath.c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (hasIni) {
-        QueueLog(token, L"option.ini を検出しました。partition ごとの分岐を適用します。");
-        QueueLog(token, L"配置先: ./TAB-A05-BD/option.ini");
-    } else {
-        QueueLog(token, L"option.ini が無いため、既存処理のまま進行します。");
-    }
-
-    const auto planned = BuildPlannedSteps();
-    std::vector<PlannedStep> runSteps;
-    runSteps.reserve(planned.size());
-
-    for (const auto& step : planned) {
-        const StepRule rule = hasIni ? LoadRule(iniPath, step.partition) : StepRule{};
-        if (!StepEnabledForRule(step, rule)) {
-            QueueLog(token, MakeSkipMessage(step));
-            continue;
-        }
-        if (step.asset && rule.img && !FileExistsA(AssetPath(step.asset))) {
+    const auto steps = BuildFlashSteps();
+    for (const auto& step : steps) {
+        if (step.asset && !FileExistsA(AssetPath(step.asset))) {
             QueueLog(token, L"エラー: 画像ファイルが見つかりません。");
             QueueLog(token, L"不足: " + ToWide(AssetPath(step.asset)));
             QueueDone(token, false, true);
             return;
         }
-        if (step.asset && hasIni && !rule.img) {
-            QueueLog(token, MakeImageCheckDisabledMessage(step));
-        }
-        runSteps.push_back(step);
     }
 
-    const WORD total = static_cast<WORD>((runSteps.size() + 1) > 0 ? (runSteps.size() + 1) : 1);
-    QueueProgress(token, 0, total);
+    QueueProgress(token, 0, static_cast<WORD>(steps.size() + 1));
 
-    for (size_t i = 0; i < runSteps.size(); ++i) {
-        const auto& step = runSteps[i];
-        QueueLog(token, step.desc);
-        auto r = Exec(step.cmd);
+    for (size_t i = 0; i < steps.size(); ++i) {
+        std::wstring prefix = std::to_wstring(i) + L"/" + std::to_wstring(steps.size() + 1) + L"  ";
+        QueueLog(token, prefix + steps[i].desc);
+        auto r = Exec(steps[i].cmd);
         if (!r.launchError.empty()) {
             QueueLog(token, L"失敗  起動エラー");
             QueueLog(token, L"原因: " + r.launchError);
@@ -770,10 +690,11 @@ void FlashThread(uint32_t token) {
             QueueDone(token, false, true);
             return;
         }
-        QueueProgress(token, static_cast<WORD>(i + 1), total);
+        QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(steps.size() + 1));
     }
 
-    QueueLog(token, L"最終処理: reboot-recovery");
+    std::wstring finalPrefix = std::to_wstring(steps.size()) + L"/" + std::to_wstring(steps.size() + 1) + L"  ";
+    QueueLog(token, finalPrefix + L"最終処理: reboot-recovery");
     auto end = Exec(FB("oem reboot-recovery"));
     if (!end.launchError.empty()) {
         QueueLog(token, L"失敗  起動エラー");
@@ -790,7 +711,7 @@ void FlashThread(uint32_t token) {
         return;
     }
 
-    QueueProgress(token, total, total);
+    QueueProgress(token, static_cast<WORD>(steps.size() + 1), static_cast<WORD>(steps.size() + 1));
     QueueLog(token, L"==============================");
     QueueLog(token, L"すべての書き込みに成功しました。");
     QueueDone(token, true, true);
