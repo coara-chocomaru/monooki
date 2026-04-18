@@ -715,9 +715,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int chipH = 26;
         int top = 24;
         int right = rc.right - 18;
-        DrawChip(hdc, right - chipW * 3 - 18 * 2, top, chipW, chipH, RGB(34, 44, 68), C_LINE, L"FASTBOOT");
-        DrawChip(hdc, right - chipW * 2 - 18, top, chipW, chipH, RGB(30, 54, 70), RGB(64, 114, 134), L"UTF-8");
-        DrawChip(hdc, right - chipW, top, chipW, chipH, RGB(32, 62, 52), RGB(64, 120, 96), L"SAFE UI");
+        DrawChip(hdc, right - chipW * 3 - 18 * 2, top, chipW, chipH, RGB(34, 44, 68), C_LINE, L"v1.0");
 
         RECT logTitle = g_layout.logCard;
         logTitle.left += 16;
