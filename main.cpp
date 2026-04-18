@@ -55,7 +55,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
                        L"ROMフォルダ : ./TAB-A05-BD\r\n"
-                       L"option.ini  : ./TAB-A05-BD/option.ini (任意)\r\n"
                        L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
                        L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
                        L"--------------------------------------------------------------\r\n"
