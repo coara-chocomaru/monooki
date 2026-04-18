@@ -32,8 +32,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hLblStatus = CreateCtrl(hwnd, L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
         hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
-        hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
-        hLblRom = CreateCtrl(hwnd, L"STATIC", L"TAB-A05-BD", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
+        hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\.\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
+        hLblRom = CreateCtrl(hwnd, L"STATIC", L"./TAB-A05-BD", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
         hLblSteps = CreateCtrl(hwnd, L"STATIC", L"wipe / flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
         hBtnCheck = CreateCtrl(hwnd, L"BUTTON", L"端末確認", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_CHECK, g_hFontBody);
@@ -53,8 +53,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateHintUI(L"端末を fastboot モードで接続してから「端末確認」を押してください。");
         UpdateStepsUI(L"wipe / flash / erase / reboot");
 
-        AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
-                       L"ROMフォルダ : TAB-A05-BD\r\n"
+        AppendLogBlock(L"fastboot    : .\\.\\platform-tools\\fastboot.exe\r\n"
+                       L"ROMフォルダ : ./TAB-A05-BD\r\n"
                        L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
                        L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
                        L"--------------------------------------------------------------\r\n"
@@ -62,7 +62,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (!FileExistsA(FASTBOOT_EXE())) {
             UpdateStatusUI(L"fastboot 未検出");
-            UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
+            UpdateHintUI(L".\\platform-tools\\fastboot.exe を配置してください。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
             AppendLogBlock(L"警告: fastboot.exe が見つかりません。\r\n");
@@ -214,7 +214,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!FileExistsA(FASTBOOT_EXE())) {
             EnableWindow(hBtnFlash, FALSE);
             UpdateStatusUI(L"fastboot 未検出");
-            UpdateHintUI(L"platform-tools\\fastboot.exe を配置してください。");
+            UpdateHintUI(L".\\platform-tools\\fastboot.exe を配置してください。");
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }

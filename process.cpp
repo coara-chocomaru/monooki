@@ -2,8 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstring>
-#include <memory>
+#include <deque>
 #include <string_view>
 #include <vector>
 
@@ -39,8 +38,7 @@ struct Handle {
 std::wstring NormalizeForDisplay(const std::wstring& src) {
     std::wstring out;
     out.reserve(src.size());
-    for (size_t i = 0; i < src.size(); ++i) {
-        wchar_t ch = src[i];
+    for (wchar_t ch : src) {
         if (ch == L'\r') {
             continue;
         }
@@ -172,7 +170,7 @@ bool FileExistsA(const std::string& path) {
 }
 
 std::string RomDir() {
-    return "TAB-A05-BD";
+    return ".\\TAB-A05-BD";
 }
 
 std::string FASTBOOT_EXE() {
@@ -299,16 +297,13 @@ void QueueText(uint32_t token, UINT kind, const std::wstring& msg) {
 }
 
 void QueueProgress(uint32_t token, WORD pos, WORD rng) {
-    if (!PostMessageW(g_hMain, WM_PROG_SET, static_cast<WPARAM>(token), MAKELPARAM(pos, rng))) {
-        return;
-    }
+    (void)token;
+    PostMessageW(g_hMain, WM_PROG_SET, static_cast<WPARAM>(token), MAKELPARAM(pos, rng));
 }
 
 void QueueDone(uint32_t token, bool ok, bool flashMode) {
     const LPARAM flags = (ok ? 1 : 0) | (flashMode ? 2 : 0);
-    if (!PostMessageW(g_hMain, WM_OP_DONE, static_cast<WPARAM>(token), flags)) {
-        return;
-    }
+    PostMessageW(g_hMain, WM_OP_DONE, static_cast<WPARAM>(token), flags);
 }
 
 void UpdateText(HWND hwnd, const std::wstring& text) {
@@ -343,12 +338,10 @@ void AppendLogBlock(const std::wstring& text) {
     }
 
     SendMessageW(hLog, WM_SETREDRAW, FALSE, 0);
-
     const int len = GetWindowTextLengthW(hLog);
     SendMessageW(hLog, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
     SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
     TrimLogWindow();
-
     SendMessageW(hLog, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(hLog, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
     SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
@@ -500,7 +493,7 @@ void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled) 
     DeleteObject(pen);
 
     wchar_t text[256]{};
-    GetWindowTextW(dis->hwndItem, text, static_cast<int>(std::size(text)));
+    GetWindowTextW(dis->hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
     RECT trc = rc;
     SetTextColor(dis->hDC, enabled ? C_TEXT : C_MUTED);
     SelectObject(dis->hDC, g_hFontBody);
