@@ -339,8 +339,6 @@ void DrawHeaderText(HDC hdc, const RECT& rc) {
     subRc.bottom = subRc.top + 28;
     SelectObject(hdc, g_hFontSub);
     SetTextColor(hdc, C_MUTED);
-    DrawTextW(hdc, L"端末確認 → 検証 → 書き込みを、見やすいダッシュボードで実行します。", -1,
-              &subRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 }
 
 void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text) {
