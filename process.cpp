@@ -161,6 +161,36 @@ std::wstring Win32ErrorText(DWORD err) {
     return out;
 }
 
+namespace {
+std::wstring ModuleDirW() {
+    wchar_t buffer[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+    if (len == 0 || len >= (sizeof(buffer) / sizeof(buffer[0]))) {
+        return L".";
+    }
+    std::wstring path(buffer, buffer + len);
+    const size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        return L".";
+    }
+    path.resize(pos);
+    return path;
+}
+
+std::string WideToAnsi(const std::wstring& s) {
+    if (s.empty()) {
+        return {};
+    }
+    const int need = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(need - 1), '\0');
+    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, out.data(), need, nullptr, nullptr);
+    return out;
+}
+} // namespace
+
 bool FileExistsA(const std::string& path) {
     if (path.empty()) {
         return false;
@@ -170,12 +200,13 @@ bool FileExistsA(const std::string& path) {
 }
 
 std::string RomDir() {
-    return ".\\TAB-A05-BD";
+    return WideToAnsi(ModuleDirW() + L"\\TAB-A05-BD");
 }
 
 std::string FASTBOOT_EXE() {
-    return ".\\platform-tools\\fastboot.exe";
+    return WideToAnsi(ModuleDirW() + L"\\platform-tools\\fastboot.exe");
 }
+
 
 std::string FB(const std::string& args) {
     return std::string("\"") + FASTBOOT_EXE() + "\" " + args;
