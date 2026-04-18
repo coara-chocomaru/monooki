@@ -241,7 +241,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UpdateStatusUI(L"検証失敗");
                 UpdateHintUI(L"端末が見つからないか、条件を満たしていません。");
                 if (!g_Unlocked) {
-                    MessageBoxW(hwnd, L"先にアンロックをしてください！", L"アンロックが必要です", MB_ICONWARNING);
+                    MessageBoxW(hwnd, L"端末との接続に失敗しました", L"実行条件を満たしていない可能性があります。", MB_ICONWARNING);
                 } else {
                     MessageBoxW(hwnd,
                         L"端末が見つからないか、モデルが一致しません。\n"
