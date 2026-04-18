@@ -1,0 +1,74 @@
+name: Build a05bd Flasher
+
+on:
+  push:
+    branches: ["main2", "master"]
+  pull_request:
+    branches: ["main2", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: MSVC / ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, x86]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC environment (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Compile test.cpp
+        shell: cmd
+        run: |
+          cl.exe /nologo ^
+                 /EHsc /std:c++17 /permissive- ^
+                 /O2 /Oi /GL /MT /GS /sdl /W3 ^
+                 test.cpp ^
+                 /link /LTCG /SUBSYSTEM:WINDOWS ^
+                 comctl32.lib kernel32.lib user32.lib gdi32.lib ^
+                 /OUT:a05bd_flasher_${{ matrix.arch }}.exe
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a05bd-flasher-${{ matrix.arch }}
+          path: a05bd_flasher_${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: Download x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: a05bd-flasher-x64
+
+      - name: Download x86 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: a05bd-flasher-x86
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          generate_release_notes: true
+          files: |
+            a05bd_flasher_x64.exe
+            a05bd_flasher_x86.exe
