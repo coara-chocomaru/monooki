@@ -578,8 +578,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return c;
         };
 
-        hLblTitle = MkCtrl(L"STATIC", L"a05bd フラッシャー", 0, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
-        hLblSub   = MkCtrl(L"STATIC", L"簡易書き込みツール", 0, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
+        hLblTitle = MkCtrl(L"STATIC", L"a05bd フラッシャー", 0, 0, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
+        hLblSub   = MkCtrl(L"STATIC", L"簡易書き込みツール", 0, 0, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
         hLblStatus = MkCtrl(L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
         hLblHint   = MkCtrl(L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = MkCtrl(L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
