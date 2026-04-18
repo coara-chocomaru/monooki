@@ -2,9 +2,9 @@ name: Build a05bd Flasher
 
 on:
   push:
-    branches: ["main5", "master"]
+    branches: ["main6", "master"]
   pull_request:
-    branches: ["main5", "master"]
+    branches: ["main6", "master"]
   workflow_dispatch:
 
 permissions:
