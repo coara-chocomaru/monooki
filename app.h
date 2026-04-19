@@ -8,8 +8,8 @@
 #include <commctrl.h>
 #include <gdiplus.h>
 
-#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -19,20 +19,20 @@
 #define EM_SETBKGNDCOLOR 0x0443
 #endif
 
-constexpr int ID_BTN_CHECK   = 101;
-constexpr int ID_BTN_FLASH   = 102;
-constexpr int ID_PROGRESS    = 103;
-constexpr int ID_LOG_WINDOW  = 104;
-constexpr int ID_LBL_STATUS  = 105;
-constexpr int ID_LBL_DEVICE  = 106;
-constexpr int ID_LBL_FASTBT  = 107;
-constexpr int ID_LBL_ROM     = 108;
-constexpr int ID_LBL_STEPS   = 109;
-constexpr int ID_LBL_HINT    = 110;
-constexpr int ID_LBL_TITLE   = 111;
-constexpr int ID_LBL_SUB     = 112;
-constexpr int ID_BTN_OPTION  = 113;
-constexpr int ID_LBL_BGIMG   = 114;
+constexpr int ID_BTN_CHECK  = 101;
+constexpr int ID_BTN_FLASH  = 102;
+constexpr int ID_PROGRESS   = 103;
+constexpr int ID_LOG_WINDOW = 104;
+constexpr int ID_LBL_STATUS = 105;
+constexpr int ID_LBL_DEVICE = 106;
+constexpr int ID_LBL_FASTBT = 107;
+constexpr int ID_LBL_ROM    = 108;
+constexpr int ID_LBL_STEPS  = 109;
+constexpr int ID_LBL_HINT   = 110;
+constexpr int ID_LBL_TITLE  = 111;
+constexpr int ID_LBL_SUB    = 112;
+constexpr int ID_BTN_OPTION = 113;
+constexpr int ID_LBL_BGIMG  = 114;
 
 constexpr UINT WM_LOG_FLUSH = WM_APP + 1;
 constexpr UINT WM_PROG_SET  = WM_APP + 2;
@@ -163,7 +163,9 @@ extern std::wstring g_BgImageText;
 extern Layout g_layout;
 extern std::mutex g_LogMutex;
 extern std::deque<LogLine> g_LogQueue;
+extern std::deque<std::wstring> g_LogLines;
 extern std::atomic<bool> g_LogFlushPending;
+extern int g_LogScrollPos;
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ToWide(const std::string& s);
@@ -207,6 +209,7 @@ void ShutdownGdiPlus();
 void ReloadBackgroundImage();
 void ApplyAppConfig(const AppConfig& cfg);
 void OpenSettingsWindow(HWND owner);
+void RegisterLogViewClass();
 AppConfig LoadAppConfig();
 void SaveAppConfig(const AppConfig& cfg);
 AppConfig DefaultAppConfig();

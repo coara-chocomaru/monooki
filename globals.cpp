@@ -41,13 +41,15 @@ std::atomic<uint32_t> g_CurrentOperationToken{0};
 
 std::wstring g_StatusText = L"待機中";
 std::wstring g_DeviceText = L"未確認";
-std::wstring g_FastbootText = L".\\platform-tools\\fastboot.exe";
-std::wstring g_RomText = L"./TAB-A05-BD";
-std::wstring g_StepsText = L"wipe / flash / erase / reboot";
+std::wstring g_FastbootText = L"fastboot.exe : .\\platform-tools\\fastboot.exe";
+std::wstring g_RomText = L"画像フォルダ : ./TAB-A05-BD";
+std::wstring g_StepsText = L"手順 : flash / erase / reboot";
 std::wstring g_HintText = L"端末を fastboot モードで接続してから「端末確認」を押してください。";
-std::wstring g_BgImageText = L"背景画像: 未設定";
+std::wstring g_BgImageText = L"背景画像 : 未設定";
 
 Layout g_layout{};
 std::mutex g_LogMutex;
 std::deque<LogLine> g_LogQueue;
+std::deque<std::wstring> g_LogLines;
 std::atomic<bool> g_LogFlushPending{false};
+int g_LogScrollPos{0};

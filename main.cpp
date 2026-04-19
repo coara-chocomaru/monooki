@@ -22,23 +22,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hFontBody = MakeFont(L"Segoe UI", 10, FW_NORMAL);
         g_hFontMono = MakeFont(L"Consolas", 10, FW_NORMAL);
 
-        SafeDeleteObject(g_brPanel);
-        SafeDeleteObject(g_brPanel2);
-        SafeDeleteObject(g_brEdit);
-        g_brPanel = CreateSolidBrush(C_PANEL);
-        g_brPanel2 = CreateSolidBrush(C_PANEL2);
-        g_brEdit = CreateSolidBrush(C_EDIT_BG);
+        if (!g_brPanel) {
+            g_brPanel = CreateSolidBrush(C_PANEL);
+        }
+        if (!g_brPanel2) {
+            g_brPanel2 = CreateSolidBrush(C_PANEL2);
+        }
+        if (!g_brEdit) {
+            g_brEdit = CreateSolidBrush(C_EDIT_BG);
+        }
         g_brTransparent = reinterpret_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
 
-        hLblTitle = CreateCtrl(hwnd, L"STATIC", L"a05bd フラッシャー", 0, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
-        hLblSub = CreateCtrl(hwnd, L"STATIC", L"簡易書き込みツール", 0, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
-        hLblStatus = CreateCtrl(hwnd, L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
-        hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
-        hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
-        hLblFastboot = CreateCtrl(hwnd, L"STATIC", g_FastbootText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
-        hLblRom = CreateCtrl(hwnd, L"STATIC", g_RomText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
-        hLblBgImage = CreateCtrl(hwnd, L"STATIC", g_BgImageText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_BGIMG, g_hFontBody);
-        hLblSteps = CreateCtrl(hwnd, L"STATIC", g_StepsText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
+        hLblTitle = CreateCtrl(hwnd, L"STATIC", L"a05bd フラッシャー", SS_LEFTNOWORDWRAP, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
+        hLblSub = CreateCtrl(hwnd, L"STATIC", L"簡易書き込みツール", SS_LEFTNOWORDWRAP, 0, 0, 0, 0, 0, ID_LBL_SUB, g_hFontSub);
+        hLblStatus = CreateCtrl(hwnd, L"STATIC", L"待機中", SS_LEFTNOWORDWRAP, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
+        hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFTNOWORDWRAP, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
+        hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
+        hLblFastboot = CreateCtrl(hwnd, L"STATIC", g_FastbootText.c_str(), SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
+        hLblRom = CreateCtrl(hwnd, L"STATIC", g_RomText.c_str(), SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
+        hLblBgImage = CreateCtrl(hwnd, L"STATIC", g_BgImageText.c_str(), SS_LEFTNOWORDWRAP | SS_PATHELLIPSIS, 0, 0, 0, 0, 0, ID_LBL_BGIMG, g_hFontBody);
+        hLblSteps = CreateCtrl(hwnd, L"STATIC", g_StepsText.c_str(), SS_LEFTNOWORDWRAP, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
         hBtnCheck = CreateCtrl(hwnd, L"BUTTON", L"端末確認", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_CHECK, g_hFontBody);
         hBtnFlash = CreateCtrl(hwnd, L"BUTTON", L"ROM 書き込み", BS_OWNERDRAW | BS_PUSHBUTTON | WS_DISABLED, 0, 0, 0, 0, 0, ID_BTN_FLASH, g_hFontBody);
@@ -50,10 +53,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
         SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
 
-        hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
-                          WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
-        SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
-        SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
+        RegisterLogViewClass();
+        hLog = CreateWindowExW(0, L"A05BDLogView", nullptr, WS_VISIBLE | WS_CHILD | WS_VSCROLL,
+                               0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_LOG_WINDOW)), nullptr, nullptr);
+        if (hLog && g_hFontMono) {
+            SendMessageW(hLog, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontMono), FALSE);
+        }
 
         UpdateStatusUI(L"待機中");
         UpdateDeviceUI(L"未確認");
@@ -61,13 +66,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStepsUI(L"手順 : flash / erase / reboot");
         UpdateBgImageUI(g_BgImageText);
 
-        AppendLogBlock(g_FastbootText + L"\r\n"
-                       + g_RomText + L"\r\n"
-                       + g_BgImageText + L"\r\n"
-                       + L"確認手順      : fastboot devices / getvar product / getvar unlocked\r\n"
-                       + L"処理方式      : 個別 partition に flash / erase を順次実行\r\n"
-                       + L"--------------------------------------------------------------\r\n"
-                       + L"端末を fastboot モードで接続し、「端末確認」を押してください。\r\n");
+        AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
+                       L"ROMフォルダ : ./TAB-A05-BD\r\n"
+                       L"背景画像    : 未設定\r\n"
+                       L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
+                       L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
+                       L"--------------------------------------------------------------\r\n"
+                       L"端末を fastboot モードで接続し、「端末確認」を押してください。\r\n");
 
         if (!FileExistsA(FASTBOOT_EXE())) {
             UpdateStatusUI(L"fastboot 未検出");
@@ -167,10 +172,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLORBTN: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_PANEL);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brPanel);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_ERASEBKGND:

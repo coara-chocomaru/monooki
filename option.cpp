@@ -2,7 +2,6 @@
 
 #include <commdlg.h>
 #include <cwctype>
-#include <cwchar>
 #include <iterator>
 
 #pragma comment(lib, "comdlg32.lib")
@@ -11,10 +10,10 @@ namespace {
 constexpr int IDC_THEME = 2001;
 constexpr int IDC_IMGDIR = 2002;
 constexpr int IDC_BGIMG = 2003;
-constexpr int IDC_BG_BROWSE = 2004;
-constexpr int IDC_SAVE = 2005;
-constexpr int IDC_RESET = 2006;
-constexpr int IDC_CLOSE = 2007;
+constexpr int IDC_SAVE = 2004;
+constexpr int IDC_RESET = 2005;
+constexpr int IDC_CLOSE = 2006;
+constexpr int IDC_BG_BROWSE = 2007;
 
 struct SettingsState {
     HWND owner{};
@@ -117,59 +116,6 @@ int ThemeIndexFromLabel(const std::wstring& text) {
     return 0;
 }
 
-void RebuildThemeResources() {
-    SafeDeleteObject(g_brPanel);
-    SafeDeleteObject(g_brPanel2);
-    SafeDeleteObject(g_brEdit);
-    g_brPanel = CreateSolidBrush(C_PANEL);
-    g_brPanel2 = CreateSolidBrush(C_PANEL2);
-    g_brEdit = CreateSolidBrush(C_EDIT_BG);
-    if (hProgressBar) {
-        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
-        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
-    }
-}
-
-void PaintSettingsWindow(HDC hdc, const RECT& rc) {
-    HBRUSH bg = CreateSolidBrush(C_BG);
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
-
-    RECT header = {rc.left, rc.top, rc.right, rc.top + 96};
-    HBRUSH headerBr = CreateSolidBrush(C_BG2);
-    FillRect(hdc, &header, headerBr);
-    DeleteObject(headerBr);
-
-    RECT accent = {rc.left + 18, 94, rc.right - 18, 96};
-    HBRUSH accentBr = CreateSolidBrush(C_ACCENT);
-    FillRect(hdc, &accent, accentBr);
-    DeleteObject(accentBr);
-
-    const int margin = 18;
-    const int gap = 14;
-    const int cardTop = 110;
-    const int cardH = (rc.bottom - rc.top) - cardTop - margin;
-    const int totalW = (rc.right - rc.left) - margin * 2;
-    const int leftW = (totalW - gap) * 58 / 100;
-    const int rightW = totalW - gap - leftW;
-    RECT leftCard{margin, cardTop, margin + leftW, cardTop + cardH};
-    RECT rightCard{margin + leftW + gap, cardTop, margin + leftW + gap + rightW, cardTop + cardH};
-
-    DrawRoundCard(hdc, leftCard, C_PANEL, C_LINE, 18);
-    DrawRoundCard(hdc, rightCard, C_PANEL2, C_LINE, 18);
-
-    SetBkMode(hdc, TRANSPARENT);
-    SelectObject(hdc, g_hFontTitle);
-    SetTextColor(hdc, C_TEXT);
-    RECT titleRc{margin, 18, rc.right - margin, 56};
-    DrawTextW(hdc, L"設定", -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    SelectObject(hdc, g_hFontBody);
-    SetTextColor(hdc, C_MUTED);
-    RECT descRc{margin, 54, rc.right - margin, 76};
-    DrawTextW(hdc, L"色・画像フォルダ・背景画像をこの画面で切り替えます。", -1, &descRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-}
-
 std::wstring DisplayImageDir() {
     if (g_Config.imageDir.empty()) {
         return L"./TAB-A05-BD";
@@ -184,6 +130,19 @@ std::wstring DisplayBgImage() {
     return g_Config.backgroundImage;
 }
 
+void RebuildThemeResources() {
+    SafeDeleteObject(g_brPanel);
+    SafeDeleteObject(g_brPanel2);
+    SafeDeleteObject(g_brEdit);
+    g_brPanel = CreateSolidBrush(C_PANEL);
+    g_brPanel2 = CreateSolidBrush(C_PANEL2);
+    g_brEdit = CreateSolidBrush(C_EDIT_BG);
+    if (hProgressBar) {
+        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
+        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
+    }
+}
+
 void RefreshTexts() {
     g_FastbootText = L"fastboot.exe : .\\platform-tools\\fastboot.exe";
     g_RomText = L"画像フォルダ : " + DisplayImageDir();
@@ -196,6 +155,8 @@ void RefreshTexts() {
     UpdateText(hLblTitle, L"a05bd フラッシャー");
     UpdateText(hLblSub, L"簡易書き込みツール");
 }
+
+AppConfig DefaultAppConfig();
 
 bool WriteConfigFile(const AppConfig& cfg) {
     const std::wstring path = ConfigPathW();
@@ -230,15 +191,10 @@ AppConfig ReadConfigFromFile() {
     return cfg;
 }
 
-void ApplyThemeToWindow(HWND hwnd) {
-    if (hwnd) {
-        InvalidateRect(hwnd, nullptr, TRUE);
-        UpdateWindow(hwnd);
-    }
-}
-
 void FillSettingsControls(SettingsState* state) {
-    if (!state) return;
+    if (!state) {
+        return;
+    }
     SendMessageW(state->comboTheme, CB_RESETCONTENT, 0, 0);
     SendMessageW(state->comboTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"a : default"));
     SendMessageW(state->comboTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"b"));
@@ -248,11 +204,22 @@ void FillSettingsControls(SettingsState* state) {
     SetWindowTextW(state->editBgImg, g_Config.backgroundImage.empty() ? L"" : g_Config.backgroundImage.c_str());
 }
 
+void ApplyThemeToWindow(HWND hwnd) {
+    if (hwnd) {
+        InvalidateRect(hwnd, nullptr, TRUE);
+        UpdateWindow(hwnd);
+    }
+}
+
 void SaveFromSettings(SettingsState* state) {
-    if (!state) return;
+    if (!state) {
+        return;
+    }
     AppConfig cfg{};
     cfg.themeIndex = static_cast<int>(SendMessageW(state->comboTheme, CB_GETCURSEL, 0, 0));
-    if (cfg.themeIndex < 0 || cfg.themeIndex > 2) cfg.themeIndex = 0;
+    if (cfg.themeIndex < 0 || cfg.themeIndex > 2) {
+        cfg.themeIndex = 0;
+    }
     cfg.imageDir = NormalizeInputPath(ReadControlText(state->editImgDir));
     cfg.backgroundImage = NormalizeInputPath(ReadControlText(state->editBgImg));
     SaveAppConfig(cfg);
@@ -273,6 +240,37 @@ void BrowseBackgroundImage(HWND owner, HWND targetEdit) {
     }
 }
 
+void PaintSettingsWindow(HWND hwnd, HDC hdc) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+
+    Gdiplus::SolidBrush bg(Gdiplus::Color(255, GetRValue(C_BG), GetGValue(C_BG), GetBValue(C_BG)));
+    g.FillRectangle(&bg, static_cast<float>(rc.left), static_cast<float>(rc.top),
+                    static_cast<float>(rc.right - rc.left), static_cast<float>(rc.bottom - rc.top));
+
+    Gdiplus::SolidBrush head(Gdiplus::Color(255, GetRValue(C_BG2), GetGValue(C_BG2), GetBValue(C_BG2)));
+    g.FillRectangle(&head, static_cast<float>(rc.left), static_cast<float>(rc.top),
+                    static_cast<float>(rc.right - rc.left), 64.0f);
+
+    Gdiplus::SolidBrush accent(Gdiplus::Color(255, GetRValue(C_ACCENT), GetGValue(C_ACCENT), GetBValue(C_ACCENT)));
+    g.FillRectangle(&accent, static_cast<float>(rc.left), 64.0f, static_cast<float>(rc.right - rc.left), 2.0f);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SelectObject(hdc, g_hFontTitle);
+    SetTextColor(hdc, C_TEXT);
+    RECT titleRc{18, 14, rc.right - 18, 42};
+    DrawTextW(hdc, L"設定", -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, g_hFontBody);
+    SetTextColor(hdc, C_MUTED);
+    RECT hintRc{18, 40, rc.right - 18, 60};
+    DrawTextW(hdc, L"config.ini に保存され、次回起動時も同じディレクトリから読み込まれます。", -1, &hintRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+}
+
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* state = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
@@ -283,29 +281,29 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
 
         const int left = 18;
-        const int top = 18;
-        const int labelW = 120;
-        const int editW = 300;
+        const int top = 78;
+        const int labelW = 142;
+        const int editW = 360;
         const int rowH = 28;
-        const int gapY = 14;
-        const int buttonW = 86;
-        const int buttonH = 28;
+        const int gapY = 16;
+        const int buttonW = 94;
+        const int buttonH = 30;
 
         CreateWindowExW(0, L"STATIC", L"レイアウト色", WS_CHILD | WS_VISIBLE, left, top + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
         state->comboTheme = CreateWindowExW(0, L"COMBOBOX", nullptr,
                                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                                             left + labelW, top, editW, 200, hwnd, reinterpret_cast<HMENU>(IDC_THEME), nullptr, nullptr);
 
-        CreateWindowExW(0, L"STATIC", L"画像フォルダ", WS_CHILD | WS_VISIBLE, left, top + rowH + gapY + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindowExW(0, L"STATIC", L"画像フォルダ (フルパス)", WS_CHILD | WS_VISIBLE, left, top + rowH + gapY + 4, labelW + 40, 20, hwnd, nullptr, nullptr, nullptr);
         state->editImgDir = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
                                             left + labelW, top + rowH + gapY, editW, rowH, hwnd, reinterpret_cast<HMENU>(IDC_IMGDIR), nullptr, nullptr);
 
-        CreateWindowExW(0, L"STATIC", L"背景画像", WS_CHILD | WS_VISIBLE, left, top + (rowH + gapY) * 2 + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindowExW(0, L"STATIC", L"背景画像 (フルパス)", WS_CHILD | WS_VISIBLE, left, top + (rowH + gapY) * 2 + 4, labelW + 40, 20, hwnd, nullptr, nullptr, nullptr);
         state->editBgImg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
                                            left + labelW, top + (rowH + gapY) * 2, editW - buttonW - 8, rowH, hwnd, reinterpret_cast<HMENU>(IDC_BGIMG), nullptr, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        CreateWindowExW(0, L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         left + labelW + editW - buttonW, top + (rowH + gapY) * 2, buttonW, buttonH,
                         hwnd, reinterpret_cast<HMENU>(IDC_BG_BROWSE), nullptr, nullptr);
 
@@ -314,48 +312,39 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"STATIC", L"背景画像は透過つきで自動リサイズ表示されます。", WS_CHILD | WS_VISIBLE,
                         left, top + (rowH + gapY) * 3 + 26, 520, 20, hwnd, nullptr, nullptr, nullptr);
 
-        CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        left, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_RESET), nullptr, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        left + buttonW + 10, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                        left + (buttonW + 10) * 2, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_CLOSE), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        left, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_RESET), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        left + buttonW + 10, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                        left + (buttonW + 10) * 2, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_CLOSE), nullptr, nullptr);
 
         FillSettingsControls(state);
+
         for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
             SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBody), TRUE);
         }
-        InvalidateRect(hwnd, nullptr, TRUE);
+        if (state->comboTheme) {
+            SendMessageW(state->comboTheme, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBody), TRUE);
+        }
         return 0;
     }
 
-    case WM_CTLCOLORSTATIC: {
-        HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brTransparent);
-    }
-
-    case WM_CTLCOLORBTN: {
-        HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brPanel);
-    }
-
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
     case WM_CTLCOLORDLG: {
         HDC hdc = reinterpret_cast<HDC>(wp);
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brPanel);
+        return reinterpret_cast<LRESULT>(g_brTransparent ? g_brTransparent : GetStockObject(NULL_BRUSH));
     }
 
     case WM_CTLCOLORLISTBOX: {
         HDC hdc = reinterpret_cast<HDC>(wp);
         SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_EDIT_BG);
+        SetBkColor(hdc, C_PANEL2);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brEdit);
+        return reinterpret_cast<LRESULT>(g_brPanel2 ? g_brPanel2 : g_brTransparent);
     }
 
     case WM_CTLCOLOREDIT: {
@@ -372,11 +361,21 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc{};
-        GetClientRect(hwnd, &rc);
-        PaintSettingsWindow(hdc, rc);
+        PaintSettingsWindow(hwnd, hdc);
         EndPaint(hwnd, &ps);
         return 0;
+    }
+
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lp);
+        if (dis && dis->CtlType == ODT_BUTTON) {
+            const bool enabled = IsWindowEnabled(dis->hwndItem) != FALSE;
+            const bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            const bool hot = (dis->itemState & ODS_HOTLIGHT) != 0;
+            DrawButtonFace(dis, hot, pressed, enabled);
+            return TRUE;
+        }
+        break;
     }
 
     case WM_COMMAND: {
@@ -387,8 +386,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_SAVE:
             SaveFromSettings(state);
             ApplyThemeToWindow(g_hMain);
-            InvalidateRect(hwnd, nullptr, TRUE);
-            UpdateWindow(hwnd);
             return 0;
         case IDC_RESET: {
             AppConfig cfg = DefaultAppConfig();
@@ -396,8 +393,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ApplyAppConfig(cfg);
             FillSettingsControls(state);
             ApplyThemeToWindow(g_hMain);
-            InvalidateRect(hwnd, nullptr, TRUE);
-            UpdateWindow(hwnd);
             return 0;
         }
         case IDC_CLOSE:
@@ -416,19 +411,26 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
 
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        HWND owner = state ? state->owner : nullptr;
         if (state) {
             delete state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }
         g_hSettings = nullptr;
+        if (owner) {
+            EnableWindow(owner, TRUE);
+            SetForegroundWindow(owner);
+        }
         return 0;
+    }
     }
 
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 } // namespace
+
 
 AppConfig DefaultAppConfig() {
     AppConfig cfg{};
@@ -468,6 +470,9 @@ void ApplyAppConfig(const AppConfig& cfg) {
     if (g_hMain) {
         InvalidateRect(g_hMain, nullptr, TRUE);
     }
+    if (hLog) {
+        InvalidateRect(hLog, nullptr, TRUE);
+    }
 }
 
 void OpenSettingsWindow(HWND owner) {
@@ -496,8 +501,8 @@ void OpenSettingsWindow(HWND owner) {
     }
 
     g_hSettings = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
-                                  clsName, L"設定", WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 720, 420,
+                                  clsName, L"設定", WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 620, 390,
                                   owner, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_hSettings) {
         return;
@@ -505,8 +510,8 @@ void OpenSettingsWindow(HWND owner) {
 
     RECT rcOwner{};
     if (owner && GetWindowRect(owner, &rcOwner)) {
-        const int w = 720;
-        const int h = 420;
+        const int w = 620;
+        const int h = 390;
         const int x = rcOwner.left + ((rcOwner.right - rcOwner.left) - w) / 2;
         const int y = rcOwner.top + ((rcOwner.bottom - rcOwner.top) - h) / 2;
         SetWindowPos(g_hSettings, nullptr, x, y, w, h, SWP_NOZORDER);
