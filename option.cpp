@@ -176,6 +176,12 @@ std::wstring OptionIniPathW() {
     return ModuleDirW() + L"\\option.ini";
 }
 
+bool IsLogSavingEnabled() {
+    const bool enabled = GetPrivateProfileIntW(L"Settings", L"log", 1, OptionIniPathW().c_str()) != 0;
+    g_LogEnabled.store(enabled, std::memory_order_release);
+    return enabled;
+}
+
 void EnsureGdiPlus() {
     if (g_GdiPlusReady) {
         return;
@@ -645,9 +651,9 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-     1.60f, 0.0f, 0.0f, 0.0f, 0.0f,
-     0.0f, 1.60f, 0.0f, 0.0f, 0.0f,
-     0.0f, 0.0f, 1.60f, 0.0f, 0.0f,
+     1.30f, 0.0f, 0.0f, 0.0f, 0.0f,
+     0.0f, 1.30f, 0.0f, 0.0f, 0.0f,
+     0.0f, 0.0f, 1.30f, 0.0f, 0.0f,
      0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
      0.0f, 0.0f, 0.0f, 0.0f, 1.0f
 }};
@@ -676,7 +682,7 @@ void LoadAppConfig() {
     GetPrivateProfileStringW(L"Settings", L"background_image", L"", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path.c_str());
     g_ConfigBackgroundImage = TrimCopy(buffer);
 
-    g_LogEnabled = GetPrivateProfileIntW(L"Settings", L"log", 1, OptionIniPathW().c_str()) != 0;
+    g_LogEnabled = IsLogSavingEnabled();
 
     ApplyConfigState(false);
 

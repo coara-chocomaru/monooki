@@ -164,6 +164,7 @@ void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled);
 void AppendLogBlock(const std::wstring& text);
 void FlushLogQueue();
 void CleanupGdi();
+bool IsLogSavingEnabled();
 void LoadAppConfig();
 void SaveAppConfig();
 void OpenSettingsWindow();

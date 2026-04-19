@@ -174,7 +174,7 @@ struct SessionLog {
     }
 
     void save(const wchar_t* suffix, bool ok, bool flashMode) const {
-        if (!g_LogEnabled.load(std::memory_order_acquire)) {
+        if (!IsLogSavingEnabled()) {
             return;
         }
 
