@@ -427,7 +427,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
-    case WM_CTLCOLOREDIT: {
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX: {
         HDC hdc = reinterpret_cast<HDC>(wp);
         SetBkMode(hdc, OPAQUE);
         SetBkColor(hdc, C_EDIT_BG);
@@ -443,8 +444,15 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return reinterpret_cast<LRESULT>(g_brPanel);
     }
 
-    case WM_ERASEBKGND:
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        HBRUSH br = CreateSolidBrush(C_BG);
+        FillRect(hdc, &rc, br);
+        DeleteObject(br);
         return 1;
+    }
 
     case WM_PAINT: {
         PAINTSTRUCT ps{};
@@ -561,7 +569,10 @@ void SaveAppConfig() {
 }
 
 void OpenSettingsWindow() {
+    LoadAppConfig();
+
     if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) {
+        SyncSettingsWindowFields();
         ShowWindow(g_hSettingsWnd, SW_SHOW);
         SetForegroundWindow(g_hSettingsWnd);
         return;

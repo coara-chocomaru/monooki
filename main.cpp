@@ -2,6 +2,84 @@
 
 #include <thread>
 
+#include <commctrl.h>
+#include <msimg32.h>
+
+
+namespace {
+
+void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient) {
+    const int w = rcClient.right - rcClient.left;
+    const int h = rcClient.bottom - rcClient.top;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    HWND parent = GetParent(hwnd);
+    if (!parent) {
+        return;
+    }
+
+    RECT rcScreen = rcClient;
+    POINT pts[2] = {
+        {rcScreen.left, rcScreen.top},
+        {rcScreen.right, rcScreen.bottom}
+    };
+    MapWindowPoints(hwnd, parent, pts, 2);
+    rcScreen.left = pts[0].x;
+    rcScreen.top = pts[0].y;
+    rcScreen.right = pts[1].x;
+    rcScreen.bottom = pts[1].y;
+
+    HDC hParent = GetDC(parent);
+    if (!hParent) {
+        return;
+    }
+
+    BitBlt(hdc, 0, 0, w, h, hParent, rcScreen.left, rcScreen.top, SRCCOPY);
+    ReleaseDC(parent, hParent);
+
+    HDC mem = CreateCompatibleDC(hdc);
+    if (!mem) {
+        return;
+    }
+
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
+    if (!bmp) {
+        DeleteDC(mem);
+        return;
+    }
+
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    RECT fill{0, 0, w, h};
+    HBRUSH br = CreateSolidBrush(C_PANEL2);
+    FillRect(mem, &fill, br);
+    DeleteObject(br);
+
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 170;
+    bf.AlphaFormat = 0;
+    AlphaBlend(hdc, 0, 0, w, h, mem, 0, 0, w, h, bf);
+
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
+LRESULT CALLBACK LogSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        PaintLogBackdrop(hwnd, hdc, rc);
+        return 1;
+    }
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWORD style, DWORD exStyle,
                        int x, int y, int w, int h, int id, HFONT font) {
     HWND c = CreateWindowExW(exStyle, cls, txt, WS_VISIBLE | WS_CHILD | style,
@@ -45,7 +123,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hProgressBar, PBM_SETMARQUEE, FALSE, 0);
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
-                          WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
+                          WS_EX_TRANSPARENT | WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
+        SetWindowSubclass(hLog, LogSubclassProc, 1, 0);
         SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
         SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
 

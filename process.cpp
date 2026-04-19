@@ -528,7 +528,7 @@ void PaintMain(HDC hdc, const RECT& rc) {
     subRc.bottom = subRc.top + 24;
     DrawTextW(hdc, L"簡易書き込みツール", -1, &subRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    DrawChip(hdc, rc.right - 216, 24, 92, 26, RGB(34, 44, 68), C_LINE, L"v1.0");
+    DrawChip(hdc, rc.right - 322, 24, 92, 26, RGB(34, 44, 68), C_LINE, L"v1.0");
 
     RECT logTitle = g_layout.logCard;
     logTitle.left += 16;
