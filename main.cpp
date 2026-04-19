@@ -61,7 +61,7 @@ void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient) {
 
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 64;
+    bf.SourceConstantAlpha = 255;
     bf.AlphaFormat = 0;
     AlphaBlend(hdc, 0, 0, w, h, mem, 0, 0, w, h, bf);
 
