@@ -290,20 +290,20 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         CreateWindowExW(0, L"STATIC", L"レイアウト色", WS_CHILD | WS_VISIBLE, left, top + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
         state->comboTheme = CreateWindowExW(0, L"COMBOBOX", nullptr,
                                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
-                                            left + labelW, top, editW, 200, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_THEME)), nullptr, nullptr);
+                                            left + labelW, top, editW, 200, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_THEME)), nullptr, nullptr);
 
         CreateWindowExW(0, L"STATIC", L"画像フォルダ (フルパス)", WS_CHILD | WS_VISIBLE, left, top + rowH + gapY + 4, labelW + 40, 20, hwnd, nullptr, nullptr, nullptr);
         state->editImgDir = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
-                                            left + labelW, top + rowH + gapY, editW, rowH, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_IMGDIR)), nullptr, nullptr);
+                                            left + labelW, top + rowH + gapY, editW, rowH, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_IMGDIR)), nullptr, nullptr);
 
         CreateWindowExW(0, L"STATIC", L"背景画像 (フルパス)", WS_CHILD | WS_VISIBLE, left, top + (rowH + gapY) * 2 + 4, labelW + 40, 20, hwnd, nullptr, nullptr, nullptr);
         state->editBgImg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
-                                           left + labelW, top + (rowH + gapY) * 2, editW - buttonW - 8, rowH, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BGIMG)), nullptr, nullptr);
+                                           left + labelW, top + (rowH + gapY) * 2, editW - buttonW - 8, rowH, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_BGIMG)), nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                         left + labelW + editW - buttonW, top + (rowH + gapY) * 2, buttonW, buttonH,
-                        hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BG_BROWSE)), nullptr, nullptr);
+                        hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_BG_BROWSE)), nullptr, nullptr);
 
         CreateWindowExW(0, L"STATIC", L"保存すると config.ini に反映されます。", WS_CHILD | WS_VISIBLE,
                         left, top + (rowH + gapY) * 3 + 4, 520, 20, hwnd, nullptr, nullptr, nullptr);
@@ -311,11 +311,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         left, top + (rowH + gapY) * 3 + 26, 520, 20, hwnd, nullptr, nullptr, nullptr);
 
         CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                        left, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_RESET)), nullptr, nullptr);
+                        left, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_RESET)), nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                        left + buttonW + 10, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SAVE)), nullptr, nullptr);
+                        left + buttonW + 10, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_SAVE)), nullptr, nullptr);
         CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                        left + (buttonW + 10) * 2, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLOSE)), nullptr, nullptr);
+                        left + (buttonW + 10) * 2, top + (rowH + gapY) * 4 + 28, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_CLOSE)), nullptr, nullptr);
 
         FillSettingsControls(state);
 
@@ -452,26 +452,6 @@ void SaveAppConfig(const AppConfig& cfg) {
     WriteConfigFile(normalized);
 }
 
-void ApplyAppConfig(const AppConfig& cfg) {
-    g_Config = cfg;
-    if (g_Config.themeIndex < 0 || g_Config.themeIndex > 2) {
-        g_Config.themeIndex = 0;
-    }
-    g_theme = ThemeFromIndex(g_Config.themeIndex);
-    RebuildThemeResources();
-    RefreshTexts();
-    ReloadBackgroundImage();
-    if (hProgressBar) {
-        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
-        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
-    }
-    if (g_hMain) {
-        InvalidateRect(g_hMain, nullptr, TRUE);
-    }
-    if (hLog) {
-        InvalidateRect(hLog, nullptr, TRUE);
-    }
-}
 
 void OpenSettingsWindow(HWND owner) {
     if (g_hSettings && IsWindow(g_hSettings)) {
