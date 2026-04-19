@@ -625,7 +625,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-} // namespace
+}
 
 void DrawBackgroundImage(HDC hdc, const RECT& rc) {
     if (!g_BackgroundImage) {
@@ -645,12 +645,12 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-        1.15f, 0.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.15f, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.15f, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.0f, 1.0f
-    }};
+     1.30f, 0.0f, 0.0f, 0.0f, 0.0f,
+     0.0f, 1.30f, 0.0f, 0.0f, 0.0f,
+     0.0f, 0.0f, 1.30f, 0.0f, 0.0f,
+     0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
+     0.0f, 0.0f, 0.0f, 0.0f, 1.0f
+}};
     attrs.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
 
     const RectF dest(static_cast<REAL>(rc.left), static_cast<REAL>(rc.top),
