@@ -64,6 +64,8 @@ bool g_GdiPlusReady{};
 bool g_SettingsSyncing{};
 std::unique_ptr<Image> g_BackgroundImage;
 std::wstring g_BackgroundResolvedPath;
+constexpr float kBackgroundBrightness = 1.00f;
+constexpr float kBackgroundAlpha = 0.42f;
 
 std::wstring TrimCopy(std::wstring s) {
     auto notSpace = [](wchar_t ch) { return !iswspace(ch); };
@@ -645,10 +647,10 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-        1.10f, 0.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.10f, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.10f, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.28f, 0.0f,
+        kBackgroundBrightness, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, kBackgroundBrightness, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, kBackgroundBrightness, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, kBackgroundAlpha, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f, 1.0f
     }};
     attrs.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);

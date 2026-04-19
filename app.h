@@ -113,6 +113,10 @@ extern std::atomic<bool> g_Busy;
 extern std::atomic<bool> g_Unlocked;
 extern std::atomic<uint32_t> g_CurrentOperationToken;
 
+extern std::wstring g_OperationLogBuffer;
+extern std::mutex g_OperationLogMutex;
+extern uint32_t g_OperationLogToken;
+
 extern std::wstring g_StatusText;
 extern std::wstring g_DeviceText;
 extern std::wstring g_FastbootText;

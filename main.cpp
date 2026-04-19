@@ -122,8 +122,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hProgressBar, PBM_SETMARQUEE, FALSE, 0);
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
-                          WS_EX_TRANSPARENT, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
-        SetWindowSubclass(hLog, LogSubclassProc, 1, 0);
+                          0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
         SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
 
         UpdateStatusUI(L"待機中");
@@ -231,9 +230,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLOREDIT: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, TRANSPARENT);
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, C_EDIT_BG);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brTransparent);
+        return reinterpret_cast<LRESULT>(g_brEdit ? g_brEdit : g_brPanel2);
     }
 
     case WM_CTLCOLORBTN: {
