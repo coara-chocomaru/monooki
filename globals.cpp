@@ -49,10 +49,6 @@ std::atomic<bool> g_Busy{false};
 std::atomic<bool> g_Unlocked{false};
 std::atomic<uint32_t> g_CurrentOperationToken{0};
 
-std::wstring g_OperationLogBuffer;
-std::mutex g_OperationLogMutex;
-uint32_t g_OperationLogToken{0};
-
 std::wstring g_StatusText = L"待機中";
 std::wstring g_DeviceText = L"未確認";
 std::wstring g_FastbootText = L".\\platform-tools\\fastboot.exe";
@@ -67,3 +63,4 @@ Layout g_layout{};
 std::mutex g_LogMutex;
 std::deque<LogLine> g_LogQueue;
 std::atomic<bool> g_LogFlushPending{false};
+std::atomic<bool> g_LogEnabled{true};

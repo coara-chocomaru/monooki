@@ -64,8 +64,6 @@ bool g_GdiPlusReady{};
 bool g_SettingsSyncing{};
 std::unique_ptr<Image> g_BackgroundImage;
 std::wstring g_BackgroundResolvedPath;
-constexpr float kBackgroundBrightness = 1.00f;
-constexpr float kBackgroundAlpha = 0.42f;
 
 std::wstring TrimCopy(std::wstring s) {
     auto notSpace = [](wchar_t ch) { return !iswspace(ch); };
@@ -172,6 +170,10 @@ bool FileExistsW(const std::wstring& path) {
 
 std::wstring ConfigIniPathW() {
     return ModuleDirW() + L"\\config.ini";
+}
+
+std::wstring OptionIniPathW() {
+    return ModuleDirW() + L"\\option.ini";
 }
 
 void EnsureGdiPlus() {
@@ -647,10 +649,10 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-        kBackgroundBrightness, 0.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, kBackgroundBrightness, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, kBackgroundBrightness, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, kBackgroundAlpha, 0.0f,
+        1.15f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.15f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.15f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f, 1.0f
     }};
     attrs.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
@@ -678,6 +680,8 @@ void LoadAppConfig() {
     GetPrivateProfileStringW(L"Settings", L"background_image", L"", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path.c_str());
     g_ConfigBackgroundImage = TrimCopy(buffer);
 
+    g_LogEnabled = GetPrivateProfileIntW(L"Settings", L"log", 1, OptionIniPathW().c_str()) != 0;
+
     ApplyConfigState(false);
 
     if (!exists) {
@@ -694,6 +698,7 @@ void SaveAppConfig() {
     WritePrivateProfileStringW(L"Settings", L"theme", theme.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Settings", L"rom_dir", rom.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Settings", L"background_image", bg.c_str(), path.c_str());
+    WritePrivateProfileStringW(L"Settings", L"log", g_LogEnabled.load(std::memory_order_acquire) ? L"1" : L"0", OptionIniPathW().c_str());
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
 
     g_ConfigThemeKey = theme;

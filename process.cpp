@@ -80,44 +80,26 @@ std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
     return lines;
 }
 
-std::wstring OptionIniPathW() {
-    return ModuleDirW() + L"\\option.ini";
-}
-
-bool IsOperationLogEnabled() {
-    const std::string path = WideToAnsi(OptionIniPathW());
-    return GetPrivateProfileIntA("Partitions", "log", 1, path.c_str()) != 0;
-}
-
-std::wstring CurrentTimestampString() {
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    wchar_t buffer[64]{};
-    swprintf_s(buffer, L"%04u%02u%02u_%02u%02u%02u_%03u",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    return buffer;
-}
-
-std::wstring OperationLabel(bool flashMode) {
-    return flashMode ? L"rom書き込み" : L"端末確認";
-}
-
-std::wstring OperationResultLabel(bool flashMode, bool success) {
-    std::wstring label = flashMode ? L"rom書き込み終了結果: " : L"端末確認結果: ";
-    label += success ? L"成功" : L"失敗";
-    return label;
+bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+        [](char a, char b) {
+            return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a))) ==
+                   static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b)));
+        });
+    return it != haystack.end();
 }
 
 std::string WideToUtf8(const std::wstring& s) {
     if (s.empty()) {
         return {};
     }
-
     const int need = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (need <= 0) {
         return {};
     }
-
     std::string out(static_cast<size_t>(need - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), need, nullptr, nullptr);
     return out;
@@ -130,100 +112,81 @@ bool EnsureDirectoryW(const std::wstring& path) {
     if (CreateDirectoryW(path.c_str(), nullptr)) {
         return true;
     }
-    const DWORD err = GetLastError();
-    return err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
-bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text) {
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+std::wstring LogDirectoryW() {
+    return ModuleDirW() + L"\\log";
+}
+
+std::wstring TimestampForFileW() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t buf[32]{};
+    swprintf(buf, 32, L"%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+std::wstring BuildLogPathW(const wchar_t* suffix) {
+    const std::wstring dir = LogDirectoryW();
+    EnsureDirectoryW(dir);
+    return dir + L"\\" + TimestampForFileW() + L"_" + suffix + L".txt";
+}
+
+bool WriteUtf8TextFileW(const std::wstring& path, const std::wstring& text) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         return false;
     }
 
-    bool ok = true;
+    Handle file(h);
+    const std::string utf8 = WideToUtf8(text);
+    const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
     DWORD written = 0;
-    const BYTE bom[] = {0xEF, 0xBB, 0xBF};
-    ok = WriteFile(h, bom, sizeof(bom), &written, nullptr) != FALSE;
+    if (!WriteFile(file.get(), bom, 3, &written, nullptr)) {
+        return false;
+    }
+    if (!utf8.empty()) {
+        if (!WriteFile(file.get(), utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr)) {
+            return false;
+        }
+    }
+    return true;
+}
 
-    if (ok) {
-        const std::string utf8 = WideToUtf8(text);
-        if (!utf8.empty()) {
-            ok = WriteFile(h, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr) != FALSE;
+struct SessionLog {
+    uint32_t token{};
+    std::wstring body;
+
+    void add(const std::wstring& msg) {
+        QueueLog(token, msg);
+        const auto lines = SplitLogLines(NormalizeForDisplay(msg));
+        for (const auto& line : lines) {
+            body.append(line);
+            body.append(L"\r\n");
         }
     }
 
-    CloseHandle(h);
-    return ok;
-}
-
-void SaveOperationLogFile(uint32_t token, bool flashMode, bool success) {
-    if (!IsOperationLogEnabled()) {
-        return;
-    }
-
-    std::wstring body;
-    {
-        std::lock_guard<std::mutex> lock(g_OperationLogMutex);
-        if (token != g_OperationLogToken) {
+    void save(const wchar_t* suffix, bool ok, bool flashMode) const {
+        if (!g_LogEnabled.load(std::memory_order_acquire)) {
             return;
         }
-        body = g_OperationLogBuffer;
+
+        std::wstring out;
+        out.reserve(body.size() + 128);
+        out.append(L"日時: ");
+        out.append(TimestampForFileW());
+        out.append(L"\r\n");
+        out.append(L"種別: ");
+        out.append(flashMode ? L"ROM書き込み" : L"端末確認");
+        out.append(L"\r\n");
+        out.append(L"結果: ");
+        out.append(ok ? L"成功" : L"失敗");
+        out.append(L"\r\n\r\n");
+        out.append(body);
+        WriteUtf8TextFileW(BuildLogPathW(suffix), out);
     }
-
-    const std::wstring logDir = ModuleDirW() + L"\\log";
-    if (!EnsureDirectoryW(logDir)) {
-        return;
-    }
-
-    const std::wstring stamp = CurrentTimestampString();
-
-    std::wstring text;
-    text.reserve(body.size() + 256);
-    text += L"日時: ";
-    text += stamp;
-    text += L"
-";
-    text += L"操作: ";
-    text += OperationLabel(flashMode);
-    text += L"
-";
-    text += OperationResultLabel(flashMode, success);
-    text += L"
-";
-    text += L"ROMフォルダ: ";
-    text += g_RomText;
-    text += L"
-";
-    text += L"----------------------------------------
-";
-    text += body;
-    if (text.empty() || text.back() != L'
-') {
-        text += L"
-";
-    }
-
-    const std::wstring fileName = logDir + L"\" + stamp + L"_" + (flashMode ? L"rom書き込みログ.txt" : L"端末確認ログ.txt");
-    WriteUtf8TextFile(fileName, text);
-}
-
-void FinalizeOperation(uint32_t token, bool ok, bool flashMode) {
-    SaveOperationLogFile(token, flashMode, ok);
-    QueueDone(token, ok, flashMode);
-}
-
-
-bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) {
-        return true;
-    }
-    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-        [](char a, char b) {
-            return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a))) ==
-                   static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b)));
-        });
-    return it != haystack.end();
-}
+};
 
 void TrimLogWindow(size_t limitChars = kMaxLogChars) {
     if (!hLog) {
@@ -453,11 +416,6 @@ uint32_t BeginOperation() {
         std::lock_guard<std::mutex> lock(g_LogMutex);
         g_LogQueue.clear();
     }
-    {
-        std::lock_guard<std::mutex> lock(g_OperationLogMutex);
-        g_OperationLogToken = token;
-        g_OperationLogBuffer.clear();
-    }
     g_LogFlushPending.store(false, std::memory_order_release);
     return token;
 }
@@ -472,17 +430,6 @@ void QueueLog(uint32_t token, const std::wstring& msg) {
                 g_LogQueue.pop_front();
             }
             g_LogQueue.push_back(LogLine{token, line});
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_OperationLogMutex);
-        if (token == g_OperationLogToken) {
-            for (const auto& line : lines) {
-                g_OperationLogBuffer.append(line);
-                g_OperationLogBuffer.append(L"
-");
-            }
         }
     }
 
@@ -760,92 +707,104 @@ std::vector<FlashStep> BuildFlashSteps() {
 }
 
 void CheckThread(uint32_t token) {
+    SessionLog log{token};
     const std::string fastboot = FASTBOOT_EXE();
+    auto finish = [&](bool ok) {
+        log.save(L"端末確認ログ", ok, false);
+        QueueDone(token, ok, false);
+    };
+
     QueueText(token, 0, L"端末確認中");
     QueueText(token, 1, L"検出中");
     QueueText(token, 2, L"fastboot の応答を確認しています。");
-    QueueLog(token, L"━━ 端末確認 ━━");
+    log.add(L"━━ 端末確認 ━━");
 
     if (!FileExistsA(fastboot)) {
-        QueueLog(token, L"エラー: fastboot.exe が見つかりません。");
-        QueueLog(token, L"配置先: .\\platform-tools\\fastboot.exe");
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: fastboot.exe が見つかりません。");
+        log.add(L"配置先: .\\platform-tools\\fastboot.exe");
+        finish(false);
         return;
     }
 
-    QueueLog(token, L"fastboot.exe を起動します…");
+    log.add(L"fastboot.exe を起動します…");
     auto d = Exec(FB("devices"));
     if (!d.launchError.empty()) {
-        QueueLog(token, L"エラー: fastboot.exe の起動に失敗しました。");
-        QueueLog(token, L"原因: " + d.launchError);
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: fastboot.exe の起動に失敗しました。");
+        log.add(L"原因: " + d.launchError);
+        finish(false);
         return;
     }
 
     if (!d.output.empty()) {
-        QueueLog(token, L"応答: " + ToWide(d.output));
+        log.add(L"応答: " + ToWide(d.output));
     }
 
     if (!ContainsInsensitive(d.output, "fastboot")) {
-        QueueLog(token, L"エラー: fastboot モードの端末が検出されません。");
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: fastboot モードの端末が検出されません。");
+        finish(false);
         return;
     }
 
-    QueueLog(token, L"端末を検出しました。product を確認しています…");
+    log.add(L"端末を検出しました。product を確認しています…");
     auto v = Exec(FB("getvar product"));
     if (!v.launchError.empty()) {
-        QueueLog(token, L"エラー: product 取得に失敗しました。");
-        QueueLog(token, L"原因: " + v.launchError);
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: product 取得に失敗しました。");
+        log.add(L"原因: " + v.launchError);
+        finish(false);
         return;
     }
 
     if (!v.output.empty()) {
-        QueueLog(token, L"product 応答: " + ToWide(v.output));
+        log.add(L"product 応答: " + ToWide(v.output));
     }
 
     if (!ContainsInsensitive(v.output, "a05bd")) {
-        QueueLog(token, L"エラー: モデル不一致。期待値: a05bd");
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: モデル不一致。期待値: a05bd");
+        finish(false);
         return;
     }
 
-    QueueLog(token, L"端末を確認しました。unlocked を確認しています…");
+    log.add(L"端末を確認しました。unlocked を確認しています…");
     auto u = Exec(FB("getvar unlocked"));
     if (!u.launchError.empty()) {
-        QueueLog(token, L"エラー: unlocked 取得に失敗しました。");
-        QueueLog(token, L"原因: " + u.launchError);
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: unlocked 取得に失敗しました。");
+        log.add(L"原因: " + u.launchError);
+        finish(false);
         return;
     }
 
     if (!u.output.empty()) {
-        QueueLog(token, L"unlocked 応答: " + ToWide(u.output));
+        log.add(L"unlocked 応答: " + ToWide(u.output));
     }
 
     const bool unlocked = ContainsInsensitive(u.output, "yes");
     if (!unlocked) {
-        QueueLog(token, L"エラー: unlocked が yes ではありません。");
-        QueueLog(token, L"先にアンロックをしてください！");
-        FinalizeOperation(token, false, false);
+        log.add(L"エラー: unlocked が yes ではありません。");
+        log.add(L"先にアンロックをしてください！");
+        finish(false);
         return;
     }
 
-    QueueLog(token, L"確認済み: a05bd");
-    QueueLog(token, L"unlocked: yes");
-    FinalizeOperation(token, true, false);
+    log.add(L"確認済み: a05bd");
+    log.add(L"unlocked: yes");
+    finish(true);
 }
 
 void FlashThread(uint32_t token) {
+    SessionLog log{token};
     const std::string fastboot = FASTBOOT_EXE();
+    auto finish = [&](bool ok) {
+        log.save(L"rom書き込みログ", ok, true);
+        QueueDone(token, ok, true);
+    };
+
     QueueText(token, 0, L"書き込み中");
     QueueText(token, 2, L"書き込み処理を実行しています。");
-    QueueLog(token, L"━━ 書き込み開始 ━━");
+    log.add(L"━━ 書き込み開始 ━━");
 
     if (!FileExistsA(fastboot)) {
-        QueueLog(token, L"エラー: fastboot.exe が見つかりません。");
-        FinalizeOperation(token, false, true);
+        log.add(L"エラー: fastboot.exe が見つかりません。");
+        finish(false);
         return;
     }
 
@@ -863,20 +822,20 @@ void FlashThread(uint32_t token) {
 
     for (size_t i = 0; i < steps.size(); ++i) {
         std::wstring prefix = std::to_wstring(i) + L"/" + std::to_wstring(totalSteps) + L"  ";
-        QueueLog(token, prefix + steps[i].desc);
+        log.add(prefix + steps[i].desc);
         auto r = Exec(steps[i].cmd);
         if (!r.launchError.empty()) {
-            QueueLog(token, L"失敗  起動エラー");
-            QueueLog(token, L"原因: " + r.launchError);
-            FinalizeOperation(token, false, true);
+            log.add(L"失敗  起動エラー");
+            log.add(L"原因: " + r.launchError);
+            finish(false);
             return;
         }
         if (r.exitCode != 0) {
-            QueueLog(token, L"失敗  終了コード=" + std::to_wstring(r.exitCode));
+            log.add(L"失敗  終了コード=" + std::to_wstring(r.exitCode));
             if (!r.output.empty()) {
-                QueueLog(token, L"出力: " + ToWide(r.output));
+                log.add(L"出力: " + ToWide(r.output));
             }
-            FinalizeOperation(token, false, true);
+            finish(false);
             return;
         }
         QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(totalSteps));
@@ -884,28 +843,28 @@ void FlashThread(uint32_t token) {
 
     if (doReboot) {
         std::wstring finalPrefix = std::to_wstring(steps.size()) + L"/" + std::to_wstring(totalSteps) + L"  ";
-        QueueLog(token, finalPrefix + L"最終処理: reboot-recovery");
+        log.add(finalPrefix + L"最終処理: reboot-recovery");
         auto end = Exec(FB("oem reboot-recovery"));
         if (!end.launchError.empty()) {
-            QueueLog(token, L"失敗  起動エラー");
-            QueueLog(token, L"原因: " + end.launchError);
-            FinalizeOperation(token, false, true);
+            log.add(L"失敗  起動エラー");
+            log.add(L"原因: " + end.launchError);
+            finish(false);
             return;
         }
         if (end.exitCode != 0) {
-            QueueLog(token, L"失敗  終了コード=" + std::to_wstring(end.exitCode));
+            log.add(L"失敗  終了コード=" + std::to_wstring(end.exitCode));
             if (!end.output.empty()) {
-                QueueLog(token, L"出力: " + ToWide(end.output));
+                log.add(L"出力: " + ToWide(end.output));
             }
-            FinalizeOperation(token, false, true);
+            finish(false);
             return;
         }
         QueueProgress(token, static_cast<WORD>(totalSteps), static_cast<WORD>(totalSteps));
     } else {
-        QueueLog(token, L"最終処理: スキップされました (option.ini)");
+        log.add(L"最終処理: スキップされました (option.ini)");
     }
 
-    QueueLog(token, L"==============================");
-    QueueLog(token, L"すべての書き込みに成功しました。");
-    FinalizeOperation(token, true, true);
+    log.add(L"==============================");
+    log.add(L"すべての書き込みに成功しました。");
+    finish(true);
 }

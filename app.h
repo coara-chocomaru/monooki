@@ -113,10 +113,6 @@ extern std::atomic<bool> g_Busy;
 extern std::atomic<bool> g_Unlocked;
 extern std::atomic<uint32_t> g_CurrentOperationToken;
 
-extern std::wstring g_OperationLogBuffer;
-extern std::mutex g_OperationLogMutex;
-extern uint32_t g_OperationLogToken;
-
 extern std::wstring g_StatusText;
 extern std::wstring g_DeviceText;
 extern std::wstring g_FastbootText;
@@ -131,6 +127,7 @@ extern Layout g_layout;
 extern std::mutex g_LogMutex;
 extern std::deque<LogLine> g_LogQueue;
 extern std::atomic<bool> g_LogFlushPending;
+extern std::atomic<bool> g_LogEnabled;
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ModuleDirW();

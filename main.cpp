@@ -7,6 +7,10 @@
 
 namespace {
 
+void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient);
+static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWORD style, DWORD exStyle,
+                       int x, int y, int w, int h, int id, HFONT font);
+
 void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient) {
     const int w = rcClient.right - rcClient.left;
     const int h = rcClient.bottom - rcClient.top;
@@ -79,6 +83,11 @@ LRESULT CALLBACK LogSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWORD style,
+                       int x, int y, int w, int h, int id, HFONT font) {
+    return CreateCtrl(parent, cls, txt, style, 0, x, y, w, h, id, font);
+}
+
 static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWORD style, DWORD exStyle,
                        int x, int y, int w, int h, int id, HFONT font) {
     HWND c = CreateWindowExW(exStyle, cls, txt, WS_VISIBLE | WS_CHILD | style,
@@ -122,7 +131,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hProgressBar, PBM_SETMARQUEE, FALSE, 0);
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
-                          0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
+                          WS_EX_TRANSPARENT, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
+        SetWindowSubclass(hLog, LogSubclassProc, 1, 0);
         SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
 
         UpdateStatusUI(L"待機中");
@@ -230,10 +240,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLOREDIT: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_EDIT_BG);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brEdit ? g_brEdit : g_brPanel2);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_CTLCOLORBTN: {
