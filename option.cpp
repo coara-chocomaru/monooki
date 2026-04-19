@@ -597,10 +597,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(hdc, g_hFontTitle ? g_hFontTitle : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_TEXT);
         RECT title{18, 12, rc.right - 18, 34};
-        DrawTextW(hdc, L"設定", -4, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        SelectObject(hdc, g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
-        SetTextColor(hdc, C_MUTED);
-        RECT sub{18, 34, rc.right - 18, 54};
         return 0;
     }
 
