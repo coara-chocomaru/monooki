@@ -25,7 +25,7 @@ void LayoutControls(HWND hwnd) {
 
     const int pad = 18;
 
-    MoveWindow(hBtnSettings, width - margin - 86, margin + 8, 68, 30, TRUE);
+    MoveWindow(hBtnSettings, width - margin - 74, margin + 8, 56, 28, TRUE);
 
     MoveWindow(hLblStatus, g_layout.rightCard.left + pad, g_layout.rightCard.top + 14, rightW - pad * 2, 24, TRUE);
     MoveWindow(hLblHint, g_layout.rightCard.left + pad, g_layout.rightCard.top + 42, rightW - pad * 2, 30, TRUE);

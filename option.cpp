@@ -4,6 +4,8 @@
 #include <cwctype>
 #include <memory>
 
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <gdiplus.h>
 
 #pragma comment(lib, "gdiplus.lib")
@@ -55,6 +57,8 @@ HWND g_hSetBg{};
 HWND g_hSetSave{};
 HWND g_hSetReset{};
 HWND g_hSetClose{};
+HWND g_hSetRomBrowse{};
+HWND g_hSetBgBrowse{};
 ULONG_PTR g_GdiPlusToken{};
 bool g_GdiPlusReady{};
 std::unique_ptr<Image> g_BackgroundImage;
@@ -76,6 +80,78 @@ std::wstring TrimCopy(std::wstring s) {
         }
     }
     return s;
+}
+
+bool DirectoryExistsW(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+std::wstring BrowseForFolderPath(HWND owner) {
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+    bi.lpszTitle = L"ROMフォルダを選択してください";
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) {
+        return {};
+    }
+
+    wchar_t path[MAX_PATH]{};
+    std::wstring result;
+    if (SHGetPathFromIDListW(pidl, path)) {
+        result = path;
+    }
+    CoTaskMemFree(pidl);
+    return result;
+}
+
+std::wstring BrowseForImageFile(HWND owner) {
+    HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool needUninit = SUCCEEDED(co);
+    IFileOpenDialog* dlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg));
+    if (FAILED(hr) || !dlg) {
+        if (needUninit) {
+            CoUninitialize();
+        }
+        return {};
+    }
+
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"画像ファイル", L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"},
+        {L"すべてのファイル", L"*.*"}
+    };
+    dlg->SetFileTypes(static_cast<UINT>(sizeof(filters) / sizeof(filters[0])), filters);
+    dlg->SetDefaultExtension(L"png");
+    dlg->SetTitle(L"背景画像を選択してください");
+
+    std::wstring result;
+    hr = dlg->Show(owner);
+    if (SUCCEEDED(hr)) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+            PWSTR filePath = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &filePath)) && filePath) {
+                result = filePath;
+                CoTaskMemFree(filePath);
+            }
+            item->Release();
+        }
+    }
+
+    dlg->Release();
+    if (needUninit) {
+        CoUninitialize();
+    }
+    return result;
 }
 
 std::wstring ToLowerCopy(std::wstring s) {
@@ -275,25 +351,31 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_hSetTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"c"));
 
         CreateWindowExW(0, L"STATIC", L"ROMフォルダ", WS_CHILD | WS_VISIBLE,
-                        18, 56, 100, 20, hwnd, nullptr, nullptr, nullptr);
+                        18, 68, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetRom = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                    120, 52, 350, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM)), nullptr, nullptr);
+                                    120, 64, 304, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM)), nullptr, nullptr);
         SendMessageW(g_hSetRom, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+        g_hSetRomBrowse = CreateWindowExW(0, L"BUTTON", L"参照", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          434, 63, 68, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM_BROWSE)), nullptr, nullptr);
+        SendMessageW(g_hSetRomBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
 
         CreateWindowExW(0, L"STATIC", L"背景画像", WS_CHILD | WS_VISIBLE,
-                        18, 94, 100, 20, hwnd, nullptr, nullptr, nullptr);
+                        18, 106, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetBg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                   120, 90, 350, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG)), nullptr, nullptr);
+                                   120, 102, 304, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG)), nullptr, nullptr);
         SendMessageW(g_hSetBg, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+        g_hSetBgBrowse = CreateWindowExW(0, L"BUTTON", L"画像選択", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         434, 101, 68, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG_BROWSE)), nullptr, nullptr);
+        SendMessageW(g_hSetBgBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
 
         g_hSetSave = CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     120, 136, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_SAVE)), nullptr, nullptr);
+                                     120, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_SAVE)), nullptr, nullptr);
         g_hSetReset = CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      222, 136, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_RESET)), nullptr, nullptr);
+                                      222, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_RESET)), nullptr, nullptr);
         g_hSetClose = CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      324, 136, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_CLOSE)), nullptr, nullptr);
+                                      324, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_CLOSE)), nullptr, nullptr);
         SendMessageW(g_hSetSave, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         SendMessageW(g_hSetReset, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         SendMessageW(g_hSetClose, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
@@ -317,6 +399,22 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_SET_CLOSE:
             DestroyWindow(hwnd);
             return 0;
+        case ID_SET_ROM_BROWSE: {
+            const std::wstring picked = BrowseForFolderPath(hwnd);
+            if (!picked.empty()) {
+                SetWindowTextW(g_hSetRom, picked.c_str());
+                ApplyFromSettingsControls(false);
+            }
+            return 0;
+        }
+        case ID_SET_BG_BROWSE: {
+            const std::wstring picked = BrowseForImageFile(hwnd);
+            if (!picked.empty()) {
+                SetWindowTextW(g_hSetBg, picked.c_str());
+                ApplyFromSettingsControls(false);
+            }
+            return 0;
+        }
         default:
             break;
         }
@@ -359,11 +457,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(hdc, TRANSPARENT);
         SelectObject(hdc, g_hFontTitle ? g_hFontTitle : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_TEXT);
-        RECT title{18, 16, rc.right - 18, 42};
+        RECT title{18, 14, rc.right - 18, 38};
         DrawTextW(hdc, L"設定", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_MUTED);
-        RECT sub{18, 38, rc.right - 18, 62};
+        RECT sub{18, 40, rc.right - 18, 64};
         DrawTextW(hdc, L"config.ini を同じディレクトリに保存します。", -1, &sub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         EndPaint(hwnd, &ps);
         return 0;
@@ -381,6 +479,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hSetSave = nullptr;
         g_hSetReset = nullptr;
         g_hSetClose = nullptr;
+        g_hSetRomBrowse = nullptr;
+        g_hSetBgBrowse = nullptr;
         return 0;
     }
 
@@ -488,8 +588,8 @@ void OpenSettingsWindow() {
 
     RECT rc{};
     GetWindowRect(g_hMain, &rc);
-    const int w = 520;
-    const int h = 240;
+    const int w = 540;
+    const int h = 292;
     const int x = rc.left + ((rc.right - rc.left) - w) / 2;
     const int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
 

@@ -26,6 +26,8 @@ constexpr int ID_LBL_HINT     = 110;
 constexpr int ID_LBL_TITLE    = 111;
 constexpr int ID_LBL_SUB      = 112;
 constexpr int ID_BTN_SETTINGS  = 113;
+constexpr int ID_SET_ROM_BROWSE = 114;
+constexpr int ID_SET_BG_BROWSE  = 115;
 
 constexpr UINT WM_LOG_FLUSH = WM_APP + 1;
 constexpr UINT WM_PROG_SET  = WM_APP + 2;
