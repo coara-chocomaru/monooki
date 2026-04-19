@@ -208,7 +208,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC hdc = reinterpret_cast<HDC>(wp);
         HWND ctrl = reinterpret_cast<HWND>(lp);
 
-        COLORREF bg = C_PANEL;
         COLORREF fg = C_TEXT;
 
         if (ctrl == hLblStatus) {
@@ -223,10 +222,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             fg = C_TEXT;
         }
 
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, bg);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, fg);
-        return reinterpret_cast<LRESULT>(g_brPanel);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_CTLCOLOREDIT: {

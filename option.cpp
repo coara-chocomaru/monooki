@@ -316,7 +316,7 @@ void SyncMainTexts() {
 }
 
 void SyncSettingsWindowFields() {
-    if (!g_hSettingsWnd) {
+    if (!g_hSetTheme && !g_hSetRom && !g_hSetBg) {
         return;
     }
 
@@ -326,12 +326,34 @@ void SyncSettingsWindowFields() {
     if (g_hSetTheme) {
         SendMessageW(g_hSetTheme, CB_SETCURSEL, themeIndex, 0);
         InvalidateRect(g_hSetTheme, nullptr, TRUE);
+        UpdateWindow(g_hSetTheme);
     }
     if (g_hSetRom) {
-        SetWindowTextW(g_hSetRom, g_ConfigRomDir.empty() ? L"./TAB-A05-BD" : g_ConfigRomDir.c_str());
+        const std::wstring rom = g_ConfigRomDir.empty() ? L"./TAB-A05-BD" : g_ConfigRomDir;
+        SetWindowTextW(g_hSetRom, rom.c_str());
+        SendMessageW(g_hSetRom, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(C_EDIT_BG));
+        InvalidateRect(g_hSetRom, nullptr, TRUE);
+        UpdateWindow(g_hSetRom);
     }
     if (g_hSetBg) {
         SetWindowTextW(g_hSetBg, g_ConfigBackgroundImage.c_str());
+        SendMessageW(g_hSetBg, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(C_EDIT_BG));
+        InvalidateRect(g_hSetBg, nullptr, TRUE);
+        UpdateWindow(g_hSetBg);
+    }
+    if (g_hSetSave) {
+        InvalidateRect(g_hSetSave, nullptr, TRUE);
+    }
+    if (g_hSetReset) {
+        InvalidateRect(g_hSetReset, nullptr, TRUE);
+    }
+    if (g_hSetClose) {
+        InvalidateRect(g_hSetClose, nullptr, TRUE);
+    }
+
+    if (g_hSettingsWnd) {
+        InvalidateRect(g_hSettingsWnd, nullptr, TRUE);
+        UpdateWindow(g_hSettingsWnd);
     }
 
     g_SettingsSyncing = false;
@@ -413,6 +435,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                                     120, 92, 346, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM)), nullptr, nullptr);
         SendMessageW(g_hSetRom, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+        SendMessageW(g_hSetRom, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(C_EDIT_BG));
         g_hSetRomBrowse = CreateWindowExW(0, L"BUTTON", L"参照", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                           478, 91, 62, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM_BROWSE)), nullptr, nullptr);
         SendMessageW(g_hSetRomBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
@@ -423,6 +446,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                                    120, 136, 346, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG)), nullptr, nullptr);
         SendMessageW(g_hSetBg, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+        SendMessageW(g_hSetBg, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(C_EDIT_BG));
         g_hSetBgBrowse = CreateWindowExW(0, L"BUTTON", L"画像選択", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                          478, 135, 62, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG_BROWSE)), nullptr, nullptr);
         SendMessageW(g_hSetBgBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
@@ -440,6 +464,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SyncSettingsWindowFields();
         return 0;
     }
+
+    case WM_SHOWWINDOW:
+        if (wp) {
+            SyncSettingsWindowFields();
+        }
+        return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -518,12 +548,20 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
-    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        SetBkMode(hdc, OPAQUE);
+        SetTextColor(hdc, C_TEXT);
+        SetBkColor(hdc, C_EDIT_BG);
+        return reinterpret_cast<LRESULT>(g_brEdit ? g_brEdit : g_brPanel2);
+    }
+
     case WM_CTLCOLORLISTBOX: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, TRANSPARENT);
+        SetBkMode(hdc, OPAQUE);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brTransparent);
+        SetBkColor(hdc, C_PANEL2);
+        return reinterpret_cast<LRESULT>(g_brPanel2 ? g_brPanel2 : g_brTransparent);
     }
 
     case WM_CTLCOLORBTN: {
@@ -610,7 +648,7 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
         1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.18f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.28f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f, 1.0f
     }};
     attrs.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);

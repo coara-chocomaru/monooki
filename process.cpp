@@ -6,6 +6,10 @@
 #include <string_view>
 #include <vector>
 
+#include <gdiplus.h>
+
+using namespace Gdiplus;
+
 namespace {
 constexpr size_t kMaxQueuedLines = 384;
 constexpr size_t kMaxLogChars = 48000;
@@ -78,6 +82,41 @@ std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
     }
     lines.push_back(current);
     return lines;
+}
+
+void FillRectAlpha(HDC hdc, const RECT& rc, COLORREF fill, BYTE alpha) {
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeHighQuality);
+    SolidBrush brush(Color(alpha, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    g.FillRectangle(&brush, static_cast<REAL>(rc.left), static_cast<REAL>(rc.top),
+                    static_cast<REAL>(rc.right - rc.left), static_cast<REAL>(rc.bottom - rc.top));
+}
+
+void FillRoundedRectAlpha(HDC hdc, const RECT& rc, COLORREF fill, BYTE alpha, COLORREF edge, int radius) {
+    const REAL w = static_cast<REAL>(rc.right - rc.left);
+    const REAL h = static_cast<REAL>(rc.bottom - rc.top);
+    if (w <= 0.0f || h <= 0.0f) {
+        return;
+    }
+
+    Graphics g(hdc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+    const REAL x = static_cast<REAL>(rc.left);
+    const REAL y = static_cast<REAL>(rc.top);
+    const REAL d = static_cast<REAL>(radius * 2);
+
+    GraphicsPath path;
+    path.AddArc(x, y, d, d, 180, 90);
+    path.AddArc(x + w - d, y, d, d, 270, 90);
+    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    path.AddArc(x, y + h - d, d, d, 90, 90);
+    path.CloseFigure();
+
+    SolidBrush brush(Color(alpha, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    Pen pen(Color(255, GetRValue(edge), GetGValue(edge), GetBValue(edge)), 1.0f);
+    g.FillPath(&brush, &path);
+    g.DrawPath(&pen, &path);
 }
 
 bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
@@ -437,28 +476,12 @@ void FlushLogQueue() {
 }
 
 void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int radius) {
-    HBRUSH br = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, edge);
-    HGDIOBJ oldBr = SelectObject(hdc, br);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBr);
-    DeleteObject(pen);
-    DeleteObject(br);
+    FillRoundedRectAlpha(hdc, rc, fill, 202, edge, radius);
 }
 
 void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text) {
     RECT rc{x, y, x + w, y + h};
-    HBRUSH br = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, edge);
-    HGDIOBJ oldBr = SelectObject(hdc, br);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
-    SelectObject(hdc, oldPen);
-    SelectObject(hdc, oldBr);
-    DeleteObject(pen);
-    DeleteObject(br);
+    FillRoundedRectAlpha(hdc, rc, fill, 228, edge, 12);
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, C_TEXT);
@@ -498,18 +521,14 @@ void PaintMain(HDC hdc, const RECT& rc) {
     DrawBackgroundImage(hdc, rc);
 
     RECT header = {rc.left, rc.top, rc.right, rc.top + 124};
-    HBRUSH headerBr = CreateSolidBrush(C_BG2);
-    FillRect(hdc, &header, headerBr);
-    DeleteObject(headerBr);
+    FillRectAlpha(hdc, header, C_BG2, 220);
 
     DrawRoundCard(hdc, g_layout.leftCard, C_PANEL, C_LINE);
     DrawRoundCard(hdc, g_layout.rightCard, C_PANEL, C_LINE);
     DrawRoundCard(hdc, g_layout.logCard, C_PANEL2, C_LINE);
 
     RECT accent = {rc.left + 18, 122, rc.right - 18, 124};
-    HBRUSH accentBr = CreateSolidBrush(C_ACCENT);
-    FillRect(hdc, &accent, accentBr);
-    DeleteObject(accentBr);
+    FillRectAlpha(hdc, accent, C_ACCENT, 255);
 
     SelectObject(hdc, g_hFontTitle);
     SetBkMode(hdc, TRANSPARENT);
