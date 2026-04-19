@@ -128,6 +128,8 @@ extern std::mutex g_LogMutex;
 extern std::deque<LogLine> g_LogQueue;
 extern std::atomic<bool> g_LogFlushPending;
 extern std::atomic<bool> g_LogEnabled;
+bool IsLogSavingEnabled();
+void SetLogSavingEnabled(bool enabled);
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ModuleDirW();
@@ -164,7 +166,6 @@ void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled);
 void AppendLogBlock(const std::wstring& text);
 void FlushLogQueue();
 void CleanupGdi();
-bool IsLogSavingEnabled();
 void LoadAppConfig();
 void SaveAppConfig();
 void OpenSettingsWindow();

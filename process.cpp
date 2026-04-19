@@ -174,7 +174,7 @@ struct SessionLog {
     }
 
     void save(const wchar_t* suffix, bool ok, bool flashMode) const {
-        if (!IsLogSavingEnabled()) {
+        if (!::IsLogSavingEnabled()) {
             return;
         }
 

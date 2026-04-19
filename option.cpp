@@ -176,12 +176,6 @@ std::wstring OptionIniPathW() {
     return ModuleDirW() + L"\\option.ini";
 }
 
-bool IsLogSavingEnabled() {
-    const bool enabled = GetPrivateProfileIntW(L"Settings", L"log", 1, OptionIniPathW().c_str()) != 0;
-    g_LogEnabled.store(enabled, std::memory_order_release);
-    return enabled;
-}
-
 void EnsureGdiPlus() {
     if (g_GdiPlusReady) {
         return;
@@ -682,7 +676,7 @@ void LoadAppConfig() {
     GetPrivateProfileStringW(L"Settings", L"background_image", L"", buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])), path.c_str());
     g_ConfigBackgroundImage = TrimCopy(buffer);
 
-    g_LogEnabled = IsLogSavingEnabled();
+    SetLogSavingEnabled(GetPrivateProfileIntW(L"Settings", L"log", 1, OptionIniPathW().c_str()) != 0);
 
     ApplyConfigState(false);
 
@@ -700,7 +694,7 @@ void SaveAppConfig() {
     WritePrivateProfileStringW(L"Settings", L"theme", theme.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Settings", L"rom_dir", rom.c_str(), path.c_str());
     WritePrivateProfileStringW(L"Settings", L"background_image", bg.c_str(), path.c_str());
-    WritePrivateProfileStringW(L"Settings", L"log", g_LogEnabled.load(std::memory_order_acquire) ? L"1" : L"0", OptionIniPathW().c_str());
+    WritePrivateProfileStringW(L"Settings", L"log", ::IsLogSavingEnabled() ? L"1" : L"0", OptionIniPathW().c_str());
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
 
     g_ConfigThemeKey = theme;

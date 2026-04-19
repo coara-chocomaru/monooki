@@ -64,3 +64,11 @@ std::mutex g_LogMutex;
 std::deque<LogLine> g_LogQueue;
 std::atomic<bool> g_LogFlushPending{false};
 std::atomic<bool> g_LogEnabled{true};
+
+bool IsLogSavingEnabled() {
+    return g_LogEnabled.load(std::memory_order_acquire);
+}
+
+void SetLogSavingEnabled(bool enabled) {
+    g_LogEnabled.store(enabled, std::memory_order_release);
+}
