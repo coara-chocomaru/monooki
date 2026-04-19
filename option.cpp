@@ -601,8 +601,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(hdc, g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_MUTED);
         RECT sub{18, 34, rc.right - 18, 54};
-        DrawTextW(hdc, L"config.ini の値を表示して保存します。", -1, &sub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        EndPaint(hwnd, &ps);
         return 0;
     }
 
