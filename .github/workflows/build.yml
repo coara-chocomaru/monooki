@@ -2,9 +2,9 @@ name: Build a05bd Flasher
 
 on:
   push:
-    branches: ["test2", "master"]
+    branches: ["test3", "master"]
   pull_request:
-    branches: ["test2", "master"]
+    branches: ["test3", "master"]
   workflow_dispatch:
 
 permissions:
@@ -36,9 +36,9 @@ jobs:
                  /DUNICODE /D_UNICODE ^
                  /EHsc /std:c++17 /permissive- ^
                  /O2 /Oi /GL /Gw /Gy /MT /GS /sdl /W3 /MP ^
-                 main.cpp globals.cpp ui.cpp process.cpp ^
+                 main.cpp globals.cpp ui.cpp process.cpp option.cpp ^
                  /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS ^
-                 comctl32.lib msimg32.lib kernel32.lib user32.lib gdi32.lib ^
+                 comctl32.lib msimg32.lib kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib gdiplus.lib ^
                  /OUT:a05bd_flasher_${{ matrix.arch }}.exe
 
       - name: Upload build artifact
@@ -52,7 +52,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/test2' || github.ref == 'refs/heads/master')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/test3' || github.ref == 'refs/heads/master')
 
     steps:
       - name: Download x64 artifact
