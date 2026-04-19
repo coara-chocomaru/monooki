@@ -122,7 +122,7 @@ void AddRoundRectPath(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& rc, flo
     path.CloseFigure();
 }
 
-void DrawBitmapWithAlpha(Gdiplus::Graphics& graphics, const Gdiplus::Bitmap* bitmap, const RECT& rc, float alpha) {
+void DrawBitmapWithAlpha(Gdiplus::Graphics& graphics, Gdiplus::Bitmap* bitmap, const RECT& rc, float alpha) {
     if (!bitmap) {
         return;
     }
