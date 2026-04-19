@@ -645,9 +645,9 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-     1.30f, 0.0f, 0.0f, 0.0f, 0.0f,
-     0.0f, 1.30f, 0.0f, 0.0f, 0.0f,
-     0.0f, 0.0f, 1.30f, 0.0f, 0.0f,
+     1.60f, 0.0f, 0.0f, 0.0f, 0.0f,
+     0.0f, 1.60f, 0.0f, 0.0f, 0.0f,
+     0.0f, 0.0f, 1.60f, 0.0f, 0.0f,
      0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
      0.0f, 0.0f, 0.0f, 0.0f, 1.0f
 }};
