@@ -3,7 +3,6 @@
 #include <thread>
 
 #include <commctrl.h>
-#include <msimg32.h>
 
 
 namespace {

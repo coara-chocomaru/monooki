@@ -525,7 +525,7 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     const Rect dest(rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
     g.DrawImage(g_BackgroundImage.get(), dest,
-                0.0f, 0.0f, static_cast<REAL>(width), static_cast<REAL>(height), UnitPixel, &attrs);
+                0, 0, static_cast<INT>(width), static_cast<INT>(height), UnitPixel, &attrs);
 }
 
 void LoadAppConfig() {
