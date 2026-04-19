@@ -421,8 +421,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         const HFONT font = g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
-        CreateWindowExW(0, L"STATIC", L"設定内容は config.ini に保存されます。", WS_CHILD | WS_VISIBLE,
-                        18, 16, 420, 18, hwnd, nullptr, nullptr, nullptr);
         CreateWindowExW(0, L"STATIC", L"色パターン", WS_CHILD | WS_VISIBLE,
                         18, 52, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetTheme = CreateWindowExW(0, L"COMBOBOX", nullptr,
