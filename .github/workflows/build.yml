@@ -2,9 +2,9 @@ name: Build a05bd Flasher
 
 on:
   push:
-    branches: ["test4", "master"]
+    branches: ["main9", "master"]
   pull_request:
-    branches: ["test4", "master"]
+    branches: ["main9", "master"]
   workflow_dispatch:
 
 permissions:
@@ -52,7 +52,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/test4' || github.ref == 'refs/heads/master')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main9' || github.ref == 'refs/heads/master')
 
     steps:
       - name: Download x64 artifact
