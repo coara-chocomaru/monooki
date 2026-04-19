@@ -155,6 +155,8 @@ void UpdateHintUI(const std::wstring& text);
 void UpdateStepsUI(const std::wstring& text);
 void LayoutControls(HWND hwnd);
 void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int radius = 18);
+void DrawTranslucentRect(HDC hdc, const RECT& rc, COLORREF fill, BYTE alpha);
+void DrawTranslucentRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, BYTE alpha, int radius = 18);
 void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text);
 void DrawBackgroundImage(HDC hdc, const RECT& rc);
 void PaintMain(HDC hdc, const RECT& rc);

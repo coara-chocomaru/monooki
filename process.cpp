@@ -6,6 +6,12 @@
 #include <string_view>
 #include <vector>
 
+#include <gdiplus.h>
+
+#pragma comment(lib, "gdiplus.lib")
+
+using namespace Gdiplus;
+
 namespace {
 constexpr size_t kMaxQueuedLines = 384;
 constexpr size_t kMaxLogChars = 48000;
@@ -544,6 +550,46 @@ void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int ra
     DeleteObject(br);
 }
 
+void AddRoundRectPath(GraphicsPath& path, float x, float y, float w, float h, float radius) {
+    const float d = radius * 2.0f;
+    path.StartFigure();
+    path.AddArc(x, y, d, d, 180.0f, 90.0f);
+    path.AddArc(x + w - d, y, d, d, 270.0f, 90.0f);
+    path.AddArc(x + w - d, y + h - d, d, d, 0.0f, 90.0f);
+    path.AddArc(x, y + h - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+}
+
+void DrawTranslucentRect(HDC hdc, const RECT& rc, COLORREF fill, BYTE alpha) {
+    Graphics g(hdc);
+    g.SetCompositingMode(CompositingModeSourceOver);
+    g.SetSmoothingMode(SmoothingModeHighQuality);
+    SolidBrush brush(Color(alpha, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    g.FillRectangle(&brush, static_cast<REAL>(rc.left), static_cast<REAL>(rc.top),
+                    static_cast<REAL>(rc.right - rc.left), static_cast<REAL>(rc.bottom - rc.top));
+}
+
+void DrawTranslucentRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, BYTE alpha, int radius) {
+    const float w = static_cast<float>(rc.right - rc.left);
+    const float h = static_cast<float>(rc.bottom - rc.top);
+    if (w <= 0.0f || h <= 0.0f) {
+        return;
+    }
+
+    Graphics g(hdc);
+    g.SetCompositingMode(CompositingModeSourceOver);
+    g.SetSmoothingMode(SmoothingModeHighQuality);
+
+    GraphicsPath path;
+    AddRoundRectPath(path, static_cast<float>(rc.left), static_cast<float>(rc.top), w, h, static_cast<float>(radius));
+
+    SolidBrush brush(Color(alpha, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
+    Pen pen(Color(static_cast<BYTE>(std::min<int>(255, static_cast<int>(alpha) + 48)), GetRValue(edge), GetGValue(edge), GetBValue(edge)), 1.0f);
+
+    g.FillPath(&brush, &path);
+    g.DrawPath(&pen, &path);
+}
+
 void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text) {
     RECT rc{x, y, x + w, y + h};
     HBRUSH br = CreateSolidBrush(fill);
@@ -594,13 +640,11 @@ void PaintMain(HDC hdc, const RECT& rc) {
     DrawBackgroundImage(hdc, rc);
 
     RECT header = {rc.left, rc.top, rc.right, rc.top + 124};
-    HBRUSH headerBr = CreateSolidBrush(C_BG2);
-    FillRect(hdc, &header, headerBr);
-    DeleteObject(headerBr);
+    DrawTranslucentRect(hdc, header, C_BG2, 84);
 
     DrawRoundCard(hdc, g_layout.leftCard, C_PANEL, C_LINE);
     DrawRoundCard(hdc, g_layout.rightCard, C_PANEL, C_LINE);
-    DrawRoundCard(hdc, g_layout.logCard, C_PANEL2, C_LINE);
+    DrawTranslucentRoundCard(hdc, g_layout.logCard, C_PANEL2, C_LINE, 80);
 
     RECT accent = {rc.left + 18, 122, rc.right - 18, 124};
     HBRUSH accentBr = CreateSolidBrush(C_ACCENT);
