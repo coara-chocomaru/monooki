@@ -1,214 +1,467 @@
 #include "app.h"
-#include <shobjidl.h>
 
-constexpr int ID_CB_THEME = 201;
-constexpr int ID_ED_ROM = 202;
-constexpr int ID_BTN_ROM = 203;
-constexpr int ID_ED_BG = 204;
-constexpr int ID_BTN_BG = 205;
-constexpr int ID_BTN_OK = 206;
-constexpr int ID_BTN_CANCEL = 207;
-constexpr int ID_BTN_RESET = 208;
+#include <commdlg.h>
+#include <cwctype>
+#include <cwchar>
+#include <iterator>
 
-std::wstring ConfigIniPath() {
-    return ModuleDirW() + L"\\config.ini";
+#pragma comment(lib, "comdlg32.lib")
+
+namespace {
+constexpr int IDC_THEME = 2001;
+constexpr int IDC_IMGDIR = 2002;
+constexpr int IDC_BGIMG = 2003;
+constexpr int IDC_BG_BROWSE = 2004;
+constexpr int IDC_SAVE = 2005;
+constexpr int IDC_RESET = 2006;
+constexpr int IDC_CLOSE = 2007;
+
+struct SettingsState {
+    HWND owner{};
+    HWND comboTheme{};
+    HWND editImgDir{};
+    HWND editBgImg{};
+};
+
+std::wstring TrimCopy(const std::wstring& s) {
+    size_t begin = 0;
+    while (begin < s.size() && iswspace(s[begin])) {
+        ++begin;
+    }
+    size_t end = s.size();
+    while (end > begin && iswspace(s[end - 1])) {
+        --end;
+    }
+    return s.substr(begin, end - begin);
 }
 
-void LoadConfig() {
-    std::wstring path = ConfigIniPath();
-    g_Config.theme = GetPrivateProfileIntW(L"Settings", L"Theme", 0, path.c_str());
-    wchar_t buf[MAX_PATH];
-    GetPrivateProfileStringW(L"Settings", L"RomDir", L"", buf, MAX_PATH, path.c_str());
-    g_Config.romDir = buf;
-    GetPrivateProfileStringW(L"Settings", L"BgImage", L"", buf, MAX_PATH, path.c_str());
-    g_Config.bgImage = buf;
+std::wstring NormalizeInputPath(const std::wstring& raw) {
+    std::wstring s = TrimCopy(raw);
+    while (!s.empty() && (s.front() == L'"' || s.front() == L'\'')) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && (s.back() == L'"' || s.back() == L'\'')) {
+        s.pop_back();
+    }
+    s = TrimCopy(s);
+    if (s.empty()) {
+        return {};
+    }
+    DWORD need = GetFullPathNameW(s.c_str(), 0, nullptr, nullptr);
+    if (need == 0) {
+        return s;
+    }
+    std::wstring out(static_cast<size_t>(need), L'\0');
+    DWORD got = GetFullPathNameW(s.c_str(), need, out.data(), nullptr);
+    if (got == 0) {
+        return s;
+    }
+    out.resize(wcslen(out.c_str()));
+    return out;
 }
 
-void SaveConfig() {
-    std::wstring path = ConfigIniPath();
-    WritePrivateProfileStringW(L"Settings", L"Theme", std::to_wstring(g_Config.theme).c_str(), path.c_str());
-    WritePrivateProfileStringW(L"Settings", L"RomDir", g_Config.romDir.c_str(), path.c_str());
-    WritePrivateProfileStringW(L"Settings", L"BgImage", g_Config.bgImage.c_str(), path.c_str());
+std::wstring ReadControlText(HWND hwnd) {
+    if (!hwnd) {
+        return {};
+    }
+    const int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) {
+        return {};
+    }
+    std::wstring text(static_cast<size_t>(len + 1), L'\0');
+    GetWindowTextW(hwnd, text.data(), len + 1);
+    text.resize(wcslen(text.c_str()));
+    return text;
 }
 
-void ApplyTheme() {
-    if (g_Config.theme == 1) {
-        C_BG = RGB(240, 240, 240); C_BG2 = RGB(220, 220, 220); C_PANEL = RGB(255, 255, 255);
-        C_PANEL2 = RGB(245, 245, 245); C_LINE = RGB(200, 200, 200); C_TEXT = RGB(30, 30, 30);
-        C_MUTED = RGB(100, 100, 100); C_ACCENT = RGB(0, 120, 215); C_BTN = RGB(225, 225, 225);
-        C_BTN_HOV = RGB(210, 210, 210); C_BTN_DN = RGB(190, 190, 190); C_BTN_EDGE = RGB(170, 170, 170);
-        C_EDIT_BG = RGB(250, 250, 250);
-    } else if (g_Config.theme == 2) {
-        C_BG = RGB(10, 10, 10); C_BG2 = RGB(15, 15, 15); C_PANEL = RGB(20, 20, 20);
-        C_PANEL2 = RGB(25, 25, 25); C_LINE = RGB(0, 100, 0); C_TEXT = RGB(0, 255, 0);
-        C_MUTED = RGB(0, 150, 0); C_ACCENT = RGB(0, 200, 0); C_BTN = RGB(15, 30, 15);
-        C_BTN_HOV = RGB(20, 50, 20); C_BTN_DN = RGB(10, 20, 10); C_BTN_EDGE = RGB(0, 150, 0);
-        C_EDIT_BG = RGB(5, 15, 5);
-    } else {
-        C_BG = RGB(15, 18, 28); C_BG2 = RGB(21, 26, 40); C_PANEL = RGB(25, 31, 48);
-        C_PANEL2 = RGB(30, 38, 58); C_LINE = RGB(56, 69, 98); C_TEXT = RGB(237, 242, 247);
-        C_MUTED = RGB(155, 168, 190); C_ACCENT = RGB(0, 179, 255); C_BTN = RGB(39, 49, 72);
-        C_BTN_HOV = RGB(52, 63, 92); C_BTN_DN = RGB(26, 37, 60); C_BTN_EDGE = RGB(86, 102, 138);
-        C_EDIT_BG = RGB(17, 21, 31);
+ThemePalette ThemeFromIndex(int index) {
+    switch (index) {
+    case 1:
+        return ThemePalette{
+            RGB(12, 23, 21), RGB(18, 33, 29), RGB(19, 43, 37), RGB(24, 51, 45), RGB(62, 84, 77),
+            RGB(241, 246, 243), RGB(163, 180, 171), RGB(58, 202, 176), RGB(72, 204, 120), RGB(248, 193, 76),
+            RGB(245, 104, 104), RGB(33, 55, 48), RGB(44, 73, 63), RGB(24, 41, 35), RGB(77, 102, 92),
+            RGB(17, 28, 25), RGB(31, 77, 67), RGB(74, 124, 110)
+        };
+    case 2:
+        return ThemePalette{
+            RGB(20, 16, 28), RGB(28, 21, 40), RGB(35, 27, 54), RGB(43, 34, 64), RGB(78, 66, 108),
+            RGB(243, 239, 248), RGB(173, 162, 196), RGB(188, 124, 255), RGB(107, 219, 156), RGB(255, 197, 102),
+            RGB(255, 117, 117), RGB(48, 39, 73), RGB(64, 51, 93), RGB(36, 29, 56), RGB(102, 88, 145),
+            RGB(23, 18, 34), RGB(54, 40, 85), RGB(103, 82, 160)
+        };
+    default:
+        return ThemePalette{
+            RGB(15, 18, 28), RGB(21, 26, 40), RGB(25, 31, 48), RGB(30, 38, 58), RGB(56, 69, 98),
+            RGB(237, 242, 247), RGB(155, 168, 190), RGB(0, 179, 255), RGB(52, 199, 89), RGB(255, 185, 0),
+            RGB(255, 92, 92), RGB(39, 49, 72), RGB(52, 63, 92), RGB(26, 37, 60), RGB(86, 102, 138),
+            RGB(17, 21, 31), RGB(34, 44, 68), RGB(86, 102, 138)
+        };
     }
 }
 
-void RefreshBrushes() {
+std::wstring ThemeLabelFromIndex(int index) {
+    switch (index) {
+    case 1: return L"b";
+    case 2: return L"c";
+    default: return L"a";
+    }
+}
+
+int ThemeIndexFromLabel(const std::wstring& text) {
+    if (!text.empty()) {
+        const wchar_t ch = static_cast<wchar_t>(towlower(text[0]));
+        if (ch == L'b') return 1;
+        if (ch == L'c') return 2;
+    }
+    return 0;
+}
+
+void RebuildThemeResources() {
     SafeDeleteObject(g_brPanel);
     SafeDeleteObject(g_brPanel2);
     SafeDeleteObject(g_brEdit);
     g_brPanel = CreateSolidBrush(C_PANEL);
     g_brPanel2 = CreateSolidBrush(C_PANEL2);
     g_brEdit = CreateSolidBrush(C_EDIT_BG);
-    if (hLog) {
-        SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
-        InvalidateRect(hLog, nullptr, TRUE);
+    if (hProgressBar) {
+        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
+        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
     }
 }
 
-void CleanupGdi() {
-    SafeDeleteObject(g_hFontTitle);
-    SafeDeleteObject(g_hFontSub);
-    SafeDeleteObject(g_hFontBody);
-    SafeDeleteObject(g_hFontMono);
-    SafeDeleteObject(g_brPanel);
-    SafeDeleteObject(g_brPanel2);
-    SafeDeleteObject(g_brEdit);
+std::wstring DisplayImageDir() {
+    if (g_Config.imageDir.empty()) {
+        return L"./TAB-A05-BD";
+    }
+    return g_Config.imageDir;
 }
 
-std::wstring BrowseFolder(HWND owner) {
-    std::wstring out;
-    IFileOpenDialog* pfd = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)))) {
-        DWORD dwOptions;
-        if (SUCCEEDED(pfd->GetOptions(&dwOptions))) {
-            pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-            if (SUCCEEDED(pfd->Show(owner))) {
-                IShellItem* psi = nullptr;
-                if (SUCCEEDED(pfd->GetResult(&psi))) {
-                    PWSTR pszPath = nullptr;
-                    if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
-                        out = pszPath;
-                        CoTaskMemFree(pszPath);
-                    }
-                    psi->Release();
-                }
-            }
-        }
-        pfd->Release();
+std::wstring DisplayBgImage() {
+    if (g_Config.backgroundImage.empty()) {
+        return L"未設定";
     }
-    return out;
+    return g_Config.backgroundImage;
 }
 
-std::wstring BrowseFile(HWND owner) {
-    std::wstring out;
-    IFileOpenDialog* pfd = nullptr;
-    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)))) {
-        COMDLG_FILTERSPEC filters[] = { {L"Image Files", L"*.bmp;*.jpg;*.jpeg;*.png"}, {L"All Files", L"*.*"} };
-        pfd->SetFileTypes(2, filters);
-        if (SUCCEEDED(pfd->Show(owner))) {
-            IShellItem* psi = nullptr;
-            if (SUCCEEDED(pfd->GetResult(&psi))) {
-                PWSTR pszPath = nullptr;
-                if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
-                    out = pszPath;
-                    CoTaskMemFree(pszPath);
-                }
-                psi->Release();
-            }
-        }
-        pfd->Release();
+void RefreshTexts() {
+    g_FastbootText = L"fastboot.exe : .\\platform-tools\\fastboot.exe";
+    g_RomText = L"画像フォルダ : " + DisplayImageDir();
+    g_BgImageText = L"背景画像 : " + DisplayBgImage();
+    g_StepsText = L"手順 : flash / erase / reboot";
+    UpdateText(hLblFastboot, g_FastbootText);
+    UpdateText(hLblRom, g_RomText);
+    UpdateBgImageUI(g_BgImageText);
+    UpdateStepsUI(g_StepsText);
+    UpdateText(hLblTitle, L"a05bd フラッシャー");
+    UpdateText(hLblSub, L"簡易書き込みツール");
+}
+
+bool WriteConfigFile(const AppConfig& cfg) {
+    const std::wstring path = ConfigPathW();
+    const wchar_t* section = L"Config";
+    const std::wstring theme = ThemeLabelFromIndex(cfg.themeIndex);
+    if (!WritePrivateProfileStringW(section, L"layout", theme.c_str(), path.c_str())) return false;
+    if (!WritePrivateProfileStringW(section, L"img_dir", cfg.imageDir.c_str(), path.c_str())) return false;
+    if (!WritePrivateProfileStringW(section, L"background", cfg.backgroundImage.c_str(), path.c_str())) return false;
+    return true;
+}
+
+AppConfig ReadConfigFromFile() {
+    AppConfig cfg = DefaultAppConfig();
+    const std::wstring path = ConfigPathW();
+    if (!FileExistsW(path)) {
+        WriteConfigFile(cfg);
+        return cfg;
     }
-    return out;
+
+    wchar_t buf[4096]{};
+    GetPrivateProfileStringW(L"Config", L"layout", L"a", buf, static_cast<DWORD>(std::size(buf)), path.c_str());
+    cfg.themeIndex = ThemeIndexFromLabel(buf);
+
+    buf[0] = 0;
+    GetPrivateProfileStringW(L"Config", L"img_dir", L"", buf, static_cast<DWORD>(std::size(buf)), path.c_str());
+    cfg.imageDir = NormalizeInputPath(buf);
+
+    buf[0] = 0;
+    GetPrivateProfileStringW(L"Config", L"background", L"", buf, static_cast<DWORD>(std::size(buf)), path.c_str());
+    cfg.backgroundImage = NormalizeInputPath(buf);
+
+    return cfg;
+}
+
+void ApplyThemeToWindow(HWND hwnd) {
+    if (hwnd) {
+        InvalidateRect(hwnd, nullptr, TRUE);
+        UpdateWindow(hwnd);
+    }
+}
+
+void FillSettingsControls(SettingsState* state) {
+    if (!state) return;
+    SendMessageW(state->comboTheme, CB_RESETCONTENT, 0, 0);
+    SendMessageW(state->comboTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"a : default"));
+    SendMessageW(state->comboTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"b"));
+    SendMessageW(state->comboTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"c"));
+    SendMessageW(state->comboTheme, CB_SETCURSEL, static_cast<WPARAM>(g_Config.themeIndex), 0);
+    SetWindowTextW(state->editImgDir, g_Config.imageDir.empty() ? L"" : g_Config.imageDir.c_str());
+    SetWindowTextW(state->editBgImg, g_Config.backgroundImage.empty() ? L"" : g_Config.backgroundImage.c_str());
+}
+
+void SaveFromSettings(SettingsState* state) {
+    if (!state) return;
+    AppConfig cfg{};
+    cfg.themeIndex = static_cast<int>(SendMessageW(state->comboTheme, CB_GETCURSEL, 0, 0));
+    if (cfg.themeIndex < 0 || cfg.themeIndex > 2) cfg.themeIndex = 0;
+    cfg.imageDir = NormalizeInputPath(ReadControlText(state->editImgDir));
+    cfg.backgroundImage = NormalizeInputPath(ReadControlText(state->editBgImg));
+    SaveAppConfig(cfg);
+    ApplyAppConfig(cfg);
+}
+
+void BrowseBackgroundImage(HWND owner, HWND targetEdit) {
+    wchar_t fileBuf[MAX_PATH * 4]{};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(fileBuf));
+    ofn.lpstrFilter = L"Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0All Files\0*.*\0\0";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
+    if (GetOpenFileNameW(&ofn)) {
+        SetWindowTextW(targetEdit, ofn.lpstrFile);
+    }
 }
 
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* state = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
     case WM_CREATE: {
-        CreateWindowW(L"STATIC", L"テーマ:", WS_CHILD | WS_VISIBLE, 20, 20, 100, 24, hwnd, nullptr, g_hFontBody);
-        HWND cb = CreateWindowW(L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 120, 20, 150, 100, hwnd, (HMENU)ID_CB_THEME, nullptr);
-        SendMessageW(cb, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"デフォルト");
-        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"ライト");
-        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"ハッカー");
-        SendMessageW(cb, CB_SETCURSEL, g_Config.theme, 0);
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        state = new SettingsState{};
+        state->owner = cs ? cs->hwndParent : nullptr;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
 
-        CreateWindowW(L"STATIC", L"ROMパス:", WS_CHILD | WS_VISIBLE, 20, 60, 100, 24, hwnd, nullptr, g_hFontBody);
-        HWND edRom = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_Config.romDir.empty() ? L"(デフォルト)" : g_Config.romDir.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 120, 60, 240, 24, hwnd, (HMENU)ID_ED_ROM, nullptr);
-        SendMessageW(edRom, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        HWND btnRom = CreateWindowW(L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE, 370, 60, 60, 24, hwnd, (HMENU)ID_BTN_ROM, nullptr);
-        SendMessageW(btnRom, WM_SETFONT, (WPARAM)g_hFontBody, 0);
+        const int left = 18;
+        const int top = 18;
+        const int labelW = 120;
+        const int editW = 300;
+        const int rowH = 28;
+        const int gapY = 14;
+        const int buttonW = 86;
+        const int buttonH = 28;
 
-        CreateWindowW(L"STATIC", L"背景画像:", WS_CHILD | WS_VISIBLE, 20, 100, 100, 24, hwnd, nullptr, g_hFontBody);
-        HWND edBg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_Config.bgImage.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 120, 100, 240, 24, hwnd, (HMENU)ID_ED_BG, nullptr);
-        SendMessageW(edBg, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        HWND btnBg = CreateWindowW(L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE, 370, 100, 60, 24, hwnd, (HMENU)ID_BTN_BG, nullptr);
-        SendMessageW(btnBg, WM_SETFONT, (WPARAM)g_hFontBody, 0);
+        CreateWindowExW(0, L"STATIC", L"レイアウト色", WS_CHILD | WS_VISIBLE, left, top + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+        state->comboTheme = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                                            left + labelW, top, editW, 200, hwnd, reinterpret_cast<HMENU>(IDC_THEME), nullptr, nullptr);
 
-        HWND btnReset = CreateWindowW(L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE, 20, 160, 80, 30, hwnd, (HMENU)ID_BTN_RESET, nullptr);
-        SendMessageW(btnReset, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        HWND btnOk = CreateWindowW(L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE, 270, 160, 80, 30, hwnd, (HMENU)ID_BTN_OK, nullptr);
-        SendMessageW(btnOk, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        HWND btnCancel = CreateWindowW(L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE, 360, 160, 80, 30, hwnd, (HMENU)ID_BTN_CANCEL, nullptr);
-        SendMessageW(btnCancel, WM_SETFONT, (WPARAM)g_hFontBody, 0);
-        return 0;
-    }
-    case WM_COMMAND: {
-        if (LOWORD(wp) == ID_BTN_ROM) {
-            std::wstring path = BrowseFolder(hwnd);
-            if (!path.empty()) SetWindowTextW(GetDlgItem(hwnd, ID_ED_ROM), path.c_str());
-        } else if (LOWORD(wp) == ID_BTN_BG) {
-            std::wstring path = BrowseFile(hwnd);
-            if (!path.empty()) SetWindowTextW(GetDlgItem(hwnd, ID_ED_BG), path.c_str());
-        } else if (LOWORD(wp) == ID_BTN_RESET) {
-            SendMessageW(GetDlgItem(hwnd, ID_CB_THEME), CB_SETCURSEL, 0, 0);
-            SetWindowTextW(GetDlgItem(hwnd, ID_ED_ROM), L"(デフォルト)");
-            SetWindowTextW(GetDlgItem(hwnd, ID_ED_BG), L"");
-        } else if (LOWORD(wp) == ID_BTN_OK) {
-            g_Config.theme = static_cast<int>(SendMessageW(GetDlgItem(hwnd, ID_CB_THEME), CB_GETCURSEL, 0, 0));
-            wchar_t buf[MAX_PATH];
-            GetWindowTextW(GetDlgItem(hwnd, ID_ED_ROM), buf, MAX_PATH);
-            std::wstring r = buf;
-            g_Config.romDir = (r == L"(デフォルト)") ? L"" : r;
-            GetWindowTextW(GetDlgItem(hwnd, ID_ED_BG), buf, MAX_PATH);
-            g_Config.bgImage = buf;
-            SaveConfig();
-            ApplyTheme();
-            RefreshBrushes();
-            InvalidateRect(g_hMain, nullptr, TRUE);
-            g_RomText = g_Config.romDir.empty() ? L"./TAB-A05-BD" : g_Config.romDir;
-            SetWindowTextW(hLblRom, g_RomText.c_str());
-            DestroyWindow(hwnd);
-        } else if (LOWORD(wp) == ID_BTN_CANCEL) {
-            DestroyWindow(hwnd);
+        CreateWindowExW(0, L"STATIC", L"画像フォルダ", WS_CHILD | WS_VISIBLE, left, top + rowH + gapY + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+        state->editImgDir = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
+                                            left + labelW, top + rowH + gapY, editW, rowH, hwnd, reinterpret_cast<HMENU>(IDC_IMGDIR), nullptr, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"背景画像", WS_CHILD | WS_VISIBLE, left, top + (rowH + gapY) * 2 + 4, labelW, 20, hwnd, nullptr, nullptr, nullptr);
+        state->editBgImg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                           WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_TABSTOP,
+                                           left + labelW, top + (rowH + gapY) * 2, editW - buttonW - 8, rowH, hwnd, reinterpret_cast<HMENU>(IDC_BGIMG), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"参照...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        left + labelW + editW - buttonW, top + (rowH + gapY) * 2, buttonW, buttonH,
+                        hwnd, reinterpret_cast<HMENU>(IDC_BG_BROWSE), nullptr, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"保存すると config.ini に反映されます。", WS_CHILD | WS_VISIBLE,
+                        left, top + (rowH + gapY) * 3 + 4, 520, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindowExW(0, L"STATIC", L"背景画像は透過つきで自動リサイズ表示されます。", WS_CHILD | WS_VISIBLE,
+                        left, top + (rowH + gapY) * 3 + 26, 520, 20, hwnd, nullptr, nullptr, nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        left, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_RESET), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        left + buttonW + 10, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        left + (buttonW + 10) * 2, top + (rowH + gapY) * 4 + 22, buttonW, buttonH, hwnd, reinterpret_cast<HMENU>(IDC_CLOSE), nullptr, nullptr);
+
+        FillSettingsControls(state);
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBody), TRUE);
         }
         return 0;
     }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, C_TEXT);
+        if (msg == WM_CTLCOLOREDIT) {
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, C_EDIT_BG);
+            return reinterpret_cast<LRESULT>(g_brEdit);
+        }
+        return reinterpret_cast<LRESULT>(g_brTransparent);
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_COMMAND: {
+        switch (LOWORD(wp)) {
+        case IDC_BG_BROWSE:
+            BrowseBackgroundImage(hwnd, state ? state->editBgImg : nullptr);
+            return 0;
+        case IDC_SAVE:
+            SaveFromSettings(state);
+            ApplyThemeToWindow(g_hMain);
+            return 0;
+        case IDC_RESET: {
+            AppConfig cfg = DefaultAppConfig();
+            SaveAppConfig(cfg);
+            ApplyAppConfig(cfg);
+            FillSettingsControls(state);
+            ApplyThemeToWindow(g_hMain);
+            return 0;
+        }
+        case IDC_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case IDC_THEME:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                return 0;
+            }
+            break;
+        }
+        break;
+    }
+
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
+
     case WM_DESTROY:
-        EnableWindow(g_hMain, TRUE);
-        SetForegroundWindow(g_hMain);
+        if (state) {
+            delete state;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        g_hSettings = nullptr;
         return 0;
     }
+
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void ShowSettingsDialog(HWND parent) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = SettingsWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"A05SettingsClass";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassW(&wc);
-    EnableWindow(parent, FALSE);
-    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"A05SettingsClass", L"設定", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 480, 250, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
-    RECT rcParent, rcDlg;
-    GetWindowRect(parent, &rcParent);
-    GetWindowRect(hDlg, &rcDlg);
-    SetWindowPos(hDlg, nullptr, rcParent.left + (rcParent.right - rcParent.left - (rcDlg.right - rcDlg.left)) / 2,
-                 rcParent.top + (rcParent.bottom - rcParent.top - (rcDlg.bottom - rcDlg.top)) / 2, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+} // namespace
+
+AppConfig DefaultAppConfig() {
+    AppConfig cfg{};
+    cfg.themeIndex = 0;
+    cfg.imageDir.clear();
+    cfg.backgroundImage.clear();
+    return cfg;
+}
+
+AppConfig LoadAppConfig() {
+    return ReadConfigFromFile();
+}
+
+void SaveAppConfig(const AppConfig& cfg) {
+    AppConfig normalized = cfg;
+    if (normalized.themeIndex < 0 || normalized.themeIndex > 2) {
+        normalized.themeIndex = 0;
+    }
+    normalized.imageDir = NormalizeInputPath(normalized.imageDir);
+    normalized.backgroundImage = NormalizeInputPath(normalized.backgroundImage);
+    WriteConfigFile(normalized);
+}
+
+void ApplyAppConfig(const AppConfig& cfg) {
+    g_Config = cfg;
+    if (g_Config.themeIndex < 0 || g_Config.themeIndex > 2) {
+        g_Config.themeIndex = 0;
+    }
+    g_theme = ThemeFromIndex(g_Config.themeIndex);
+    RebuildThemeResources();
+    RefreshTexts();
+    ReloadBackgroundImage();
+    if (hProgressBar) {
+        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
+        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
+    }
+    if (g_hMain) {
+        InvalidateRect(g_hMain, nullptr, TRUE);
+    }
+}
+
+void OpenSettingsWindow(HWND owner) {
+    if (g_hSettings && IsWindow(g_hSettings)) {
+        SetForegroundWindow(g_hSettings);
+        return;
+    }
+
+    if (!owner) {
+        owner = g_hMain;
+    }
+
+    const wchar_t clsName[] = L"A05BDSettingsWindow";
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = SettingsWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = clsName;
+        wc.hbrBackground = nullptr;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        wc.style = CS_DBLCLKS;
+        RegisterClassW(&wc);
+        registered = true;
+    }
+
+    g_hSettings = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                                  clsName, L"設定", WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 620, 320,
+                                  owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!g_hSettings) {
+        return;
+    }
+
+    RECT rcOwner{};
+    if (owner && GetWindowRect(owner, &rcOwner)) {
+        const int w = 620;
+        const int h = 320;
+        const int x = rcOwner.left + ((rcOwner.right - rcOwner.left) - w) / 2;
+        const int y = rcOwner.top + ((rcOwner.bottom - rcOwner.top) - h) / 2;
+        SetWindowPos(g_hSettings, nullptr, x, y, w, h, SWP_NOZORDER);
+    }
+
+    if (owner) {
+        EnableWindow(owner, FALSE);
+    }
+    ShowWindow(g_hSettings, SW_SHOW);
+    UpdateWindow(g_hSettings);
+
+    MSG msg{};
+    while (IsWindow(g_hSettings)) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage(static_cast<int>(msg.wParam));
+                if (owner) {
+                    EnableWindow(owner, TRUE);
+                }
+                return;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (IsWindow(g_hSettings)) {
+            WaitMessage();
+        }
+    }
+
+    if (owner) {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
 }

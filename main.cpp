@@ -1,4 +1,5 @@
 #include "app.h"
+
 #include <thread>
 
 static HWND CreateCtrl(HWND parent, const wchar_t* cls, const wchar_t* txt, DWORD style, DWORD exStyle,
@@ -21,7 +22,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hFontBody = MakeFont(L"Segoe UI", 10, FW_NORMAL);
         g_hFontMono = MakeFont(L"Consolas", 10, FW_NORMAL);
 
-        RefreshBrushes();
+        SafeDeleteObject(g_brPanel);
+        SafeDeleteObject(g_brPanel2);
+        SafeDeleteObject(g_brEdit);
+        g_brPanel = CreateSolidBrush(C_PANEL);
+        g_brPanel2 = CreateSolidBrush(C_PANEL2);
+        g_brEdit = CreateSolidBrush(C_EDIT_BG);
         g_brTransparent = reinterpret_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
 
         hLblTitle = CreateCtrl(hwnd, L"STATIC", L"a05bd フラッシャー", 0, 0, 0, 0, 0, 0, ID_LBL_TITLE, g_hFontTitle);
@@ -29,17 +35,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hLblStatus = CreateCtrl(hwnd, L"STATIC", L"待機中", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STATUS, g_hFontBody);
         hLblHint = CreateCtrl(hwnd, L"STATIC", g_HintText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_HINT, g_hFontBody);
         hLblDevice = CreateCtrl(hwnd, L"STATIC", L"未確認", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_DEVICE, g_hFontBody);
-        hLblFastboot = CreateCtrl(hwnd, L"STATIC", L".\\platform-tools\\fastboot.exe", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
+        hLblFastboot = CreateCtrl(hwnd, L"STATIC", g_FastbootText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_FASTBT, g_hFontBody);
         hLblRom = CreateCtrl(hwnd, L"STATIC", g_RomText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_ROM, g_hFontBody);
-        hLblSteps = CreateCtrl(hwnd, L"STATIC", L"flash / erase / reboot", SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
+        hLblBgImage = CreateCtrl(hwnd, L"STATIC", g_BgImageText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_BGIMG, g_hFontBody);
+        hLblSteps = CreateCtrl(hwnd, L"STATIC", g_StepsText.c_str(), SS_LEFT, 0, 0, 0, 0, 0, ID_LBL_STEPS, g_hFontBody);
 
         hBtnCheck = CreateCtrl(hwnd, L"BUTTON", L"端末確認", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_CHECK, g_hFontBody);
         hBtnFlash = CreateCtrl(hwnd, L"BUTTON", L"ROM 書き込み", BS_OWNERDRAW | BS_PUSHBUTTON | WS_DISABLED, 0, 0, 0, 0, 0, ID_BTN_FLASH, g_hFontBody);
-        hBtnSettings = CreateCtrl(hwnd, L"BUTTON", L"設定", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_SETTINGS, g_hFontBody);
+        hBtnOption = CreateCtrl(hwnd, L"BUTTON", L"設定", BS_OWNERDRAW | BS_PUSHBUTTON, 0, 0, 0, 0, 0, ID_BTN_OPTION, g_hFontBody);
 
         hProgressBar = CreateWindowExW(0, PROGRESS_CLASSW, nullptr, WS_VISIBLE | WS_CHILD | PBS_SMOOTH,
                                        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_PROGRESS)), nullptr, nullptr);
         SendMessageW(hProgressBar, PBM_SETMARQUEE, FALSE, 0);
+        SendMessageW(hProgressBar, PBM_SETBKCOLOR, 0, static_cast<LPARAM>(C_PANEL));
+        SendMessageW(hProgressBar, PBM_SETBARCOLOR, 0, static_cast<LPARAM>(C_ACCENT));
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
                           WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
@@ -49,13 +58,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStatusUI(L"待機中");
         UpdateDeviceUI(L"未確認");
         UpdateHintUI(L"端末を fastboot モードで接続してから「端末確認」を押してください。");
-        UpdateStepsUI(L"flash / erase / reboot");
+        UpdateStepsUI(L"手順 : flash / erase / reboot");
+        UpdateBgImageUI(g_BgImageText);
 
-        AppendLogBlock(L"fastboot    : .\\platform-tools\\fastboot.exe\r\n"
-                       L"確認手順    : fastboot devices / getvar product / getvar unlocked\r\n"
-                       L"処理方式    : 個別 partition に flash / erase を順次実行\r\n"
-                       L"--------------------------------------------------------------\r\n"
-                       L"端末を fastboot モードで接続し、「端末確認」を押してください。\r\n");
+        AppendLogBlock(g_FastbootText + L"\r\n"
+                       + g_RomText + L"\r\n"
+                       + g_BgImageText + L"\r\n"
+                       + L"確認手順      : fastboot devices / getvar product / getvar unlocked\r\n"
+                       + L"処理方式      : 個別 partition に flash / erase を順次実行\r\n"
+                       + L"--------------------------------------------------------------\r\n"
+                       + L"端末を fastboot モードで接続し、「端末確認」を押してください。\r\n");
 
         if (!FileExistsA(FASTBOOT_EXE())) {
             UpdateStatusUI(L"fastboot 未検出");
@@ -81,8 +93,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
+        if (LOWORD(wp) == ID_BTN_OPTION) {
+            OpenSettingsWindow(hwnd);
+            return 0;
+        }
         if (g_Busy.load(std::memory_order_acquire)) {
-            break;
+            return 0;
         }
         if (LOWORD(wp) == ID_BTN_CHECK) {
             g_DeviceVerified = false;
@@ -94,7 +110,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateHintUI(L"端末情報を取得しています。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
-            EnableWindow(hBtnSettings, FALSE);
+            EnableWindow(hBtnOption, FALSE);
             SendMessageW(hProgressBar, PBM_SETPOS, 0, 0);
             std::thread([token]() { CheckThread(token); }).detach();
         } else if (LOWORD(wp) == ID_BTN_FLASH && g_DeviceVerified && g_Unlocked) {
@@ -104,10 +120,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UpdateHintUI(L"書き込み処理を実行しています。");
             EnableWindow(hBtnCheck, FALSE);
             EnableWindow(hBtnFlash, FALSE);
-            EnableWindow(hBtnSettings, FALSE);
+            EnableWindow(hBtnOption, FALSE);
             std::thread([token]() { FlashThread(token); }).detach();
-        } else if (LOWORD(wp) == ID_BTN_SETTINGS) {
-            ShowSettingsDialog(hwnd);
         }
         return 0;
 
@@ -127,25 +141,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC hdc = reinterpret_cast<HDC>(wp);
         HWND ctrl = reinterpret_cast<HWND>(lp);
 
-        COLORREF bg = C_PANEL;
         COLORREF fg = C_TEXT;
-
         if (ctrl == hLblStatus) {
             if (g_StatusText.find(L"書き込み中") != std::wstring::npos) fg = C_WARNING;
             else if (g_StatusText.find(L"失敗") != std::wstring::npos) fg = C_DANGER;
             else if (g_StatusText.find(L"完了") != std::wstring::npos || g_StatusText.find(L"確認済み") != std::wstring::npos) fg = C_SUCCESS;
             else if (g_StatusText.find(L"未検出") != std::wstring::npos) fg = C_DANGER;
             else fg = C_ACCENT;
-        } else if (ctrl == hLblHint || ctrl == hLblSteps) {
+        } else if (ctrl == hLblHint || ctrl == hLblSteps || ctrl == hLblBgImage) {
             fg = C_MUTED;
-        } else {
-            fg = C_TEXT;
         }
 
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, bg);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, fg);
-        return reinterpret_cast<LRESULT>(g_brPanel);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_CTLCOLOREDIT: {
@@ -183,7 +192,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TEXT_SET: {
         auto* msgp = reinterpret_cast<TextMessage*>(wp);
-        if (!msgp) return 0;
+        if (!msgp) {
+            return 0;
+        }
         if (msgp->token == g_CurrentOperationToken.load(std::memory_order_acquire)) {
             if (msgp->kind == 0) UpdateStatusUI(msgp->text);
             else if (msgp->kind == 1) UpdateDeviceUI(msgp->text);
@@ -196,7 +207,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_PROG_SET: {
         const uint32_t token = static_cast<uint32_t>(wp);
-        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) return 0;
+        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) {
+            return 0;
+        }
         const WORD pos = LOWORD(lp);
         const WORD rng = HIWORD(lp);
         SendMessageW(hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, rng));
@@ -206,14 +219,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_OP_DONE: {
         const uint32_t token = static_cast<uint32_t>(wp);
-        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) return 0;
+        if (token != g_CurrentOperationToken.load(std::memory_order_acquire)) {
+            return 0;
+        }
 
         const bool ok = (lp & 1) != 0;
         const bool flashMode = (lp & 2) != 0;
 
         g_Busy = false;
         EnableWindow(hBtnCheck, TRUE);
-        EnableWindow(hBtnSettings, TRUE);
+        EnableWindow(hBtnOption, TRUE);
 
         if (!FileExistsA(FASTBOOT_EXE())) {
             EnableWindow(hBtnFlash, FALSE);
@@ -236,8 +251,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 EnableWindow(hBtnFlash, FALSE);
                 UpdateStatusUI(L"検証失敗");
                 UpdateHintUI(L"端末が見つからないか、条件を満たしていません。");
-                if (!g_Unlocked) MessageBoxW(hwnd, L"端末との接続に失敗しました", L"実行条件を満たしていません。", MB_ICONWARNING);
-                else MessageBoxW(hwnd, L"端末が見つからないか、モデルが一致しません。\nfastboot モードで接続してください。", L"確認失敗", MB_ICONERROR);
+                if (!g_Unlocked) {
+                    MessageBoxW(hwnd, L"端末との接続に失敗しました", L"実行条件を満たしていない可能性があります。", MB_ICONWARNING);
+                } else {
+                    MessageBoxW(hwnd,
+                        L"端末が見つからないか、モデルが一致しません。\n"
+                        L"fastboot モードで接続してください。",
+                        L"確認失敗", MB_ICONERROR);
+                }
             }
         } else {
             g_DeviceVerified = false;
@@ -268,15 +289,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    ULONG_PTR gdiplusToken;
-    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
+    InitGdiPlus();
+    ApplyAppConfig(LoadAppConfig());
 
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&icc);
-
-    LoadConfig();
-    ApplyTheme();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
@@ -288,14 +305,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassW(&wc);
 
-    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.3",
+    g_hMain = CreateWindowExW(0, APP_CLASS, L"a05bd フラッシャー v1.2",
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                               CW_USEDEFAULT, CW_USEDEFAULT, 920, 720,
                               nullptr, nullptr, hInst, nullptr);
 
     if (!g_hMain) {
         CleanupGdi();
-        Gdiplus::GdiplusShutdown(gdiplusToken);
+        ShutdownGdiPlus();
         return 0;
     }
 
@@ -306,6 +323,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 
     CleanupGdi();
-    Gdiplus::GdiplusShutdown(gdiplusToken);
+    ShutdownGdiPlus();
     return static_cast<int>(msg.wParam);
 }

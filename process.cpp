@@ -1,9 +1,14 @@
 #include "app.h"
+
 #include <algorithm>
 #include <cctype>
-#include <deque>
+#include <cwctype>
+#include <cwchar>
+#include <memory>
 #include <string_view>
 #include <vector>
+
+#pragma comment(lib, "gdiplus.lib")
 
 namespace {
 constexpr size_t kMaxQueuedLines = 384;
@@ -27,21 +32,41 @@ struct Handle {
     ~Handle() { reset(); }
     HANDLE get() const noexcept { return h; }
     void reset(HANDLE v = nullptr) noexcept {
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (h && h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
         h = v;
     }
 };
+
+std::wstring TrimCopy(const std::wstring& s) {
+    size_t begin = 0;
+    while (begin < s.size() && iswspace(s[begin])) {
+        ++begin;
+    }
+    size_t end = s.size();
+    while (end > begin && iswspace(s[end - 1])) {
+        --end;
+    }
+    return s.substr(begin, end - begin);
+}
 
 std::wstring NormalizeForDisplay(const std::wstring& src) {
     std::wstring out;
     out.reserve(src.size());
     for (wchar_t ch : src) {
-        if (ch == L'\r') continue;
-        if (ch == L'\n') {
-            if (out.empty() || out.back() != L'\n') out.push_back(L'\n');
+        if (ch == L'\r') {
             continue;
         }
-        if (ch < 0x20 && ch != L'\t') continue;
+        if (ch == L'\n') {
+            if (out.empty() || out.back() != L'\n') {
+                out.push_back(L'\n');
+            }
+            continue;
+        }
+        if (ch < 0x20 && ch != L'\t') {
+            continue;
+        }
         out.push_back(ch);
     }
     return out;
@@ -54,13 +79,17 @@ std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
     current.reserve(text.size());
 
     for (wchar_t ch : text) {
-        if (ch == L'\r') continue;
+        if (ch == L'\r') {
+            continue;
+        }
         if (ch == L'\n') {
             lines.push_back(current);
             current.clear();
             continue;
         }
-        if (ch < 0x20 && ch != L'\t') continue;
+        if (ch < 0x20 && ch != L'\t') {
+            continue;
+        }
         current.push_back(ch);
     }
     lines.push_back(current);
@@ -68,7 +97,9 @@ std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
 }
 
 bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) return true;
+    if (needle.empty()) {
+        return true;
+    }
     auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
         [](char a, char b) {
             return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a))) ==
@@ -78,60 +109,125 @@ bool ContainsInsensitive(std::string_view haystack, std::string_view needle) {
 }
 
 void TrimLogWindow(size_t limitChars = kMaxLogChars) {
-    if (!hLog) return;
+    if (!hLog) {
+        return;
+    }
     const int len = GetWindowTextLengthW(hLog);
-    if (len <= static_cast<int>(limitChars)) return;
+    if (len <= static_cast<int>(limitChars)) {
+        return;
+    }
     const int removeChars = len - static_cast<int>(limitChars);
     SendMessageW(hLog, EM_SETSEL, 0, removeChars);
     SendMessageW(hLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
 }
-}
 
-std::wstring ModuleDirW() {
-    wchar_t buffer[MAX_PATH * 4]{};
-    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
-    if (len == 0 || len >= (sizeof(buffer) / sizeof(buffer[0]))) return L".";
-    std::wstring path(buffer, buffer + len);
-    const size_t pos = path.find_last_of(L"\\/");
-    if (pos == std::wstring::npos) return L".";
-    path.resize(pos);
+std::wstring EnsureTrailingSlash(std::wstring path) {
+    if (path.empty()) {
+        return path;
+    }
+    const wchar_t back = L'\\';
+    if (path.back() != back && path.back() != L'/') {
+        path.push_back(back);
+    }
     return path;
 }
 
-std::string WideToAnsi(const std::wstring& s) {
-    if (s.empty()) return {};
-    const int need = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (need <= 0) return {};
-    std::string out(static_cast<size_t>(need - 1), '\0');
-    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, out.data(), need, nullptr, nullptr);
-    return out;
+std::wstring EffectiveImageDirWide() {
+    if (!g_Config.imageDir.empty()) {
+        return g_Config.imageDir;
+    }
+    return ModuleDirW() + L"\\TAB-A05-BD";
+}
+
+void DrawImageWithAlpha(HDC hdc, const RECT& rc) {
+    if (!g_BackgroundBitmap) {
+        return;
+    }
+
+    const int srcW = static_cast<int>(g_BackgroundBitmap->GetWidth());
+    const int srcH = static_cast<int>(g_BackgroundBitmap->GetHeight());
+    if (srcW <= 0 || srcH <= 0) {
+        return;
+    }
+
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+
+    const int dstW = rc.right - rc.left;
+    const int dstH = rc.bottom - rc.top;
+    if (dstW <= 0 || dstH <= 0) {
+        return;
+    }
+
+    const double scaleW = static_cast<double>(dstW) / static_cast<double>(srcW);
+    const double scaleH = static_cast<double>(dstH) / static_cast<double>(srcH);
+    const double scale = (scaleW < scaleH) ? scaleW : scaleH;
+    const int drawW = std::max(1, static_cast<int>(srcW * scale));
+    const int drawH = std::max(1, static_cast<int>(srcH * scale));
+    const int x = rc.left + (dstW - drawW) / 2;
+    const int y = rc.top + (dstH - drawH) / 2;
+
+    Gdiplus::ColorMatrix matrix{};
+    matrix.m[0][0] = 1.0f;
+    matrix.m[1][1] = 1.0f;
+    matrix.m[2][2] = 1.0f;
+    matrix.m[3][3] = 0.22f;
+    matrix.m[4][4] = 1.0f;
+
+    Gdiplus::ImageAttributes attrs;
+    attrs.SetColorMatrix(&matrix, Gdiplus::ColorMatrixFlagsDefault, Gdiplus::ColorAdjustTypeBitmap);
+    graphics.DrawImage(g_BackgroundBitmap,
+                       Gdiplus::Rect(x, y, drawW, drawH),
+                       0, 0,
+                       srcW, srcH,
+                       Gdiplus::UnitPixel,
+                       &attrs);
+}
+
 }
 
 void SafeDeleteObject(HGDIOBJ obj) {
-    if (obj) DeleteObject(obj);
+    if (obj) {
+        DeleteObject(obj);
+    }
 }
 
 std::wstring ToWide(const std::string& s) {
-    if (s.empty()) return {};
+    if (s.empty()) {
+        return {};
+    }
+
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), -1, nullptr, 0);
     if (n > 0) {
-        std::wstring w(static_cast<size_t>(n - 1), L'\0');
+        std::wstring w(static_cast<size_t>(n), L'\0');
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+        w.resize(wcslen(w.c_str()));
         return w;
     }
+
     n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    if (n <= 0) {
+        return {};
+    }
+
+    std::wstring w(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
+    w.resize(wcslen(w.c_str()));
     return w;
 }
 
 std::wstring Win32ErrorText(DWORD err) {
-    if (!err) return L"";
+    if (!err) {
+        return L"";
+    }
+
     LPWSTR buffer = nullptr;
     const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
     const DWORD len = FormatMessageW(flags, nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                                      reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+
     std::wstring out;
     if (len && buffer) {
         out.assign(buffer, buffer + len);
@@ -139,20 +235,52 @@ std::wstring Win32ErrorText(DWORD err) {
             out.pop_back();
         }
     }
-    if (buffer) LocalFree(buffer);
-    if (out.empty()) out = L"Win32 error " + std::to_wstring(err);
+    if (buffer) {
+        LocalFree(buffer);
+    }
+    if (out.empty()) {
+        out = L"Win32 error " + std::to_wstring(err);
+    }
     return out;
 }
 
 bool FileExistsA(const std::string& path) {
-    if (path.empty()) return false;
+    if (path.empty()) {
+        return false;
+    }
     const DWORD attr = GetFileAttributesA(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+bool FileExistsW(const std::wstring& path) {
+    if (path.empty()) {
+        return false;
+    }
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring ModuleDirW() {
+    wchar_t buffer[MAX_PATH * 4]{};
+    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(sizeof(buffer) / sizeof(buffer[0])));
+    if (len == 0 || len >= (sizeof(buffer) / sizeof(buffer[0]))) {
+        return L".";
+    }
+    std::wstring path(buffer, buffer + len);
+    const size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) {
+        return L".";
+    }
+    path.resize(pos);
+    return path;
+}
+
+std::wstring ConfigPathW() {
+    return ModuleDirW() + L"\\config.ini";
+}
+
 std::string RomDir() {
-    if (!g_Config.romDir.empty()) return WideToAnsi(g_Config.romDir);
-    return WideToAnsi(ModuleDirW() + L"\\TAB-A05-BD");
+    return WideToAnsi(EffectiveImageDirWide());
 }
 
 std::string FASTBOOT_EXE() {
@@ -174,15 +302,18 @@ std::string Img(const char* filename) {
 ExecResult Exec(const std::string& cmdLine) {
     ExecResult r{};
     r.exitCode = 1;
+
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
+
     HANDLE hRead = nullptr;
     HANDLE hWrite = nullptr;
     if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
         r.launchError = Win32ErrorText(GetLastError());
         return r;
     }
+
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
     Handle readHandle(hRead);
     Handle writeHandle(hWrite);
@@ -202,6 +333,7 @@ ExecResult Exec(const std::string& cmdLine) {
         r.launchError = Win32ErrorText(GetLastError());
         return r;
     }
+
     Handle proc(pi.hProcess);
     Handle thread(pi.hThread);
     writeHandle.reset();
@@ -212,9 +344,12 @@ ExecResult Exec(const std::string& cmdLine) {
     DWORD n = 0;
     for (;;) {
         const BOOL ok = ReadFile(readHandle.get(), buf, static_cast<DWORD>(sizeof(buf)), &n, nullptr);
-        if (!ok || n == 0) break;
+        if (!ok || n == 0) {
+            break;
+        }
         out.append(buf, buf + n);
     }
+
     WaitForSingleObject(proc.get(), INFINITE);
     GetExitCodeProcess(proc.get(), &r.exitCode);
     r.output = std::move(out);
@@ -230,6 +365,43 @@ HFONT MakeFont(const wchar_t* face, int size, int weight, BOOL italic) {
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
+bool InitGdiPlus() {
+    if (g_GdiplusToken != 0) {
+        return true;
+    }
+    Gdiplus::GdiplusStartupInput input{};
+    if (Gdiplus::GdiplusStartup(&g_GdiplusToken, &input, nullptr) != Gdiplus::Ok) {
+        g_GdiplusToken = 0;
+        return false;
+    }
+    return true;
+}
+
+void ShutdownGdiPlus() {
+    if (g_GdiplusToken != 0) {
+        Gdiplus::GdiplusShutdown(g_GdiplusToken);
+        g_GdiplusToken = 0;
+    }
+}
+
+void ReloadBackgroundImage() {
+    if (g_BackgroundBitmap) {
+        delete g_BackgroundBitmap;
+        g_BackgroundBitmap = nullptr;
+    }
+    if (g_Config.backgroundImage.empty()) {
+        return;
+    }
+    if (!FileExistsW(g_Config.backgroundImage)) {
+        return;
+    }
+    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromFile(g_Config.backgroundImage.c_str(), FALSE));
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) {
+        return;
+    }
+    g_BackgroundBitmap = bmp.release();
+}
+
 uint32_t BeginOperation() {
     const uint32_t token = g_CurrentOperationToken.fetch_add(1, std::memory_order_acq_rel) + 1;
     {
@@ -242,16 +414,22 @@ uint32_t BeginOperation() {
 
 void QueueLog(uint32_t token, const std::wstring& msg) {
     const auto lines = SplitLogLines(NormalizeForDisplay(msg));
+
     {
         std::lock_guard<std::mutex> lock(g_LogMutex);
         for (const auto& line : lines) {
-            if (g_LogQueue.size() >= kMaxQueuedLines) g_LogQueue.pop_front();
+            if (g_LogQueue.size() >= kMaxQueuedLines) {
+                g_LogQueue.pop_front();
+            }
             g_LogQueue.push_back(LogLine{token, line});
         }
     }
+
     bool expected = false;
     if (g_LogFlushPending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        if (!PostMessageW(g_hMain, WM_LOG_FLUSH, 0, 0)) g_LogFlushPending.store(false, std::memory_order_release);
+        if (!PostMessageW(g_hMain, WM_LOG_FLUSH, 0, 0)) {
+            g_LogFlushPending.store(false, std::memory_order_release);
+        }
     }
 }
 
@@ -260,11 +438,12 @@ void QueueText(uint32_t token, UINT kind, const std::wstring& msg) {
     p->token = token;
     p->kind = kind;
     p->text = msg;
-    if (!PostMessageW(g_hMain, WM_TEXT_SET, reinterpret_cast<WPARAM>(p), 0)) delete p;
+    if (!PostMessageW(g_hMain, WM_TEXT_SET, reinterpret_cast<WPARAM>(p), 0)) {
+        delete p;
+    }
 }
 
 void QueueProgress(uint32_t token, WORD pos, WORD rng) {
-    (void)token;
     PostMessageW(g_hMain, WM_PROG_SET, static_cast<WPARAM>(token), MAKELPARAM(pos, rng));
 }
 
@@ -274,7 +453,9 @@ void QueueDone(uint32_t token, bool ok, bool flashMode) {
 }
 
 void UpdateText(HWND hwnd, const std::wstring& text) {
-    if (hwnd) SetWindowTextW(hwnd, text.c_str());
+    if (hwnd) {
+        SetWindowTextW(hwnd, text.c_str());
+    }
 }
 
 void UpdateStatusUI(const std::wstring& text) {
@@ -297,8 +478,16 @@ void UpdateStepsUI(const std::wstring& text) {
     UpdateText(hLblSteps, text);
 }
 
+void UpdateBgImageUI(const std::wstring& text) {
+    g_BgImageText = text;
+    UpdateText(hLblBgImage, text);
+}
+
 void AppendLogBlock(const std::wstring& text) {
-    if (!hLog || text.empty()) return;
+    if (!hLog || text.empty()) {
+        return;
+    }
+
     SendMessageW(hLog, WM_SETREDRAW, FALSE, 0);
     const int len = GetWindowTextLengthW(hLog);
     SendMessageW(hLog, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
@@ -316,25 +505,166 @@ void FlushLogQueue() {
         items.swap(g_LogQueue);
     }
     g_LogFlushPending.store(false, std::memory_order_release);
-    if (items.empty()) return;
+
+    if (items.empty()) {
+        return;
+    }
+
     const uint32_t current = g_CurrentOperationToken.load(std::memory_order_acquire);
     std::wstring batch;
     batch.reserve(2048);
+
     for (const auto& item : items) {
-        if (item.token != current) continue;
-        if (!item.text.empty()) batch.append(item.text);
+        if (item.token != current) {
+            continue;
+        }
+        if (!item.text.empty()) {
+            batch.append(item.text);
+        }
         batch.append(L"\r\n");
     }
-    if (!batch.empty()) AppendLogBlock(batch);
+
+    if (!batch.empty()) {
+        AppendLogBlock(batch);
+    }
+}
+
+void DrawRoundCard(HDC hdc, const RECT& rc, COLORREF fill, COLORREF edge, int radius) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+void DrawChip(HDC hdc, int x, int y, int w, int h, COLORREF fill, COLORREF edge, const wchar_t* text) {
+    RECT rc{x, y, x + w, y + h};
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, C_TEXT);
+    SelectObject(hdc, g_hFontBody);
+    DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void PaintMain(HDC hdc, const RECT& rc) {
+    HBRUSH bg = CreateSolidBrush(C_BG);
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+
+    DrawImageWithAlpha(hdc, rc);
+
+    RECT header = {rc.left, rc.top, rc.right, rc.top + 124};
+    HBRUSH headerBr = CreateSolidBrush(C_BG2);
+    FillRect(hdc, &header, headerBr);
+    DeleteObject(headerBr);
+
+    DrawRoundCard(hdc, g_layout.leftCard, C_PANEL, C_LINE);
+    DrawRoundCard(hdc, g_layout.rightCard, C_PANEL, C_LINE);
+    DrawRoundCard(hdc, g_layout.logCard, C_PANEL2, C_LINE);
+
+    RECT accent = {rc.left + 18, 122, rc.right - 18, 124};
+    HBRUSH accentBr = CreateSolidBrush(C_ACCENT);
+    FillRect(hdc, &accent, accentBr);
+    DeleteObject(accentBr);
+
+    SelectObject(hdc, g_hFontTitle);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, C_TEXT);
+    RECT titleRc = g_layout.header;
+    titleRc.left += 2;
+    titleRc.top += 4;
+    titleRc.bottom = titleRc.top + 34;
+    DrawTextW(hdc, L"a05bd フラッシャー", -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, g_hFontSub);
+    SetTextColor(hdc, C_MUTED);
+    RECT subRc = g_layout.header;
+    subRc.left += 2;
+    subRc.top += 42;
+    subRc.bottom = subRc.top + 24;
+    DrawTextW(hdc, L"簡易書き込みツール", -1, &subRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    DrawChip(hdc, rc.right - 250, 24, 120, 26, g_theme.chipBg, g_theme.chipEdge, L"v1.2");
+
+    RECT logTitle = g_layout.logCard;
+    logTitle.left += 16;
+    logTitle.top += 12;
+    logTitle.right -= 16;
+    logTitle.bottom = logTitle.top + 22;
+    SelectObject(hdc, g_hFontBody);
+    SetTextColor(hdc, C_TEXT);
+    DrawTextW(hdc, L"実行ログ", -1, &logTitle, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT logSub = g_layout.logCard;
+    logSub.left += 88;
+    logSub.top += 12;
+    logSub.right -= 16;
+    logSub.bottom = logSub.top + 22;
+    SetTextColor(hdc, C_MUTED);
+    DrawTextW(hdc, L"fastboot の出力と進行状況を表示します。", -1, &logSub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+}
+
+void DrawButtonFace(LPDRAWITEMSTRUCT dis, bool hot, bool pressed, bool enabled) {
+    RECT rc = dis->rcItem;
+    const COLORREF fill = enabled ? (pressed ? C_BTN_DN : (hot ? C_BTN_HOV : C_BTN)) : RGB(33, 39, 54);
+    const COLORREF edge = enabled ? C_BTN_EDGE : RGB(68, 78, 103);
+
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(dis->hDC, br);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
+    SelectObject(dis->hDC, oldPen);
+    SelectObject(dis->hDC, oldBr);
+    DeleteObject(br);
+    DeleteObject(pen);
+
+    wchar_t text[256]{};
+    GetWindowTextW(dis->hwndItem, text, static_cast<int>(sizeof(text) / sizeof(text[0])));
+    RECT trc = rc;
+    SetTextColor(dis->hDC, enabled ? C_TEXT : C_MUTED);
+    SelectObject(dis->hDC, g_hFontBody);
+    DrawTextW(dis->hDC, text, -1, &trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void CleanupGdi() {
+    if (g_BackgroundBitmap) {
+        delete g_BackgroundBitmap;
+        g_BackgroundBitmap = nullptr;
+    }
+    SafeDeleteObject(g_hFontTitle);
+    SafeDeleteObject(g_hFontSub);
+    SafeDeleteObject(g_hFontBody);
+    SafeDeleteObject(g_hFontMono);
+    SafeDeleteObject(g_brPanel);
+    SafeDeleteObject(g_brPanel2);
+    SafeDeleteObject(g_brEdit);
 }
 
 std::vector<FlashStep> BuildFlashSteps() {
     std::vector<FlashStep> steps;
-    std::string iniPath = WideToAnsi(ModuleDirW() + L"\\option.ini");
+    const std::wstring iniPathW = ModuleDirW() + L"\\option.ini";
+    const std::string iniPath = WideToAnsi(iniPathW);
+
     auto opt = [&](const char* key) {
         if (!FileExistsA(iniPath)) return true;
         return GetPrivateProfileIntA("Partitions", key, 1, iniPath.c_str()) != 0;
     };
+
     if (opt("pgpt")) steps.push_back({FB("flash partition " + Img("pgpt.img")), L"PGPT 書き込み中…", "pgpt.img"});
     if (opt("nvcfg")) steps.push_back({FB("flash nvcfg " + Img("nvcfg.img")), L"NVCFG 書き込み中…", "nvcfg.img"});
     if (opt("nvdata")) steps.push_back({FB("flash nvdata " + Img("nvdata.img")), L"NVDATA 書き込み中…", "nvdata.img"});
@@ -367,6 +697,7 @@ std::vector<FlashStep> BuildFlashSteps() {
     if (opt("vendor")) steps.push_back({FB("flash vendor " + Img("vendor.img")), L"VENDOR 書き込み中…", "vendor.img"});
     if (opt("factory")) steps.push_back({FB("flash factory " + Img("factory.img")), L"FACTORY 書き込み中…", "factory.img"});
     if (opt("cache")) steps.push_back({FB("flash cache " + Img("cache.img")), L"CACHE 書き込み中…", "cache.img"});
+
     return steps;
 }
 
@@ -382,46 +713,68 @@ void CheckThread(uint32_t token) {
         QueueDone(token, false, false);
         return;
     }
+
     QueueLog(token, L"fastboot.exe を起動します…");
     auto d = Exec(FB("devices"));
     if (!d.launchError.empty()) {
-        QueueLog(token, L"エラー: fastboot.exe の起動に失敗しました。\n原因: " + d.launchError);
+        QueueLog(token, L"エラー: fastboot.exe の起動に失敗しました。");
+        QueueLog(token, L"原因: " + d.launchError);
         QueueDone(token, false, false);
         return;
     }
-    if (!d.output.empty()) QueueLog(token, L"応答: " + ToWide(d.output));
+
+    if (!d.output.empty()) {
+        QueueLog(token, L"応答: " + ToWide(d.output));
+    }
+
     if (!ContainsInsensitive(d.output, "fastboot")) {
         QueueLog(token, L"エラー: fastboot モードの端末が検出されません。");
         QueueDone(token, false, false);
         return;
     }
+
     QueueLog(token, L"端末を検出しました。product を確認しています…");
     auto v = Exec(FB("getvar product"));
     if (!v.launchError.empty()) {
-        QueueLog(token, L"エラー: product 取得に失敗しました。\n原因: " + v.launchError);
+        QueueLog(token, L"エラー: product 取得に失敗しました。");
+        QueueLog(token, L"原因: " + v.launchError);
         QueueDone(token, false, false);
         return;
     }
-    if (!v.output.empty()) QueueLog(token, L"product 応答: " + ToWide(v.output));
+
+    if (!v.output.empty()) {
+        QueueLog(token, L"product 応答: " + ToWide(v.output));
+    }
+
     if (!ContainsInsensitive(v.output, "a05bd")) {
         QueueLog(token, L"エラー: モデル不一致。期待値: a05bd");
         QueueDone(token, false, false);
         return;
     }
+
     QueueLog(token, L"端末を確認しました。unlocked を確認しています…");
     auto u = Exec(FB("getvar unlocked"));
     if (!u.launchError.empty()) {
-        QueueLog(token, L"エラー: unlocked 取得に失敗しました。\n原因: " + u.launchError);
+        QueueLog(token, L"エラー: unlocked 取得に失敗しました。");
+        QueueLog(token, L"原因: " + u.launchError);
         QueueDone(token, false, false);
         return;
     }
-    if (!u.output.empty()) QueueLog(token, L"unlocked 応答: " + ToWide(u.output));
-    if (!ContainsInsensitive(u.output, "yes")) {
-        QueueLog(token, L"エラー: unlocked が yes ではありません。\n先にアンロックをしてください！");
+
+    if (!u.output.empty()) {
+        QueueLog(token, L"unlocked 応答: " + ToWide(u.output));
+    }
+
+    const bool unlocked = ContainsInsensitive(u.output, "yes");
+    if (!unlocked) {
+        QueueLog(token, L"エラー: unlocked が yes ではありません。");
+        QueueLog(token, L"先にアンロックをしてください！");
         QueueDone(token, false, false);
         return;
     }
-    QueueLog(token, L"確認済み: a05bd\nunlocked: yes");
+
+    QueueLog(token, L"確認済み: a05bd");
+    QueueLog(token, L"unlocked: yes");
     QueueDone(token, true, false);
 }
 
@@ -436,53 +789,59 @@ void FlashThread(uint32_t token) {
         return;
     }
 
-    std::string iniPath = WideToAnsi(ModuleDirW() + L"\\option.ini");
-    auto GetOpt = [&](const char* key) {
-        if (!FileExistsA(iniPath)) return true;
-        return GetPrivateProfileIntA("Partitions", key, 1, iniPath.c_str()) != 0;
-    };
-
     const auto steps = BuildFlashSteps();
-    bool doReboot = GetOpt("reboot");
-    int totalSteps = static_cast<int>(steps.size()) + (doReboot ? 1 : 0);
-    QueueProgress(token, 0, static_cast<WORD>(totalSteps));
+    const bool doReboot = GetPrivateProfileIntW(L"Partitions", L"reboot", 0, (ModuleDirW() + L"\\option.ini").c_str()) != 0;
+
+    const int totalStepsRaw = static_cast<int>(steps.size()) + (doReboot ? 1 : 0);
+    const WORD totalSteps = static_cast<WORD>(std::max(1, totalStepsRaw));
+    QueueProgress(token, 0, totalSteps);
 
     for (size_t i = 0; i < steps.size(); ++i) {
-        std::wstring prefix = std::to_wstring(i) + L"/" + std::to_wstring(totalSteps) + L"  ";
+        std::wstring prefix = std::to_wstring(i + 1) + L"/" + std::to_wstring(totalStepsRaw > 0 ? totalStepsRaw : 1) + L"  ";
         QueueLog(token, prefix + steps[i].desc);
         auto r = Exec(steps[i].cmd);
         if (!r.launchError.empty()) {
-            QueueLog(token, L"失敗  起動エラー\n原因: " + r.launchError);
+            QueueLog(token, L"失敗  起動エラー");
+            QueueLog(token, L"原因: " + r.launchError);
             QueueDone(token, false, true);
             return;
         }
         if (r.exitCode != 0) {
             QueueLog(token, L"失敗  終了コード=" + std::to_wstring(r.exitCode));
-            if (!r.output.empty()) QueueLog(token, L"出力: " + ToWide(r.output));
+            if (!r.output.empty()) {
+                QueueLog(token, L"出力: " + ToWide(r.output));
+            }
             QueueDone(token, false, true);
             return;
         }
-        QueueProgress(token, static_cast<WORD>(i + 1), static_cast<WORD>(totalSteps));
+        QueueProgress(token, static_cast<WORD>(i + 1), totalSteps);
     }
+
     if (doReboot) {
-        std::wstring finalPrefix = std::to_wstring(steps.size()) + L"/" + std::to_wstring(totalSteps) + L"  ";
+        std::wstring finalPrefix = std::to_wstring(steps.size() + 1) + L"/" + std::to_wstring(totalStepsRaw) + L"  ";
         QueueLog(token, finalPrefix + L"最終処理: reboot-recovery");
         auto end = Exec(FB("oem reboot-recovery"));
         if (!end.launchError.empty()) {
-            QueueLog(token, L"失敗  起動エラー\n原因: " + end.launchError);
+            QueueLog(token, L"失敗  起動エラー");
+            QueueLog(token, L"原因: " + end.launchError);
             QueueDone(token, false, true);
             return;
         }
         if (end.exitCode != 0) {
             QueueLog(token, L"失敗  終了コード=" + std::to_wstring(end.exitCode));
-            if (!end.output.empty()) QueueLog(token, L"出力: " + ToWide(end.output));
+            if (!end.output.empty()) {
+                QueueLog(token, L"出力: " + ToWide(end.output));
+            }
             QueueDone(token, false, true);
             return;
         }
-        QueueProgress(token, static_cast<WORD>(totalSteps), static_cast<WORD>(totalSteps));
+        QueueProgress(token, totalSteps, totalSteps);
     } else {
         QueueLog(token, L"最終処理: スキップされました (option.ini)");
     }
-    QueueLog(token, L"==============================\nすべての書き込みに成功しました。");
+
+    QueueLog(token, L"==============================");
+    QueueLog(token, L"すべての書き込みに成功しました。");
     QueueDone(token, true, true);
 }
+
