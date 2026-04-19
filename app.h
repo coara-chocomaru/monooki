@@ -1,9 +1,14 @@
 #pragma once
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <commctrl.h>
 #include <gdiplus.h>
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <mutex>
@@ -162,6 +167,7 @@ extern std::atomic<bool> g_LogFlushPending;
 
 void SafeDeleteObject(HGDIOBJ obj);
 std::wstring ToWide(const std::string& s);
+std::string WideToAnsi(const std::wstring& s);
 std::wstring Win32ErrorText(DWORD err);
 bool FileExistsA(const std::string& path);
 bool FileExistsW(const std::wstring& path);

@@ -872,3 +872,4 @@ void FlashThread(uint32_t token) {
     QueueLog(token, L"すべての書き込みに成功しました。");
     QueueDone(token, true, true);
 }
+
