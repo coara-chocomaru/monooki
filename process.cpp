@@ -164,8 +164,8 @@ void DrawImageWithAlpha(HDC hdc, const RECT& rc) {
     const double scaleW = static_cast<double>(dstW) / static_cast<double>(srcW);
     const double scaleH = static_cast<double>(dstH) / static_cast<double>(srcH);
     const double scale = (scaleW < scaleH) ? scaleW : scaleH;
-    const int drawW = std::max(1, static_cast<int>(srcW * scale));
-    const int drawH = std::max(1, static_cast<int>(srcH * scale));
+    const int drawW = (static_cast<int>(srcW * scale) > 1) ? static_cast<int>(srcW * scale) : 1;
+    const int drawH = (static_cast<int>(srcH * scale) > 1) ? static_cast<int>(srcH * scale) : 1;
     const int x = rc.left + (dstW - drawW) / 2;
     const int y = rc.top + (dstH - drawH) / 2;
 
@@ -216,6 +216,34 @@ std::wstring ToWide(const std::string& s) {
     MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, w.data(), n);
     w.resize(wcslen(w.c_str()));
     return w;
+}
+
+std::string WideToAnsi(const std::wstring& s) {
+    if (s.empty()) {
+        return {};
+    }
+
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n > 0) {
+        std::string out(static_cast<size_t>(n), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), n, nullptr, nullptr);
+        if (!out.empty()) {
+            out.resize(out.size() - 1);
+        }
+        return out;
+    }
+
+    n = WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+        return {};
+    }
+
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_ACP, 0, s.c_str(), -1, out.data(), n, nullptr, nullptr);
+    if (!out.empty()) {
+        out.resize(out.size() - 1);
+    }
+    return out;
 }
 
 std::wstring Win32ErrorText(DWORD err) {
@@ -793,7 +821,7 @@ void FlashThread(uint32_t token) {
     const bool doReboot = GetPrivateProfileIntW(L"Partitions", L"reboot", 0, (ModuleDirW() + L"\\option.ini").c_str()) != 0;
 
     const int totalStepsRaw = static_cast<int>(steps.size()) + (doReboot ? 1 : 0);
-    const WORD totalSteps = static_cast<WORD>(std::max(1, totalStepsRaw));
+    const WORD totalSteps = static_cast<WORD>((totalStepsRaw > 1) ? totalStepsRaw : 1);
     QueueProgress(token, 0, totalSteps);
 
     for (size_t i = 0; i < steps.size(); ++i) {
@@ -844,4 +872,3 @@ void FlashThread(uint32_t token) {
     QueueLog(token, L"すべての書き込みに成功しました。");
     QueueDone(token, true, true);
 }
-
