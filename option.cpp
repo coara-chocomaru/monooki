@@ -61,6 +61,7 @@ HWND g_hSetRomBrowse{};
 HWND g_hSetBgBrowse{};
 ULONG_PTR g_GdiPlusToken{};
 bool g_GdiPlusReady{};
+bool g_SettingsSyncing{};
 std::unique_ptr<Image> g_BackgroundImage;
 std::wstring g_BackgroundResolvedPath;
 
@@ -274,6 +275,8 @@ void SyncSettingsWindowFields() {
         return;
     }
 
+    g_SettingsSyncing = true;
+
     const int themeIndex = ThemeIndexFromKey(g_ConfigThemeKey);
     if (g_hSetTheme) {
         SendMessageW(g_hSetTheme, CB_SETCURSEL, themeIndex, 0);
@@ -284,6 +287,8 @@ void SyncSettingsWindowFields() {
     if (g_hSetBg) {
         SetWindowTextW(g_hSetBg, g_ConfigBackgroundImage.c_str());
     }
+
+    g_SettingsSyncing = false;
 }
 
 void ApplyConfigState(bool saveToDisk) {
@@ -313,6 +318,10 @@ std::wstring ReadEditText(HWND hwnd) {
 }
 
 void ApplyFromSettingsControls(bool saveToDisk) {
+    if (!g_hSetTheme || !g_hSetRom || !g_hSetBg) {
+        return;
+    }
+
     const int sel = static_cast<int>(SendMessageW(g_hSetTheme, CB_GETCURSEL, 0, 0));
     g_ConfigThemeKey = ThemeKeyFromIndex(sel);
 
@@ -399,11 +408,26 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_SET_CLOSE:
             DestroyWindow(hwnd);
             return 0;
+        case ID_SET_THEME:
+            if (!g_SettingsSyncing && HIWORD(wp) == CBN_SELCHANGE) {
+                ApplyFromSettingsControls(true);
+            }
+            return 0;
+        case ID_SET_ROM:
+            if (!g_SettingsSyncing && (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) {
+                ApplyFromSettingsControls(true);
+            }
+            return 0;
+        case ID_SET_BG:
+            if (!g_SettingsSyncing && (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) {
+                ApplyFromSettingsControls(true);
+            }
+            return 0;
         case ID_SET_ROM_BROWSE: {
             const std::wstring picked = BrowseForFolderPath(hwnd);
             if (!picked.empty()) {
                 SetWindowTextW(g_hSetRom, picked.c_str());
-                ApplyFromSettingsControls(false);
+                ApplyFromSettingsControls(true);
             }
             return 0;
         }
@@ -411,7 +435,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const std::wstring picked = BrowseForImageFile(hwnd);
             if (!picked.empty()) {
                 SetWindowTextW(g_hSetBg, picked.c_str());
-                ApplyFromSettingsControls(false);
+                ApplyFromSettingsControls(true);
             }
             return 0;
         }
@@ -430,10 +454,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORLISTBOX: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_EDIT_BG);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brEdit);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_CTLCOLORBTN: {
@@ -489,6 +512,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hSetClose = nullptr;
         g_hSetRomBrowse = nullptr;
         g_hSetBgBrowse = nullptr;
+        g_SettingsSyncing = false;
         return 0;
     }
 

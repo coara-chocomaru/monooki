@@ -57,7 +57,7 @@ void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient) {
 
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 170;
+    bf.SourceConstantAlpha = 92;
     bf.AlphaFormat = 0;
     AlphaBlend(hdc, 0, 0, w, h, mem, 0, 0, w, h, bf);
 
@@ -232,10 +232,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLOREDIT: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_EDIT_BG);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brEdit);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_CTLCOLORBTN: {
