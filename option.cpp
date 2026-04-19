@@ -641,10 +641,10 @@ void DrawBackgroundImage(HDC hdc, const RECT& rc) {
 
     ImageAttributes attrs;
     ColorMatrix matrix = {{
-     1.10f, 0.0f, 0.0f, 0.0f, 0.10f,
-     0.0f, 1.10f, 0.0f, 0.0f, 0.10f,
-     0.0f, 0.0f, 1.10f, 0.0f, 0.10f,
-     0.0f, 0.0f, 0.0f, 0.32f, 0.0f,
+     1.10f, 0.0f, 0.0f, 0.0f, 0.05f,
+     0.0f, 1.10f, 0.0f, 0.0f, 0.05f,
+     0.0f, 0.0f, 1.10f, 0.0f, 0.05f,
+     0.0f, 0.0f, 0.0f, 0.40f, 0.0f,
      0.0f, 0.0f, 0.0f, 0.0f, 1.0f
 }};
     attrs.SetColorMatrix(&matrix, ColorMatrixFlagsDefault, ColorAdjustTypeBitmap);
