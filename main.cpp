@@ -57,7 +57,7 @@ void PaintLogBackdrop(HWND hwnd, HDC hdc, const RECT& rcClient) {
 
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 92;
+    bf.SourceConstantAlpha = 32;
     bf.AlphaFormat = 0;
     AlphaBlend(hdc, 0, 0, w, h, mem, 0, 0, w, h, bf);
 
@@ -122,10 +122,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hProgressBar, PBM_SETMARQUEE, FALSE, 0);
 
         hLog = CreateCtrl(hwnd, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | ES_NOHIDESEL,
-                          WS_EX_TRANSPARENT | WS_EX_CLIENTEDGE, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
+                          WS_EX_TRANSPARENT, 0, 0, 0, 0, ID_LOG_WINDOW, g_hFontMono);
         SetWindowSubclass(hLog, LogSubclassProc, 1, 0);
         SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
-        SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
 
         UpdateStatusUI(L"待機中");
         UpdateDeviceUI(L"未確認");

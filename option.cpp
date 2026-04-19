@@ -196,6 +196,54 @@ std::wstring ThemeKeyFromIndex(int idx) {
     return L"a";
 }
 
+std::wstring ThemeDisplayTextFromIndex(int idx) {
+    if (idx == kThemeB) return L"b";
+    if (idx == kThemeC) return L"c";
+    return L"a";
+}
+
+void PaintSettingsComboItem(LPDRAWITEMSTRUCT dis) {
+    if (!dis || dis->CtlType != ODT_COMBOBOX || !g_hSetTheme) {
+        return;
+    }
+
+    int index = static_cast<int>(dis->itemID);
+    if (index < 0) {
+        index = static_cast<int>(SendMessageW(g_hSetTheme, CB_GETCURSEL, 0, 0));
+    }
+
+    RECT rc = dis->rcItem;
+    const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+
+    const COLORREF fill = disabled ? RGB(28, 33, 44) : (selected ? C_BTN_HOV : C_PANEL2);
+    const COLORREF edge = disabled ? RGB(68, 78, 103) : (selected ? C_ACCENT : C_BTN_EDGE);
+
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ oldBr = SelectObject(dis->hDC, br);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+    RoundRect(dis->hDC, rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1, 8, 8);
+    SelectObject(dis->hDC, oldPen);
+    SelectObject(dis->hDC, oldBr);
+    DeleteObject(pen);
+    DeleteObject(br);
+
+    if (index < 0) {
+        return;
+    }
+
+    wchar_t text[32]{};
+    const std::wstring label = ThemeDisplayTextFromIndex(index);
+    lstrcpynW(text, label.c_str(), 32);
+
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, disabled ? C_MUTED : C_TEXT);
+    RECT trc = rc;
+    trc.left += 10;
+    DrawTextW(dis->hDC, text, -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 void ApplyPalette(const ThemePalette& p) {
     C_BG = p.bg;
     C_BG2 = p.bg2;
@@ -221,9 +269,6 @@ void ApplyPalette(const ThemePalette& p) {
     g_brPanel2 = CreateSolidBrush(C_PANEL2);
     g_brEdit = CreateSolidBrush(C_EDIT_BG);
 
-    if (hLog) {
-        SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, C_EDIT_BG);
-    }
 
     if (g_hMain) {
         InvalidateRect(g_hMain, nullptr, TRUE);
@@ -280,6 +325,7 @@ void SyncSettingsWindowFields() {
     const int themeIndex = ThemeIndexFromKey(g_ConfigThemeKey);
     if (g_hSetTheme) {
         SendMessageW(g_hSetTheme, CB_SETCURSEL, themeIndex, 0);
+        InvalidateRect(g_hSetTheme, nullptr, TRUE);
     }
     if (g_hSetRom) {
         SetWindowTextW(g_hSetRom, g_ConfigRomDir.empty() ? L"./TAB-A05-BD" : g_ConfigRomDir.c_str());
@@ -349,42 +395,44 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         const HFONT font = g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
+        CreateWindowExW(0, L"STATIC", L"設定内容は config.ini に保存されます。", WS_CHILD | WS_VISIBLE,
+                        18, 16, 420, 18, hwnd, nullptr, nullptr, nullptr);
         CreateWindowExW(0, L"STATIC", L"色パターン", WS_CHILD | WS_VISIBLE,
-                        18, 18, 100, 20, hwnd, nullptr, nullptr, nullptr);
+                        18, 52, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetTheme = CreateWindowExW(0, L"COMBOBOX", nullptr,
-                                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      120, 14, 150, 180, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_THEME)), nullptr, nullptr);
+                                      WS_CHILD | WS_VISIBLE | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | CBS_DROPDOWNLIST | CBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+                                      120, 48, 180, 180, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_THEME)), nullptr, nullptr);
         SendMessageW(g_hSetTheme, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         SendMessageW(g_hSetTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"a"));
         SendMessageW(g_hSetTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"b"));
         SendMessageW(g_hSetTheme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"c"));
 
         CreateWindowExW(0, L"STATIC", L"ROMフォルダ", WS_CHILD | WS_VISIBLE,
-                        18, 68, 100, 20, hwnd, nullptr, nullptr, nullptr);
+                        18, 96, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetRom = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                    120, 64, 304, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM)), nullptr, nullptr);
+                                    120, 92, 346, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM)), nullptr, nullptr);
         SendMessageW(g_hSetRom, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         g_hSetRomBrowse = CreateWindowExW(0, L"BUTTON", L"参照", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          434, 63, 68, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM_BROWSE)), nullptr, nullptr);
+                                          478, 91, 62, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_ROM_BROWSE)), nullptr, nullptr);
         SendMessageW(g_hSetRomBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
 
         CreateWindowExW(0, L"STATIC", L"背景画像", WS_CHILD | WS_VISIBLE,
-                        18, 106, 100, 20, hwnd, nullptr, nullptr, nullptr);
+                        18, 140, 100, 20, hwnd, nullptr, nullptr, nullptr);
         g_hSetBg = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                   120, 102, 304, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG)), nullptr, nullptr);
+                                   120, 136, 346, 24, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG)), nullptr, nullptr);
         SendMessageW(g_hSetBg, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         g_hSetBgBrowse = CreateWindowExW(0, L"BUTTON", L"画像選択", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         434, 101, 68, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG_BROWSE)), nullptr, nullptr);
+                                         478, 135, 62, 26, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_BG_BROWSE)), nullptr, nullptr);
         SendMessageW(g_hSetBgBrowse, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
 
         g_hSetSave = CreateWindowExW(0, L"BUTTON", L"保存", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     120, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_SAVE)), nullptr, nullptr);
+                                     120, 188, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_SAVE)), nullptr, nullptr);
         g_hSetReset = CreateWindowExW(0, L"BUTTON", L"初期化", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      222, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_RESET)), nullptr, nullptr);
+                                      222, 188, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_RESET)), nullptr, nullptr);
         g_hSetClose = CreateWindowExW(0, L"BUTTON", L"閉じる", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      324, 162, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_CLOSE)), nullptr, nullptr);
+                                      324, 188, 90, 30, hwnd, reinterpret_cast<HMENU>(static_cast<intptr_t>(ID_SET_CLOSE)), nullptr, nullptr);
         SendMessageW(g_hSetSave, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         SendMessageW(g_hSetReset, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
         SendMessageW(g_hSetClose, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
@@ -410,24 +458,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case ID_SET_THEME:
             if (!g_SettingsSyncing && HIWORD(wp) == CBN_SELCHANGE) {
-                ApplyFromSettingsControls(true);
+                ApplyFromSettingsControls(false);
             }
             return 0;
         case ID_SET_ROM:
-            if (!g_SettingsSyncing && (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) {
-                ApplyFromSettingsControls(true);
+            if (!g_SettingsSyncing && HIWORD(wp) == EN_KILLFOCUS) {
+                ApplyFromSettingsControls(false);
             }
             return 0;
         case ID_SET_BG:
-            if (!g_SettingsSyncing && (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) {
-                ApplyFromSettingsControls(true);
+            if (!g_SettingsSyncing && HIWORD(wp) == EN_KILLFOCUS) {
+                ApplyFromSettingsControls(false);
             }
             return 0;
         case ID_SET_ROM_BROWSE: {
             const std::wstring picked = BrowseForFolderPath(hwnd);
             if (!picked.empty()) {
                 SetWindowTextW(g_hSetRom, picked.c_str());
-                ApplyFromSettingsControls(true);
+                ApplyFromSettingsControls(false);
             }
             return 0;
         }
@@ -435,7 +483,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const std::wstring picked = BrowseForImageFile(hwnd);
             if (!picked.empty()) {
                 SetWindowTextW(g_hSetBg, picked.c_str());
-                ApplyFromSettingsControls(true);
+                ApplyFromSettingsControls(false);
             }
             return 0;
         }
@@ -443,6 +491,25 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         break;
+
+    case WM_MEASUREITEM: {
+        auto* mi = reinterpret_cast<LPMEASUREITEMSTRUCT>(lp);
+        if (mi && mi->CtlType == ODT_COMBOBOX && mi->CtlID == ID_SET_THEME) {
+            mi->itemHeight = 24;
+            mi->itemWidth = 180;
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<LPDRAWITEMSTRUCT>(lp);
+        if (dis && dis->CtlType == ODT_COMBOBOX && dis->CtlID == ID_SET_THEME) {
+            PaintSettingsComboItem(dis);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_CTLCOLORSTATIC: {
         HDC hdc = reinterpret_cast<HDC>(wp);
@@ -461,10 +528,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CTLCOLORBTN: {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        SetBkMode(hdc, OPAQUE);
-        SetBkColor(hdc, C_PANEL);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, C_TEXT);
-        return reinterpret_cast<LRESULT>(g_brPanel);
+        return reinterpret_cast<LRESULT>(g_brTransparent);
     }
 
     case WM_ERASEBKGND: {
@@ -474,6 +540,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBRUSH br = CreateSolidBrush(C_BG);
         FillRect(hdc, &rc, br);
         DeleteObject(br);
+        DrawBackgroundImage(hdc, rc);
         return 1;
     }
 
@@ -485,15 +552,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBRUSH br = CreateSolidBrush(C_BG);
         FillRect(hdc, &rc, br);
         DeleteObject(br);
+        DrawBackgroundImage(hdc, rc);
         SetBkMode(hdc, TRANSPARENT);
         SelectObject(hdc, g_hFontTitle ? g_hFontTitle : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_TEXT);
-        RECT title{18, 14, rc.right - 18, 38};
+        RECT title{18, 12, rc.right - 18, 34};
         DrawTextW(hdc, L"設定", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, g_hFontBody ? g_hFontBody : reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
         SetTextColor(hdc, C_MUTED);
-        RECT sub{18, 40, rc.right - 18, 64};
-        DrawTextW(hdc, L"config.ini を同じディレクトリに保存します。", -1, &sub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT sub{18, 34, rc.right - 18, 54};
+        DrawTextW(hdc, L"config.ini の値を表示して保存します。", -1, &sub, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -594,8 +662,6 @@ void SaveAppConfig() {
 }
 
 void OpenSettingsWindow() {
-    LoadAppConfig();
-
     if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) {
         SyncSettingsWindowFields();
         ShowWindow(g_hSettingsWnd, SW_SHOW);
@@ -624,8 +690,8 @@ void OpenSettingsWindow() {
 
     RECT rc{};
     GetWindowRect(g_hMain, &rc);
-    const int w = 540;
-    const int h = 292;
+    const int w = 580;
+    const int h = 280;
     const int x = rc.left + ((rc.right - rc.left) - w) / 2;
     const int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
 
