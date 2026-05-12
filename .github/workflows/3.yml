@@ -1,137 +1,29 @@
-name: nvram-parse-rewrite
+name: Randomize MAC in NVRAM
+
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      mac_addr:
-        description: 'Custom MAC (xx:xx:xx:xx:xx:xx, empty=random)'
-        required: false
-        default: ''
+
 jobs:
-  nvram:
+  randomize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-      - name: process
-        run: |
-          python3 << 'PYEOF'
-import os, sys, hashlib, random, struct
-
-def valid_mac(b):
-    if len(b) < 6:
-        return False
-    if all(v == 0 for v in b) or all(v == 0xFF for v in b):
-        return False
-    if b[0] & 0x01:
-        return False
-    return True
-
-src = "nvram.img"
-if not os.path.exists(src):
-    sys.exit(1)
-
-with open(src, "rb") as f:
-    data = bytearray(f.read())
-
-needle = b'/mnt/vendor/nvdata/APCFG/APRDEB/WIFI'
-hits = []
-start = 0
-while True:
-    pos = data.find(needle, start)
-    if pos == -1:
-        break
-    hits.append(pos)
-    start = pos + 1
-
-if not hits:
-    needle = b'APCFG/APRDEB/WIFI'
-    start = 0
-    while True:
-        pos = data.find(needle, start)
-        if pos == -1:
-            break
-        hits.append(pos)
-        start = pos + 1
-
-best = None
-for p in hits:
-    search_end = p
-    search_start = max(0, p - 256)
-    chunk = data[search_start:search_end]
-    for i in range(len(chunk) - 5):
-        mac = chunk[i:i+6]
-        if valid_mac(mac):
-            abs_off = search_start + i
-            if abs_off > 0x20000:
-                best = (abs_off, mac)
-                break
-    if best is not None:
-        break
-
-if best is None and hits:
-    for p in hits:
-        search_end = p
-        search_start = max(0, p - 256)
-        chunk = data[search_start:search_end]
-        for i in range(len(chunk) - 5):
-            mac = chunk[i:i+6]
-            if valid_mac(mac):
-                best = (search_start + i, mac)
-                break
-        if best is not None:
-            break
-
-if best is None:
-    sys.exit(1)
-
-mac_off, old_mac = best
-old_fmt = ':'.join(f'{b:02X}' for b in old_mac)
-
-user_mac = '${{ github.event.inputs.mac_addr }}'
-if user_mac:
-    parts = user_mac.split(':')
-    if len(parts) != 6 or any(len(p) != 2 for p in parts):
-        sys.exit(1)
-    new_mac = bytes(int(p, 16) for p in parts)
-else:
-    new_mac = bytearray(6)
-    for idx in range(6):
-        new_mac[idx] = random.randint(0, 255)
-    new_mac[0] = (new_mac[0] & 0xFC) | 0x02
-    new_mac = bytes(new_mac)
-
-new_fmt = ':'.join(f'{b:02X}' for b in new_mac)
-data[mac_off:mac_off+6] = new_mac
-
-out_path = "nvram_modified.img"
-with open(out_path, "wb") as f:
-    f.write(data)
-
-sha256 = hashlib.sha256(data).hexdigest()
-
-with open("nvram_analysis.log", "w") as log:
-    log.write(f"File: nvram.img ({len(data)} bytes)\n")
-    log.write(f"WiFi MAC offset: 0x{mac_off:X}\n")
-    log.write(f"Old MAC: {old_fmt}\n")
-    log.write(f"New MAC: {new_fmt}\n")
-    log.write(f"Modified SHA256: {sha256}\n")
-    log.write(f"Path string found at: {[hex(h) for h in hits]}\n")
-    log.write("\nHex dump around MAC:\n")
-    for k in range(max(0, mac_off-16), min(len(data), mac_off+32), 16):
-        line = data[k:k+16]
-        hex_str = ' '.join(f'{b:02X}' for b in line)
-        log.write(f"0x{k:08X}: {hex_str}\n")
-
-print(f"Old MAC: {old_fmt}")
-print(f"New MAC: {new_fmt}")
-print("Done")
-PYEOF
-      - name: upload
+          python-version: '3.11'
+      - name: Run MAC randomizer
+        run: python randomize_mac.py
+      - name: Upload modified NVRAM image
         uses: actions/upload-artifact@v4
         with:
-          name: nvram-artifacts
-          path: |
-            nvram_modified.img
-            nvram_analysis.log
+          name: nvram_modified
+          path: nvram.img
+      - name: Upload analysis log
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvram_analysis_log
+          path: nvram_analysis.log
