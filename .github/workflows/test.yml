@@ -1,315 +1,99 @@
-name: NVRAM Parse & MAC Rewrite (MT8168/MT8365 Android9 Gen4m)
-
+name: nvram-parse-rewrite
 on:
   workflow_dispatch:
     inputs:
       mac_addr:
-        description: 'カスタム MACアドレス (xx:xx:xx:xx:xx:xx 形式, 空欄でランダム生成)'
+        description: 'Custom MAC (xx:xx:xx:xx:xx:xx, empty=random)'
         required: false
         default: ''
-      offset_hex:
-        description: 'MACアドレス書込み先オフセット (16進数, デフォルト 0x0004)'
-        required: false
-        default: '0x0004'
-
-  push:
-    branches: [ main ]
-    paths:
-      - 'nvram.img'
-
 jobs:
-  nvram-parse-and-rewrite:
+  nvram:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      # ============================================================
-      # Step 1: リポジトリチェックアウト
-      # ============================================================
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ============================================================
-      # Step 2: nvram.img の存在確認と基本情報取得
-      # ============================================================
-      - name: Verify nvram.img existence & gather basic info
-        id: verify
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: parse_and_rewrite
         run: |
-          echo "============================================================"
-          echo " Step 2: nvram.img 存在確認・基本情報取得"
-          echo "============================================================"
+          python3 << 'PYEOF'
+          import os, struct, random, sys, hashlib
 
-          NVRAM_FILE="nvram.img"
+          src = "nvram.img"
+          if not os.path.exists(src):
+              print("nvram.img not found")
+              sys.exit(1)
 
-          if [ ! -f "${NVRAM_FILE}" ]; then
-            echo "ERROR: ${NVRAM_FILE} が見つかりません。"
-            exit 1
-          fi
+          with open(src, "rb") as f:
+              data = f.read()
+          fsize = len(data)
+          print(f"File size: {fsize} bytes (expected 5MB)")
 
-          # ファイルサイズ・SHA256チェックサムを取得
-          FILE_SIZE=$(stat -c%s "${NVRAM_FILE}")
-          FILE_SHA256=$(sha256sum "${NVRAM_FILE}" | awk '{print $1}')
+          target = b'WIFI'
+          candidates = []
+          step = 1
+          for i in range(0, fsize - 12, step):
+              if data[i:i+4] != target:
+                  continue
+              off = struct.unpack_from('<I', data, i+4)[0]
+              sz = struct.unpack_from('<I', data, i+8)[0]
+              if off < fsize and sz > 0 and (off + sz) <= fsize and off > 0x800:
+                  candidates.append((i, off, sz))
 
-          echo "nvram.img 検出:"
-          echo "  パス:     $(realpath ${NVRAM_FILE})"
-          echo "  サイズ:   ${FILE_SIZE} bytes ($(( FILE_SIZE / 1024 )) KB)"
-          echo "  SHA256:   ${FILE_SHA256}"
+          if not candidates:
+              print("No valid WIFI section found")
+              sys.exit(1)
 
-          # 環境変数として後続ステップに公開
-          echo "NVRAM_FILE=${NVRAM_FILE}" >> $GITHUB_ENV
-          echo "FILE_SIZE=${FILE_SIZE}" >> $GITHUB_ENV
-          echo "FILE_SHA256=${FILE_SHA256}" >> $GITHUB_ENV
+          entry_pos, sec_off, sec_size = candidates[0]
+          print(f"WIFI section entry at 0x{entry_pos:06X}, data offset 0x{sec_off:06X}, size 0x{sec_size:06X}")
 
-      # ============================================================
-      # Step 3: nvram.img の構造解析とログ出力
-      # ============================================================
-      - name: Analyze nvram.img structure (Hex Dump & Partition Header)
-        id: analyze
-        run: |
-          echo "============================================================"
-          echo " Step 3: nvram.img 構造解析"
-          echo "============================================================"
+          mac_off = sec_off + 4
+          old_mac = data[mac_off:mac_off+6]
+          old_fmt = ':'.join(f'{b:02X}' for b in old_mac)
+          print(f"Existing MAC: {old_fmt}")
 
-          # --- 3-1. ヘッダー領域 (先頭 512 bytes) の詳細 hex dump ---
-          echo ""
-          echo "### [3-1] 先頭 512 bytes (想定 PMT/NVRAM ヘッダー) Hex Dump"
-          echo "---"
-          xxd -l 512 "${NVRAM_FILE}"
+          user_mac = '${{ github.event.inputs.mac_addr }}'
+          if user_mac:
+              parts = user_mac.split(':')
+              if len(parts) != 6 or any(len(p) != 2 for p in parts):
+                  print("Invalid MAC format")
+                  sys.exit(1)
+              new_mac = bytes(int(p, 16) for p in parts)
+          else:
+              new_mac = bytearray(6)
+              for idx in range(6):
+                  new_mac[idx] = random.randint(0, 255)
+              new_mac[0] = (new_mac[0] & 0xFC) | 0x02
+              new_mac = bytes(new_mac)
 
-          # --- 3-2. MACアドレス周辺領域 (0x0000 - 0x0010) の hex dump ---
-          #      MT8168/MT8365 Gen4m WiFi MAC は 0x0004 に格納される
-          echo ""
-          echo "### [3-2] MACアドレス格納領域 (0x0000 - 0x0010) Hex Dump"
-          echo "---"
-          xxd -s 0x0000 -l 16 "${NVRAM_FILE}"
+          new_fmt = ':'.join(f'{b:02X}' for b in new_mac)
+          print(f"New MAC: {new_fmt}")
 
-          # --- 3-3. パーティション署名/マジックナンバー探索 ---
-          echo ""
-          echo "### [3-3] パーティションマジックナンバー探索"
-          echo "---"
+          mod_data = bytearray(data)
+          mod_data[mac_off:mac_off+6] = new_mac
 
-          # MTK NVRAM に一般的なシグネチャ例:
-          #   - "MTK " (0x4D544B20)
-          #   - "MMM" (0x4D4D4D)
-          #   - 末尾 CRC32 (0x08 0x00 0x02 0x00)
-          MAGIC_LIST=("4D544B20" "4D4D4D" "00000200")
+          out_path = "nvram_modified.img"
+          with open(out_path, "wb") as f:
+              f.write(mod_data)
 
-          for magic in "${MAGIC_LIST[@]}"; do
-            echo -n "シグネチャ ${magic}: "
-            if xxd -p "${NVRAM_FILE}" | tr -d '\n' | grep -q "${magic}"; then
-              echo "検出"
-            else
-              echo "未検出"
-            fi
-          done
+          sha256 = hashlib.sha256(mod_data).hexdigest()
+          print(f"Modified SHA256: {sha256}")
 
-          # --- 3-4. 全ファイルの包括的 hex dump (先頭 4096 bytes) ---
-          echo ""
-          echo "### [3-4] 先頭 4096 bytes 全体 Hex Dump (構造確認用)"
-          echo "---"
-          xxd -l 4096 "${NVRAM_FILE}"
+          with open("nvram_analysis.log", "w") as log:
+              log.write(f"File: nvram.img ({fsize} bytes)\n")
+              log.write(f"WIFI section entry: 0x{entry_pos:06X}\n")
+              log.write(f"WIFI data offset: 0x{sec_off:06X}\n")
+              log.write(f"MAC offset: 0x{mac_off:06X}\n")
+              log.write(f"Old MAC: {old_fmt}\n")
+              log.write(f"New MAC: {new_fmt}\n")
+              log.write(f"Modified SHA256: {sha256}\n")
 
-          # --- 3-5. 既存 MACアドレス読み取り (オフセット 0x0004) ---
-          #      MT8168/MT8365 では: WiFi MAC = offset 0x0004～0x0009
-          #      Gen4m WiFi チップ (MT6631/MT7668 系) も同様
-          echo ""
-          echo "### [3-5] 既存 MACアドレス読み取り (offset 0x0004～0x0009)"
-          echo "---"
-          MAC_OFFSET_DEC=4
-          MAC_LENGTH=6
-
-          EXISTING_MAC=$(xxd -s ${MAC_OFFSET_DEC} -l ${MAC_LENGTH} -p "${NVRAM_FILE}" | tr -d '\n')
-          # xx:xx:xx:xx:xx:xx 形式に整形
-          FORMATTED_MAC=$(echo "${EXISTING_MAC}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
-
-          echo "  既存 MACアドレス (RAW): ${EXISTING_MAC}"
-          echo "  既存 MACアドレス (書式): ${FORMATTED_MAC}"
-
-          # --- 3-6. WiFiパラメータブロックの抽出 (0x0000～0x0100) ---
-          echo ""
-          echo "### [3-6] WiFi パラメータブロック (0x0000～0x0100) 全文"
-          echo "---"
-          xxd -s 0x0000 -l 256 "${NVRAM_FILE}"
-
-          # 環境変数として保存
-          echo "EXISTING_MAC=${EXISTING_MAC}" >> $GITHUB_ENV
-          echo "FORMATTED_MAC=${FORMATTED_MAC}" >> $GITHUB_ENV
-          echo "MAC_OFFSET_DEC=${MAC_OFFSET_DEC}" >> $GITHUB_ENV
-
-          # 解析結果をログファイルに保存
-          echo "=== NVRAM Structure Analysis Log ===" > nvram_analysis.log
-          echo "Date: $(date -u)" >> nvram_analysis.log
-          echo "File: nvram.img" >> nvram_analysis.log
-          echo "Size: ${FILE_SIZE} bytes" >> nvram_analysis.log
-          echo "SHA256: ${FILE_SHA256}" >> nvram_analysis.log
-          echo "Existing MAC: ${FORMATTED_MAC}" >> nvram_analysis.log
-          echo "MAC Offset: 0x${MAC_OFFSET_DEC} (decimal)" >> nvram_analysis.log
-          echo "Platform: MT8168/MT8365 Android 9 WiFi Gen4m" >> nvram_analysis.log
-          echo "" >> nvram_analysis.log
-          echo "--- Hex Dump (first 512 bytes) ---" >> nvram_analysis.log
-          xxd -l 512 "${NVRAM_FILE}" >> nvram_analysis.log
-          echo "" >> nvram_analysis.log
-          echo "--- MAC Area Hex Dump (0x0000-0x0010) ---" >> nvram_analysis.log
-          xxd -s 0x0000 -l 16 "${NVRAM_FILE}" >> nvram_analysis.log
-
-          # ログをアップロード用にコピー
-          cp nvram_analysis.log /tmp/nvram_analysis.log
-
-      # ============================================================
-      # Step 4: ランダム MACアドレス生成
-      # ============================================================
-      - name: Generate random MAC address (Locally Administered)
-        id: generate_mac
-        run: |
-          echo "============================================================"
-          echo " Step 4: ランダム MACアドレス生成"
-          echo "============================================================"
-
-          # ユーザー入力があればそれを使用、なければランダム生成
-          if [ -n "${{ github.event.inputs.mac_addr }}" ]; then
-            # 入力値検証 (xx:xx:xx:xx:xx:xx 形式)
-            USER_MAC="${{ github.event.inputs.mac_addr }}"
-            if echo "${USER_MAC}" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
-              NEW_MAC_RAW=$(echo "${USER_MAC}" | tr -d ':')
-              echo "カスタム MACアドレス使用: ${USER_MAC}"
-            else
-              echo "ERROR: MACアドレス形式が不正です (xx:xx:xx:xx:xx:xx)"
-              exit 1
-            fi
-          else
-            # Locally Administered ランダム MAC生成
-            # 2桁目を x2, x6, xA, xE のいずれかに設定 (ユニキャスト+ローカル管理)
-            RANDOM_HEX=$(xxd -l 6 -p /dev/urandom | tr -d '\n')
-            NEW_MAC_RAW="${RANDOM_HEX:0:1}$(echo "${RANDOM_HEX:1:1}" | tr '0123456789ABCDEFabcdef' '22222222222222226666666666666666AAAAAAAAAAAAAAAEEEEEEEEEEEEEEEE')${RANDOM_HEX:2:10}"
-
-            echo "ランダム MACアドレス生成:"
-            echo "  RAW (ランダム): ${RANDOM_HEX}"
-            echo "  RAW (修正後):   ${NEW_MAC_RAW}"
-          fi
-
-          # フォーマット整形
-          FORMATTED_NEW_MAC=$(echo "${NEW_MAC_RAW}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
-          echo "  新 MACアドレス: ${FORMATTED_NEW_MAC}"
-
-          # 環境変数として保存
-          echo "NEW_MAC_RAW=${NEW_MAC_RAW}" >> $GITHUB_ENV
-          echo "FORMATTED_NEW_MAC=${FORMATTED_NEW_MAC}" >> $GITHUB_ENV
-
-      # ============================================================
-      # Step 5: MACアドレス書き換え (dd 使用)
-      # ============================================================
-      - name: Rewrite MAC address in nvram.img using dd
-        id: rewrite_mac
-        run: |
-          echo "============================================================"
-          echo " Step 5: MACアドレス書き換え (dd)"
-          echo "============================================================"
-
-          # nvram_modified.img を生成
-          NVRAM_FILE="${GITHUB_WORKSPACE}/nvram.img"
-          MODIFIED_FILE="${GITHUB_WORKSPACE}/nvram_modified.img"
-
-          # 既存ファイルをコピー
-          cp "${NVRAM_FILE}" "${MODIFIED_FILE}"
-
-          # オフセット情報
-          MAC_OFFSET_DEC=${MAC_OFFSET_DEC}
-          MAC_LENGTH=6
-
-          # 16進数文字列をバイナリに変換し dd で書き込み
-          echo "${NEW_MAC_RAW}" | xxd -r -p | dd of="${MODIFIED_FILE}" bs=1 seek=${MAC_OFFSET_DEC} count=${MAC_LENGTH} conv=notrunc 2>/dev/null
-
-          # 書き込み結果確認
-          MAC_FINAL_RAW=$(xxd -s ${MAC_OFFSET_DEC} -l ${MAC_LENGTH} -p "${MODIFIED_FILE}" | tr -d '\n')
-          MAC_FINAL_FORMATTED=$(echo "${MAC_FINAL_RAW}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
-
-          echo "  ファイル: ${MODIFIED_FILE}"
-          echo "  書込先オフセット: ${MAC_OFFSET_DEC} (0x$(printf '%X' ${MAC_OFFSET_DEC}))"
-          echo "  書込長: ${MAC_LENGTH} bytes"
-          echo "  新 MACアドレス: ${FORMATTED_NEW_MAC}"
-          echo "  書込後確認 RAW: ${MAC_FINAL_RAW}"
-          echo "  書込後確認 書式: ${MAC_FINAL_FORMATTED}"
-
-          if [ "${MAC_FINAL_RAW}" != "${NEW_MAC_RAW}" ]; then
-            echo "ERROR: 書き込み後のMACアドレスが一致しません。"
-            exit 1
-          fi
-
-          # checksum 再計算
-          MOD_SHA256=$(sha256sum "${MODIFIED_FILE}" | awk '{print $1}')
-          echo "  nvram_modified.img SHA256: ${MOD_SHA256}"
-
-          echo "MODIFIED_FILE=${MODIFIED_FILE}" >> $GITHUB_ENV
-          echo "MOD_SHA256=${MOD_SHA256}" >> $GITHUB_ENV
-
-      # ============================================================
-      # Step 6: 書換え前後の比較検証
-      # ============================================================
-      - name: Verify MAC rewrite (before/after diff)
-        run: |
-          echo "============================================================"
-          echo " Step 6: 書換え前後比較検証"
-          echo "============================================================"
-
-          NVRAM_FILE="${GITHUB_WORKSPACE}/nvram.img"
-          MODIFIED_FILE="${GITHUB_WORKSPACE}/nvram_modified.img"
-
-          echo "--- 書換え前 (nvram.img) MAC周辺 hex dump ---"
-          xxd -s 0x0000 -l 16 "${NVRAM_FILE}"
-
-          echo ""
-          echo "--- 書換え後 (nvram_modified.img) MAC周辺 hex dump ---"
-          xxd -s 0x0000 -l 16 "${MODIFIED_FILE}"
-
-          echo ""
-          echo "--- 書換え前後 diff (hex) ---"
-          diff <(xxd "${NVRAM_FILE}") <(xxd "${MODIFIED_FILE}") > nvram_diff.log || true
-          cat nvram_diff.log
-
-          # diff ログを保存
-          cp nvram_diff.log /tmp/nvram_diff.log
-
-      # ============================================================
-      # Step 7: 成果物アップロード
-      # ============================================================
-      - name: Upload artifacts
+          print("Done")
+          PYEOF
+      - name: upload_artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nvram-rewrite-artifacts
+          name: nvram-artifacts
           path: |
             nvram_modified.img
             nvram_analysis.log
-            nvram_diff.log
-          retention-days: 90
-
-      # ============================================================
-      # Step 8: サマリー出力
-      # ============================================================
-      - name: Output summary
-        run: |
-          echo "============================================================"
-          echo " Step 8: 処理完了サマリー"
-          echo "============================================================"
-          echo ""
-          echo "  NVRAMファイル: nvram.img"
-          echo "  元ファイルサイズ: ${FILE_SIZE} bytes"
-          echo "  元ファイル SHA256: ${FILE_SHA256}"
-          echo "  既存 MACアドレス: ${FORMATTED_MAC}"
-          echo "  新 MACアドレス　: ${FORMATTED_NEW_MAC}"
-          echo "  書換え後ファイル: nvram_modified.img"
-          echo "  書換え後 SHA256: ${MOD_SHA256}"
-          echo "  出力ログ: nvram_analysis.log (構造解析)"
-          echo "  出力ログ: nvram_diff.log   (書換え前後差分)"
-          echo ""
-          echo "  ※ 成果物は Artifact 'nvram-rewrite-artifacts' としてアップロード済み"
-          echo "============================================================"
-
-      # ============================================================
-      # Step 9: 解析ログ (構造情報) の GitHub Actions ログへの保存
-      # ============================================================
-      - name: Log analysis summary to GitHub Actions log
-        run: |
-          echo "============================================================"
-          echo " NVRAM 構造解析結果ログ (nvram_analysis.log 全文)"
-          echo "============================================================"
-          cat /tmp/nvram_analysis.log
