@@ -1,491 +1,315 @@
-name: NVRAM Analyze & MAC Rewrite (MTK MT8168/MT8365 wifiGen4M Android9)
+name: NVRAM Parse & MAC Rewrite (MT8168/MT8365 Android9 Gen4m)
 
 on:
   workflow_dispatch:
     inputs:
-      nvram_path:
-        description: "nvram.img のパス"
+      mac_addr:
+        description: 'カスタム MACアドレス (xx:xx:xx:xx:xx:xx 形式, 空欄でランダム生成)'
         required: false
-        default: "nvram.img"
-      mode:
-        description: "実行モード"
-        required: true
-        default: "analyze_only"
-        type: choice
-        options:
-          - analyze_only
-          - rewrite
-      wifi_mac_offset:
-        description: "[rewrite] 解析ログで確認したWiFi MACの絶対オフセット (hex例: 0x1234)"
+        default: ''
+      offset_hex:
+        description: 'MACアドレス書込み先オフセット (16進数, デフォルト 0x0004)'
         required: false
-        default: ""
-      bt_mac_offset:
-        description: "[rewrite] 解析ログで確認したBT MACの絶対オフセット (hex例: 0x5678)"
-        required: false
-        default: ""
-      wifi_mac:
-        description: "[rewrite] 新WiFi MAC (空=ランダム生成) 例: AA:BB:CC:DD:EE:FF"
-        required: false
-        default: ""
-      bt_mac:
-        description: "[rewrite] 新BT MAC (空=ランダム生成) 例: AA:BB:CC:DD:EE:FF"
-        required: false
-        default: ""
-  push:
-    paths:
-      - "nvram.img"
+        default: '0x0004'
 
-permissions:
-  contents: write
+  push:
+    branches: [ main ]
+    paths:
+      - 'nvram.img'
 
 jobs:
-  nvram_tool:
-    name: "NVRAM 解析 / MAC 書き換え"
-    runs-on: ubuntu-22.04
+  nvram-parse-and-rewrite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
+      # ============================================================
+      # Step 1: リポジトリチェックアウト
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Verify nvram.img exists
+      # ============================================================
+      # Step 2: nvram.img の存在確認と基本情報取得
+      # ============================================================
+      - name: Verify nvram.img existence & gather basic info
+        id: verify
         run: |
-          NVRAM="${{ github.event.inputs.nvram_path || 'nvram.img' }}"
-          if [ ! -f "$NVRAM" ]; then
-            echo "::error::ファイルが見つかりません: $NVRAM"
+          echo "============================================================"
+          echo " Step 2: nvram.img 存在確認・基本情報取得"
+          echo "============================================================"
+
+          NVRAM_FILE="nvram.img"
+
+          if [ ! -f "${NVRAM_FILE}" ]; then
+            echo "ERROR: ${NVRAM_FILE} が見つかりません。"
             exit 1
           fi
-          SIZE=$(stat -c%s "$NVRAM")
-          echo "NVRAM_PATH=$NVRAM" >> $GITHUB_ENV
-          echo "NVRAM_SIZE=$SIZE"  >> $GITHUB_ENV
-          echo "nvram: $NVRAM / $SIZE bytes"
 
-      - name: Generate analyzer script
+          # ファイルサイズ・SHA256チェックサムを取得
+          FILE_SIZE=$(stat -c%s "${NVRAM_FILE}")
+          FILE_SHA256=$(sha256sum "${NVRAM_FILE}" | awk '{print $1}')
+
+          echo "nvram.img 検出:"
+          echo "  パス:     $(realpath ${NVRAM_FILE})"
+          echo "  サイズ:   ${FILE_SIZE} bytes ($(( FILE_SIZE / 1024 )) KB)"
+          echo "  SHA256:   ${FILE_SHA256}"
+
+          # 環境変数として後続ステップに公開
+          echo "NVRAM_FILE=${NVRAM_FILE}" >> $GITHUB_ENV
+          echo "FILE_SIZE=${FILE_SIZE}" >> $GITHUB_ENV
+          echo "FILE_SHA256=${FILE_SHA256}" >> $GITHUB_ENV
+
+      # ============================================================
+      # Step 3: nvram.img の構造解析とログ出力
+      # ============================================================
+      - name: Analyze nvram.img structure (Hex Dump & Partition Header)
+        id: analyze
         run: |
-          cat > nvram_tool.py << 'PYEOF'
-          #!/usr/bin/env python3
-          """
-          MTK NVRAM Analyzer / MAC Rewriter
-          Target : MT8168 / MT8365  wifiGen4M  Android 9
+          echo "============================================================"
+          echo " Step 3: nvram.img 構造解析"
+          echo "============================================================"
 
-          ── NVRAM 内の WiFi MAC について ──────────────────────────────
-          MTK Android の NVRAM パーティションは BINREGION 形式 (raw block) で
-          内部的に LID (Logical Item Descriptor) 管理されたレコードを持つ。
+          # --- 3-1. ヘッダー領域 (先頭 512 bytes) の詳細 hex dump ---
+          echo ""
+          echo "### [3-1] 先頭 512 bytes (想定 PMT/NVRAM ヘッダー) Hex Dump"
+          echo "---"
+          xxd -l 512 "${NVRAM_FILE}"
 
-          wifiGen4M (MT6632/MT7668) の WiFi NVRAM レコード (WIFI_CFG_PARAM_STRUCT) は
-          先頭に version(2B) + reserved(2B) が付き、その直後の +0x04 に
-          6 バイトの aucMacAddress が入る。
+          # --- 3-2. MACアドレス周辺領域 (0x0000 - 0x0010) の hex dump ---
+          #      MT8168/MT8365 Gen4m WiFi MAC は 0x0004 に格納される
+          echo ""
+          echo "### [3-2] MACアドレス格納領域 (0x0000 - 0x0010) Hex Dump"
+          echo "---"
+          xxd -s 0x0000 -l 16 "${NVRAM_FILE}"
 
-          BT NVRAM (BT_Addr ファイル相当) は先頭 6 バイトが BD アドレス。
+          # --- 3-3. パーティション署名/マジックナンバー探索 ---
+          echo ""
+          echo "### [3-3] パーティションマジックナンバー探索"
+          echo "---"
 
-          ただし「どの絶対オフセットにその LID レコードがあるか」はデバイス個別の
-          LID テーブルに依存するため、このスクリプトは
-            1. 全バイナリをスキャンして MAC 候補をリストアップ
-            2. WiFi NVRAM の version ヘッダ特徴 (0x00 0x01 + 2B reserved + valid MAC)
-               および BT_Addr パターンを優先検出
-            3. 解析レポートを出力 → 人間が確認 → offset 指定で書き換え
-          という 2 段階フローを取る。
+          # MTK NVRAM に一般的なシグネチャ例:
+          #   - "MTK " (0x4D544B20)
+          #   - "MMM" (0x4D4D4D)
+          #   - 末尾 CRC32 (0x08 0x00 0x02 0x00)
+          MAGIC_LIST=("4D544B20" "4D4D4D" "00000200")
 
-          ── analyze_only モードで得た wifi_mac_offset / bt_mac_offset を
-             rewrite モードの入力に使ってください。
-          """
-          import sys, os, struct, random, json, datetime, hashlib, shutil, argparse
+          for magic in "${MAGIC_LIST[@]}"; do
+            echo -n "シグネチャ ${magic}: "
+            if xxd -p "${NVRAM_FILE}" | tr -d '\n' | grep -q "${magic}"; then
+              echo "検出"
+            else
+              echo "未検出"
+            fi
+          done
 
-          def sha256(b):
-              return hashlib.sha256(b).hexdigest()
+          # --- 3-4. 全ファイルの包括的 hex dump (先頭 4096 bytes) ---
+          echo ""
+          echo "### [3-4] 先頭 4096 bytes 全体 Hex Dump (構造確認用)"
+          echo "---"
+          xxd -l 4096 "${NVRAM_FILE}"
 
-          def mac_str(b):
-              return ":".join(f"{x:02X}" for x in b)
+          # --- 3-5. 既存 MACアドレス読み取り (オフセット 0x0004) ---
+          #      MT8168/MT8365 では: WiFi MAC = offset 0x0004～0x0009
+          #      Gen4m WiFi チップ (MT6631/MT7668 系) も同様
+          echo ""
+          echo "### [3-5] 既存 MACアドレス読み取り (offset 0x0004～0x0009)"
+          echo "---"
+          MAC_OFFSET_DEC=4
+          MAC_LENGTH=6
 
-          def mac_bytes(s):
-              return bytes(int(x, 16) for x in s.strip().split(":"))
+          EXISTING_MAC=$(xxd -s ${MAC_OFFSET_DEC} -l ${MAC_LENGTH} -p "${NVRAM_FILE}" | tr -d '\n')
+          # xx:xx:xx:xx:xx:xx 形式に整形
+          FORMATTED_MAC=$(echo "${EXISTING_MAC}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
 
-          def is_unicast_nonzero(b):
-              if len(b) != 6: return False
-              if all(x == 0x00 for x in b): return False
-              if all(x == 0xFF for x in b): return False
-              if b[0] & 0x01: return False  # multicast
-              return True
+          echo "  既存 MACアドレス (RAW): ${EXISTING_MAC}"
+          echo "  既存 MACアドレス (書式): ${FORMATTED_MAC}"
 
-          def random_mac():
-              b = [random.randint(0, 255) for _ in range(6)]
-              b[0] = (b[0] | 0x02) & 0xFE  # locally administered, unicast
-              return bytes(b)
+          # --- 3-6. WiFiパラメータブロックの抽出 (0x0000～0x0100) ---
+          echo ""
+          echo "### [3-6] WiFi パラメータブロック (0x0000～0x0100) 全文"
+          echo "---"
+          xxd -s 0x0000 -l 256 "${NVRAM_FILE}"
 
-          def hexdump(data, base=0, width=16):
-              out = []
-              for i in range(0, len(data), width):
-                  row = data[i:i+width]
-                  h = " ".join(f"{x:02X}" for x in row)
-                  a = "".join(chr(x) if 0x20 <= x < 0x7F else "." for x in row)
-                  out.append(f"  {base+i:08X}  {h:<{width*3}}  |{a}|")
-              return "\n".join(out)
+          # 環境変数として保存
+          echo "EXISTING_MAC=${EXISTING_MAC}" >> $GITHUB_ENV
+          echo "FORMATTED_MAC=${FORMATTED_MAC}" >> $GITHUB_ENV
+          echo "MAC_OFFSET_DEC=${MAC_OFFSET_DEC}" >> $GITHUB_ENV
 
-          class NVRAMTool:
-              def __init__(self, path):
-                  self.path = path
-                  with open(path, "rb") as f:
-                      self.raw = bytearray(f.read())
-                  self.size = len(self.raw)
-                  self.report = {
-                      "file": path,
-                      "size": self.size,
-                      "sha256_original": sha256(bytes(self.raw)),
-                      "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                      "wifi_candidates": [],
-                      "bt_candidates": [],
-                      "all_mac_candidates": [],
-                      "strings_found": [],
-                      "log": [],
-                  }
+          # 解析結果をログファイルに保存
+          echo "=== NVRAM Structure Analysis Log ===" > nvram_analysis.log
+          echo "Date: $(date -u)" >> nvram_analysis.log
+          echo "File: nvram.img" >> nvram_analysis.log
+          echo "Size: ${FILE_SIZE} bytes" >> nvram_analysis.log
+          echo "SHA256: ${FILE_SHA256}" >> nvram_analysis.log
+          echo "Existing MAC: ${FORMATTED_MAC}" >> nvram_analysis.log
+          echo "MAC Offset: 0x${MAC_OFFSET_DEC} (decimal)" >> nvram_analysis.log
+          echo "Platform: MT8168/MT8365 Android 9 WiFi Gen4m" >> nvram_analysis.log
+          echo "" >> nvram_analysis.log
+          echo "--- Hex Dump (first 512 bytes) ---" >> nvram_analysis.log
+          xxd -l 512 "${NVRAM_FILE}" >> nvram_analysis.log
+          echo "" >> nvram_analysis.log
+          echo "--- MAC Area Hex Dump (0x0000-0x0010) ---" >> nvram_analysis.log
+          xxd -s 0x0000 -l 16 "${NVRAM_FILE}" >> nvram_analysis.log
 
-              def log(self, msg):
-                  ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                  line = f"[{ts}] {msg}"
-                  self.report["log"].append(line)
-                  print(line)
+          # ログをアップロード用にコピー
+          cp nvram_analysis.log /tmp/nvram_analysis.log
 
-              def scan_strings(self):
-                  """
-                  バイナリ中の printable ASCII 文字列を抽出。
-                  NVRAM 内のファイル名マーカー ("WIFI", "BT_A", "APCFG" 等) を探す。
-                  """
-                  self.log("── strings スキャン ──────────────────────────")
-                  markers = [b"WIFI", b"BT_A", b"APCFG", b"APRDEB", b"ETHERNET",
-                             b"NVRAM", b"CALI", b"nvram", b"wifi", b"bt_addr"]
-                  found = []
-                  for m in markers:
-                      pos = 0
-                      while True:
-                          idx = self.raw.find(m, pos)
-                          if idx == -1: break
-                          ctx_start = max(0, idx - 4)
-                          ctx_end   = min(self.size, idx + len(m) + 16)
-                          ctx = self.raw[ctx_start:ctx_end]
-                          entry = {
-                              "marker": m.decode(errors="replace"),
-                              "offset": f"0x{idx:08X}",
-                              "context_hex": ctx.hex(),
-                          }
-                          found.append(entry)
-                          self.log(f"  marker '{m.decode(errors='replace')}' @ 0x{idx:08X}  ctx={ctx.hex()}")
-                          pos = idx + 1
-                  self.report["strings_found"] = found
-
-              def scan_wifi_mac(self):
-                  """
-                  WiFi NVRAM レコード検出。
-                  wifiGen4M の WIFI_CFG_PARAM_STRUCT 先頭パターン:
-                    offset+0x00: version (通常 0x0001 or 0x0002, LE u16)
-                    offset+0x02: reserved (0x0000)
-                    offset+0x04: aucMacAddress[6]
-                  version が 0x0000 や 0xFFFF でなく、reserved が 0x0000 で
-                  その後に valid unicast MAC が続くものを候補とする。
-                  """
-                  self.log("── WiFi MAC 候補スキャン (wifiGen4M struct heuristic) ──")
-                  candidates = []
-                  for off in range(0, self.size - 10):
-                      ver  = struct.unpack_from("<H", self.raw, off)[0]
-                      rsv  = struct.unpack_from("<H", self.raw, off + 2)[0]
-                      mac6 = self.raw[off + 4: off + 10]
-                      if ver == 0x0000 or ver == 0xFFFF: continue
-                      if rsv != 0x0000: continue
-                      if not is_unicast_nonzero(mac6): continue
-                      ctx = self.raw[max(0, off-8): min(self.size, off+32)]
-                      entry = {
-                          "mac_offset": f"0x{off+4:08X}",
-                          "struct_offset": f"0x{off:08X}",
-                          "version": f"0x{ver:04X}",
-                          "mac": mac_str(mac6),
-                          "context_hex": ctx.hex(),
-                          "context_dump": hexdump(ctx, max(0, off-8)),
-                      }
-                      candidates.append(entry)
-                      self.log(f"  [WiFi候補] struct=0x{off:08X} mac_at=0x{off+4:08X} ver=0x{ver:04X} MAC={mac_str(mac6)}")
-                      self.log(hexdump(ctx, max(0, off-8)))
-                  self.report["wifi_candidates"] = candidates
-                  self.log(f"  合計 {len(candidates)} 候補")
-
-              def scan_bt_mac(self):
-                  """
-                  BT_Addr レコード検出。
-                  MTK BT NVRAM (BT_Addr ファイル相当) は先頭 6B が BD アドレス。
-                  前後のコンテキストで 0xFF パディングや既知 BT OUI などを確認する。
-                  WiFi MAC 候補と近傍にあるものを優先。
-                  """
-                  self.log("── BT MAC 候補スキャン ──────────────────────────")
-                  wifi_offsets = set()
-                  for c in self.report["wifi_candidates"]:
-                      wifi_offsets.add(int(c["mac_offset"], 16))
-
-                  candidates = []
-                  for off in range(0, self.size - 6):
-                      mac6 = self.raw[off: off + 6]
-                      if not is_unicast_nonzero(mac6): continue
-                      if off in wifi_offsets: continue
-                      ctx = self.raw[max(0, off-8): min(self.size, off+24)]
-                      entry = {
-                          "mac_offset": f"0x{off:08X}",
-                          "mac": mac_str(mac6),
-                          "context_hex": ctx.hex(),
-                          "context_dump": hexdump(ctx, max(0, off-8)),
-                      }
-                      candidates.append(entry)
-                  self.report["all_mac_candidates"] = candidates
-
-                  wifi_addr_bytes = set()
-                  for c in self.report["wifi_candidates"]:
-                      addr = int(c["mac_offset"], 16)
-                      wifi_addr_bytes.update(range(addr - 64, addr + 64))
-
-                  near_wifi = [c for c in candidates if int(c["mac_offset"], 16) in wifi_addr_bytes]
-                  far_wifi  = [c for c in candidates if int(c["mac_offset"], 16) not in wifi_addr_bytes]
-
-                  bt_candidates = near_wifi[:5] + far_wifi[:10]
-                  for c in bt_candidates:
-                      self.log(f"  [BT候補] mac_at={c['mac_offset']} MAC={c['mac']}")
-                      self.log(c["context_dump"])
-                  self.report["bt_candidates"] = bt_candidates
-                  self.log(f"  合計 {len(bt_candidates)} 候補 (近傍:{len(near_wifi)} 遠方:{len(far_wifi[:10])})")
-
-              def analyze(self):
-                  self.log("=" * 60)
-                  self.log(f"ファイル  : {self.path}")
-                  self.log(f"サイズ    : {self.size} bytes  ({self.size/1024:.1f} KB)")
-                  self.log(f"SHA-256   : {self.report['sha256_original']}")
-                  self.log("=" * 60)
-                  self.log("")
-                  self.log("【重要】analyze_only モードです。ファイルは変更しません。")
-                  self.log("解析ログの wifi_candidates / bt_candidates を確認し、")
-                  self.log("正しい mac_offset を rewrite モードの入力に指定してください。")
-                  self.log("")
-                  self.scan_strings()
-                  self.scan_wifi_mac()
-                  self.scan_bt_mac()
-
-              def rewrite(self, wifi_offset_hex, bt_offset_hex, wifi_new, bt_new):
-                  errors = []
-                  for name, off_hex, new_mac in [
-                      ("WiFi", wifi_offset_hex, wifi_new),
-                      ("BT",   bt_offset_hex,   bt_new),
-                  ]:
-                      if not off_hex:
-                          self.log(f"[SKIP] {name} offset が未指定のためスキップ")
-                          continue
-                      try:
-                          offset = int(off_hex, 16)
-                      except ValueError:
-                          errors.append(f"{name} offset が不正: {off_hex!r}")
-                          continue
-                      if offset < 0 or offset + 6 > self.size:
-                          errors.append(f"{name} offset=0x{offset:08X} が範囲外 (size={self.size})")
-                          continue
-                      current = bytes(self.raw[offset:offset+6])
-                      if not is_unicast_nonzero(current):
-                          errors.append(
-                              f"{name} offset=0x{offset:08X} の現在値が不正: {mac_str(current)} "
-                              f"(analyze_only で確認したオフセットを使ってください)"
-                          )
-                          continue
-                      self.log(f"[{name}] 書き換え: {mac_str(current)} → {mac_str(new_mac)}  (offset 0x{offset:08X})")
-                      ctx_before = self.raw[max(0, offset-8):min(self.size, offset+24)]
-                      self.log("  書き換え前:\n" + hexdump(ctx_before, max(0, offset-8)))
-                      self.raw[offset:offset+6] = new_mac
-                      ctx_after = self.raw[max(0, offset-8):min(self.size, offset+24)]
-                      self.log("  書き換え後:\n" + hexdump(ctx_after, max(0, offset-8)))
-                      self.report.setdefault("rewrites", []).append({
-                          "type": name,
-                          "offset": f"0x{offset:08X}",
-                          "old_mac": mac_str(current),
-                          "new_mac": mac_str(new_mac),
-                      })
-                  if errors:
-                      for e in errors:
-                          self.log(f"[ERROR] {e}")
-                      print("\n::error::書き換えエラーがあります。解析ログを確認してください。")
-                      sys.exit(1)
-                  self.report["sha256_after"] = sha256(bytes(self.raw))
-
-              def save_img(self, out_path):
-                  with open(out_path, "wb") as f:
-                      f.write(self.raw)
-                  self.log(f"保存: {out_path}")
-
-              def save_report(self, report_path):
-                  with open(report_path, "w", encoding="utf-8") as f:
-                      json.dump(self.report, f, ensure_ascii=False, indent=2)
-                  self.log(f"レポート: {report_path}")
-
-          def main():
-              ap = argparse.ArgumentParser()
-              ap.add_argument("nvram")
-              ap.add_argument("--mode",            default="analyze_only")
-              ap.add_argument("--report",          default="nvram_report.json")
-              ap.add_argument("--wifi-mac-offset", default="")
-              ap.add_argument("--bt-mac-offset",   default="")
-              ap.add_argument("--wifi-mac",        default="")
-              ap.add_argument("--bt-mac",          default="")
-              args = ap.parse_args()
-
-              if not os.path.exists(args.nvram):
-                  print(f"ERROR: ファイルが見つかりません: {args.nvram}")
-                  sys.exit(1)
-
-              bak = args.nvram + ".bak"
-              if not os.path.exists(bak):
-                  shutil.copy2(args.nvram, bak)
-                  print(f"バックアップ作成: {bak}")
-
-              tool = NVRAMTool(args.nvram)
-
-              if args.mode == "analyze_only":
-                  tool.analyze()
-                  tool.save_report(args.report)
-                  print()
-                  print("=" * 60)
-                  print("解析完了。nvram_report.json を確認し、")
-                  print("wifi_candidates / bt_candidates から正しい mac_offset を特定してください。")
-                  print("その後 rewrite モードで offset を指定して実行してください。")
-                  print("=" * 60)
-
-              elif args.mode == "rewrite":
-                  if not args.wifi_mac_offset and not args.bt_mac_offset:
-                      print("ERROR: rewrite モードでは wifi_mac_offset または bt_mac_offset が必要です")
-                      sys.exit(1)
-                  wifi_new = mac_bytes(args.wifi_mac) if args.wifi_mac else random_mac()
-                  bt_new   = mac_bytes(args.bt_mac)   if args.bt_mac   else random_mac()
-                  tool.analyze()
-                  tool.rewrite(args.wifi_mac_offset, args.bt_mac_offset, wifi_new, bt_new)
-                  tool.save_img(args.nvram)
-                  tool.save_report(args.report)
-                  gha = os.environ.get("GITHUB_OUTPUT", "")
-                  if gha:
-                      with open(gha, "a") as f:
-                          if args.wifi_mac_offset:
-                              f.write(f"wifi_mac={mac_str(wifi_new)}\n")
-                          if args.bt_mac_offset:
-                              f.write(f"bt_mac={mac_str(bt_new)}\n")
-              else:
-                  print(f"ERROR: 不明なモード: {args.mode}")
-                  sys.exit(1)
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-
-      - name: Run NVRAM tool
-        id: nvram
+      # ============================================================
+      # Step 4: ランダム MACアドレス生成
+      # ============================================================
+      - name: Generate random MAC address (Locally Administered)
+        id: generate_mac
         run: |
-          MODE="${{ github.event.inputs.mode || 'analyze_only' }}"
-          WIFI_OFF="${{ github.event.inputs.wifi_mac_offset }}"
-          BT_OFF="${{ github.event.inputs.bt_mac_offset }}"
-          WIFI_MAC="${{ github.event.inputs.wifi_mac }}"
-          BT_MAC="${{ github.event.inputs.bt_mac }}"
+          echo "============================================================"
+          echo " Step 4: ランダム MACアドレス生成"
+          echo "============================================================"
 
-          ARGS="$NVRAM_PATH --mode $MODE --report nvram_report.json"
-          [ -n "$WIFI_OFF" ]  && ARGS="$ARGS --wifi-mac-offset $WIFI_OFF"
-          [ -n "$BT_OFF" ]    && ARGS="$ARGS --bt-mac-offset $BT_OFF"
-          [ -n "$WIFI_MAC" ]  && ARGS="$ARGS --wifi-mac $WIFI_MAC"
-          [ -n "$BT_MAC" ]    && ARGS="$ARGS --bt-mac $BT_MAC"
+          # ユーザー入力があればそれを使用、なければランダム生成
+          if [ -n "${{ github.event.inputs.mac_addr }}" ]; then
+            # 入力値検証 (xx:xx:xx:xx:xx:xx 形式)
+            USER_MAC="${{ github.event.inputs.mac_addr }}"
+            if echo "${USER_MAC}" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
+              NEW_MAC_RAW=$(echo "${USER_MAC}" | tr -d ':')
+              echo "カスタム MACアドレス使用: ${USER_MAC}"
+            else
+              echo "ERROR: MACアドレス形式が不正です (xx:xx:xx:xx:xx:xx)"
+              exit 1
+            fi
+          else
+            # Locally Administered ランダム MAC生成
+            # 2桁目を x2, x6, xA, xE のいずれかに設定 (ユニキャスト+ローカル管理)
+            RANDOM_HEX=$(xxd -l 6 -p /dev/urandom | tr -d '\n')
+            NEW_MAC_RAW="${RANDOM_HEX:0:1}$(echo "${RANDOM_HEX:1:1}" | tr '0123456789ABCDEFabcdef' '22222222222222226666666666666666AAAAAAAAAAAAAAAEEEEEEEEEEEEEEEE')${RANDOM_HEX:2:10}"
 
-          python3 nvram_tool.py $ARGS
+            echo "ランダム MACアドレス生成:"
+            echo "  RAW (ランダム): ${RANDOM_HEX}"
+            echo "  RAW (修正後):   ${NEW_MAC_RAW}"
+          fi
 
-      - name: Show summary
+          # フォーマット整形
+          FORMATTED_NEW_MAC=$(echo "${NEW_MAC_RAW}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
+          echo "  新 MACアドレス: ${FORMATTED_NEW_MAC}"
+
+          # 環境変数として保存
+          echo "NEW_MAC_RAW=${NEW_MAC_RAW}" >> $GITHUB_ENV
+          echo "FORMATTED_NEW_MAC=${FORMATTED_NEW_MAC}" >> $GITHUB_ENV
+
+      # ============================================================
+      # Step 5: MACアドレス書き換え (dd 使用)
+      # ============================================================
+      - name: Rewrite MAC address in nvram.img using dd
+        id: rewrite_mac
         run: |
-          python3 - << 'EOF'
-          import json, sys
-          try:
-              d = json.load(open("nvram_report.json"))
-              print(f"ファイル  : {d['file']}")
-              print(f"サイズ    : {d['size']} bytes")
-              print(f"SHA-256   : {d['sha256_original'][:24]}...")
-              print()
-              print(f"=== WiFi MAC 候補 ({len(d.get('wifi_candidates',[]))} 件) ===")
-              for i, c in enumerate(d.get("wifi_candidates", [])):
-                  print(f"  [{i}] mac_offset={c['mac_offset']}  MAC={c['mac']}  ver={c.get('version','?')}")
-              print()
-              print(f"=== BT MAC 候補 ({len(d.get('bt_candidates',[]))} 件) ===")
-              for i, c in enumerate(d.get("bt_candidates", [])):
-                  print(f"  [{i}] mac_offset={c['mac_offset']}  MAC={c['mac']}")
-              print()
-              if "rewrites" in d:
-                  print("=== 実施した書き換え ===")
-                  for r in d["rewrites"]:
-                      print(f"  {r['type']:5s} offset={r['offset']}  {r['old_mac']} → {r['new_mac']}")
-                  print(f"SHA-256 (書き換え後): {d.get('sha256_after','(なし)')[:24]}...")
-          except Exception as e:
-              print(f"レポート読み込み失敗: {e}", file=sys.stderr)
-          EOF
+          echo "============================================================"
+          echo " Step 5: MACアドレス書き換え (dd)"
+          echo "============================================================"
 
-      - name: Write job summary
+          # nvram_modified.img を生成
+          NVRAM_FILE="${GITHUB_WORKSPACE}/nvram.img"
+          MODIFIED_FILE="${GITHUB_WORKSPACE}/nvram_modified.img"
+
+          # 既存ファイルをコピー
+          cp "${NVRAM_FILE}" "${MODIFIED_FILE}"
+
+          # オフセット情報
+          MAC_OFFSET_DEC=${MAC_OFFSET_DEC}
+          MAC_LENGTH=6
+
+          # 16進数文字列をバイナリに変換し dd で書き込み
+          echo "${NEW_MAC_RAW}" | xxd -r -p | dd of="${MODIFIED_FILE}" bs=1 seek=${MAC_OFFSET_DEC} count=${MAC_LENGTH} conv=notrunc 2>/dev/null
+
+          # 書き込み結果確認
+          MAC_FINAL_RAW=$(xxd -s ${MAC_OFFSET_DEC} -l ${MAC_LENGTH} -p "${MODIFIED_FILE}" | tr -d '\n')
+          MAC_FINAL_FORMATTED=$(echo "${MAC_FINAL_RAW}" | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1:\2:\3:\4:\5:\6/')
+
+          echo "  ファイル: ${MODIFIED_FILE}"
+          echo "  書込先オフセット: ${MAC_OFFSET_DEC} (0x$(printf '%X' ${MAC_OFFSET_DEC}))"
+          echo "  書込長: ${MAC_LENGTH} bytes"
+          echo "  新 MACアドレス: ${FORMATTED_NEW_MAC}"
+          echo "  書込後確認 RAW: ${MAC_FINAL_RAW}"
+          echo "  書込後確認 書式: ${MAC_FINAL_FORMATTED}"
+
+          if [ "${MAC_FINAL_RAW}" != "${NEW_MAC_RAW}" ]; then
+            echo "ERROR: 書き込み後のMACアドレスが一致しません。"
+            exit 1
+          fi
+
+          # checksum 再計算
+          MOD_SHA256=$(sha256sum "${MODIFIED_FILE}" | awk '{print $1}')
+          echo "  nvram_modified.img SHA256: ${MOD_SHA256}"
+
+          echo "MODIFIED_FILE=${MODIFIED_FILE}" >> $GITHUB_ENV
+          echo "MOD_SHA256=${MOD_SHA256}" >> $GITHUB_ENV
+
+      # ============================================================
+      # Step 6: 書換え前後の比較検証
+      # ============================================================
+      - name: Verify MAC rewrite (before/after diff)
         run: |
-          python3 - << 'EOF'
-          import json, os
-          d = json.load(open("nvram_report.json"))
-          out = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          if not out: exit()
-          with open(out, "w") as f:
-              f.write("# MTK NVRAM 解析レポート\n\n")
-              f.write(f"| 項目 | 値 |\n|---|---|\n")
-              f.write(f"| ファイル | `{d['file']}` |\n")
-              f.write(f"| サイズ | {d['size']} bytes |\n")
-              f.write(f"| SHA-256 | `{d['sha256_original']}` |\n")
-              f.write(f"| 実行日時 | {d['timestamp']} |\n\n")
-              f.write(f"## WiFi MAC 候補 (wifiGen4M struct heuristic)\n\n")
-              if d.get("wifi_candidates"):
-                  f.write("| # | mac_offset | struct_offset | version | MAC |\n|---|---|---|---|---|\n")
-                  for i, c in enumerate(d["wifi_candidates"]):
-                      f.write(f"| {i} | `{c['mac_offset']}` | `{c['struct_offset']}` | `{c.get('version','?')}` | `{c['mac']}` |\n")
-              else:
-                  f.write("> WiFi MAC 候補が見つかりませんでした。\n")
-              f.write(f"\n## BT MAC 候補\n\n")
-              if d.get("bt_candidates"):
-                  f.write("| # | mac_offset | MAC |\n|---|---|---|\n")
-                  for i, c in enumerate(d["bt_candidates"]):
-                      f.write(f"| {i} | `{c['mac_offset']}` | `{c['mac']}` |\n")
-              else:
-                  f.write("> BT MAC 候補が見つかりませんでした。\n")
-              if "rewrites" in d:
-                  f.write(f"\n## 書き換え結果\n\n")
-                  f.write("| 種別 | offset | 旧MAC | 新MAC |\n|---|---|---|---|\n")
-                  for r in d["rewrites"]:
-                      f.write(f"| {r['type']} | `{r['offset']}` | `{r['old_mac']}` | `{r['new_mac']}` |\n")
-                  f.write(f"\n| SHA-256 (後) | `{d.get('sha256_after','')}` |\n")
-              f.write(f"\n---\n")
-              f.write(f"> **次のステップ**: 上記の候補リストを確認し、\n")
-              f.write(f"> `wifi_mac_offset` / `bt_mac_offset` を指定して `rewrite` モードで再実行してください。\n")
-          EOF
+          echo "============================================================"
+          echo " Step 6: 書換え前後比較検証"
+          echo "============================================================"
 
+          NVRAM_FILE="${GITHUB_WORKSPACE}/nvram.img"
+          MODIFIED_FILE="${GITHUB_WORKSPACE}/nvram_modified.img"
+
+          echo "--- 書換え前 (nvram.img) MAC周辺 hex dump ---"
+          xxd -s 0x0000 -l 16 "${NVRAM_FILE}"
+
+          echo ""
+          echo "--- 書換え後 (nvram_modified.img) MAC周辺 hex dump ---"
+          xxd -s 0x0000 -l 16 "${MODIFIED_FILE}"
+
+          echo ""
+          echo "--- 書換え前後 diff (hex) ---"
+          diff <(xxd "${NVRAM_FILE}") <(xxd "${MODIFIED_FILE}") > nvram_diff.log || true
+          cat nvram_diff.log
+
+          # diff ログを保存
+          cp nvram_diff.log /tmp/nvram_diff.log
+
+      # ============================================================
+      # Step 7: 成果物アップロード
+      # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nvram-output-${{ github.run_number }}
+          name: nvram-rewrite-artifacts
           path: |
-            ${{ env.NVRAM_PATH }}
-            ${{ env.NVRAM_PATH }}.bak
-            nvram_report.json
-            nvram_tool.py
-          retention-days: 30
+            nvram_modified.img
+            nvram_analysis.log
+            nvram_diff.log
+          retention-days: 90
 
-      - name: Commit rewritten nvram.img
-        if: >
-          github.event.inputs.mode == 'rewrite' &&
-          github.event_name == 'workflow_dispatch'
+      # ============================================================
+      # Step 8: サマリー出力
+      # ============================================================
+      - name: Output summary
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          git add "$NVRAM_PATH" nvram_report.json || true
-          git diff --cached --quiet && echo "変更なし、コミットをスキップ" && exit 0
-          git commit -m "chore: rewrite NVRAM MAC [$DATE]
+          echo "============================================================"
+          echo " Step 8: 処理完了サマリー"
+          echo "============================================================"
+          echo ""
+          echo "  NVRAMファイル: nvram.img"
+          echo "  元ファイルサイズ: ${FILE_SIZE} bytes"
+          echo "  元ファイル SHA256: ${FILE_SHA256}"
+          echo "  既存 MACアドレス: ${FORMATTED_MAC}"
+          echo "  新 MACアドレス　: ${FORMATTED_NEW_MAC}"
+          echo "  書換え後ファイル: nvram_modified.img"
+          echo "  書換え後 SHA256: ${MOD_SHA256}"
+          echo "  出力ログ: nvram_analysis.log (構造解析)"
+          echo "  出力ログ: nvram_diff.log   (書換え前後差分)"
+          echo ""
+          echo "  ※ 成果物は Artifact 'nvram-rewrite-artifacts' としてアップロード済み"
+          echo "============================================================"
 
-          WiFi MAC : ${{ steps.nvram.outputs.wifi_mac }}
-          BT   MAC : ${{ steps.nvram.outputs.bt_mac }}
-          WiFi off : ${{ github.event.inputs.wifi_mac_offset }}
-          BT   off : ${{ github.event.inputs.bt_mac_offset }}
-          Runner   : #${{ github.run_number }}"
-          git push
+      # ============================================================
+      # Step 9: 解析ログ (構造情報) の GitHub Actions ログへの保存
+      # ============================================================
+      - name: Log analysis summary to GitHub Actions log
+        run: |
+          echo "============================================================"
+          echo " NVRAM 構造解析結果ログ (nvram_analysis.log 全文)"
+          echo "============================================================"
+          cat /tmp/nvram_analysis.log
