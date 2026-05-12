@@ -4,6 +4,15 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      wifi_offset:
+        description: 'WiFi MAC offset (hex)'
+        required: false
+        default: '0x20008'
+      bt_offset:
+        description: 'Bluetooth MAC offset (hex)'
+        required: false
+        default: '0x2080A'
 
 jobs:
   randomize:
@@ -11,19 +20,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Run MAC randomizer
-        run: python randomize_mac.py
-      - name: Upload modified NVRAM image
+        run: python randomize_mac.py ${{ github.event.inputs.wifi_offset }} ${{ github.event.inputs.bt_offset }}
+
+      - name: Upload modified image
         uses: actions/upload-artifact@v4
         with:
           name: nvram_modified
           path: nvram.img
-      - name: Upload analysis log
+
+      - name: Upload log
         uses: actions/upload-artifact@v4
         with:
-          name: nvram_analysis_log
-          path: nvram_analysis.log
+          name: mac_log
+          path: mac_change.log
