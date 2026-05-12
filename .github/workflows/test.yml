@@ -17,111 +17,88 @@ jobs:
       - name: process
         run: |
           python3 << 'PYEOF'
-          import os, struct, random, sys, hashlib
+          import os, struct, random, sys, hashlib, re
 
           src = "nvram.img"
           if not os.path.exists(src):
-              print("nvram.img not found")
               sys.exit(1)
 
           with open(src, "rb") as f:
               data = bytearray(f.read())
           fsize = len(data)
 
-          def is_valid_mac(b):
+          def is_likely_mac(b):
               if len(b) < 6:
                   return False
               if all(x == 0 for x in b) or all(x == 0xFF for x in b):
                   return False
-              if b[0] & 0x01:
+              if b[0] & 1:
                   return False
+              if b[0] == 0x02 and b[1] == 0x00 and b[2] == 0x00:
+                  return True
+              if b[0] in (0x00, 0x08, 0x0C, 0x10, 0x14, 0x18) and b[1] < 0x10:
+                  return True
               return True
 
-          candidate = None
-          best_score = 0
-
-          for i in range(0x20000, fsize - 12, 2):
-              if struct.unpack_from('<I', data, i)[0] != 0x04D0:
-                  continue
-              for rec_size in (12, 16, 20):
-                  if i + rec_size > fsize:
-                      continue
-                  lid, off, sz = struct.unpack_from('<III', data, i)
-                  if lid != 0x04D0:
-                      continue
-                  if off < 0x20000 or off >= fsize or sz < 6 or sz > 65536 or off + sz > fsize:
-                      continue
-                  mac_pos = off + 4
-                  if mac_pos + 6 > fsize:
-                      continue
-                  mac_bytes = data[mac_pos:mac_pos+6]
-                  if not is_valid_mac(mac_bytes):
-                      continue
-                  name = ""
-                  name_start = off + sz
-                  if name_start + 2 <= fsize:
-                      name_len = struct.unpack_from('<H', data, name_start)[0]
-                      if name_len > 0 and name_len < 256 and name_start + 2 + name_len <= fsize:
-                          name = data[name_start+2:name_start+2+name_len].decode('utf-8', errors='ignore')
-                  score = 0
-                  if "WIFI" in name.upper():
-                      score += 10
-                  if off > 0x100000:
-                      score += 2
-                  if score > best_score:
-                      best_score = score
-                      candidate = (off, sz, name, mac_pos, mac_bytes)
-
-          if candidate is None:
-              for i in range(0x20000, fsize - 6, 1):
-                  if data[i:i+6] == b'WIFI' or data[i:i+6] == b'wifi':
-                      for back in range(i - 256, i):
-                          if back < 0x20000:
-                              continue
-                          if back + 12 > fsize:
-                              continue
-                          lid = struct.unpack_from('<I', data, back)[0]
-                          if lid != 0x04D0:
-                              continue
-                          off, sz = struct.unpack_from('<II', data, back+4)
-                          mac_pos = off + 4
-                          if off >= 0x20000 and off + sz <= fsize and sz >= 6 and mac_pos + 6 <= fsize:
-                              mac_bytes = data[mac_pos:mac_pos+6]
-                              if is_valid_mac(mac_bytes):
-                                  candidate = (off, sz, "near_WIFI_string", mac_pos, mac_bytes)
-                                  break
-                      if candidate:
-                          break
-              if candidate is None:
-                  for i in range(0x20000, fsize - 256, 1):
-                      mac_bytes = data[i:i+6]
-                      if not is_valid_mac(mac_bytes):
+          def find_wifi_file(data):
+              c = []
+              for m in re.finditer(rb'[A-Za-z0-9_]+/WIFI\x00', data):
+                  pos = m.start()
+                  name_part = data[m.start():m.end()]
+                  if b'APCFG' in name_part or b'APRDEB' in name_part:
+                      c.append(pos)
+              if not c:
+                  for m in re.finditer(rb'APCFG/APRDEB/WIFI', data):
+                      c.append(m.start())
+              if not c:
+                  for m in re.finditer(rb'WIFI\x00', data):
+                      if m.start() > 0x1000:
+                          c.append(m.start())
+              results = []
+              for hit in c:
+                  for lookup in range(max(0, hit-64), hit):
+                      if lookup + 16 > fsize:
                           continue
-                      if data[i+6:i+8] == b'\x00\x00' or data[i+6:i+8] == b'\xFF\xFF':
-                          continue
-                      for j in range(i+8, min(i+256, fsize)):
-                          if data[j:j+4] == b'WIFI':
-                              candidate = (i, 128, "WIFI_string_after", i, mac_bytes)
+                      foff = struct.unpack_from('<I', data, lookup)[0]
+                      fsize_candidate = struct.unpack_from('<I', data, lookup+4)[0]
+                      if 0x20000 < foff < fsize and 0 < fsize_candidate < 8192 and foff + fsize_candidate <= fsize:
+                          mac_candidate = data[foff+4:foff+10]
+                          if is_likely_mac(mac_candidate):
+                              results.append((foff, fsize_candidate, hit))
                               break
-                      if candidate:
-                          break
+              return results
 
-          if candidate is None:
-              print("Could not locate WIFI MAC in nvram")
+          file_candidates = find_wifi_file(data)
+
+          if file_candidates:
+              data_off, data_sz, path_pos = file_candidates[0]
+              mac_off = data_off + 4
+          else:
+              valid_macs = []
+              for i in range(0x1FFFF, fsize - 6, 4):
+                  mac_bytes = data[i:i+6]
+                  if not is_likely_mac(mac_bytes):
+                      continue
+                  ctx = data[max(0,i-16):min(fsize,i+24)]
+                  valid_macs.append((i, mac_bytes, ctx))
+              if not valid_macs:
+                  sys.exit(1)
+              candidates = [(off, mac, ctx) for off, mac, ctx in valid_macs if off > 0x30000]
+              if not candidates:
+                  candidates = valid_macs
+              data_off = candidates[0][0]
+              mac_off = data_off
+
+          old_mac = bytes(data[mac_off:mac_off+6])
+          if not is_likely_mac(old_mac):
               sys.exit(1)
 
-          data_off, data_sz, item_name, mac_off, old_mac = candidate
           old_fmt = ':'.join(f'{b:02X}' for b in old_mac)
-          print(f"WIFI data offset: 0x{data_off:X}")
-          print(f"MAC offset: 0x{mac_off:X}")
-          print(f"Name hint: {item_name}")
-          print(f"Existing MAC: {old_fmt}")
 
           user_mac = '${{ github.event.inputs.mac_addr }}'
           if user_mac:
               parts = user_mac.split(':')
               if len(parts) != 6 or any(len(p) != 2 for p in parts):
-                  print("Invalid MAC format")
                   sys.exit(1)
               new_mac = bytes(int(p, 16) for p in parts)
           else:
@@ -132,8 +109,6 @@ jobs:
               new_mac = bytes(new_mac)
 
           new_fmt = ':'.join(f'{b:02X}' for b in new_mac)
-          print(f"New MAC: {new_fmt}")
-
           data[mac_off:mac_off+6] = new_mac
 
           out_path = "nvram_modified.img"
@@ -144,15 +119,13 @@ jobs:
 
           with open("nvram_analysis.log", "w") as log:
               log.write(f"File: nvram.img ({len(data)} bytes)\n")
-              log.write(f"WIFI data offset: 0x{data_off:X} size: 0x{data_sz:X}\n")
+              log.write(f"WIFI data offset: 0x{data_off:X}\n")
               log.write(f"MAC offset: 0x{mac_off:X}\n")
               log.write(f"Old MAC: {old_fmt}\n")
               log.write(f"New MAC: {new_fmt}\n")
               log.write(f"Modified SHA256: {sha256}\n")
-              if item_name:
-                  log.write(f"Associated name: {item_name}\n")
-              log.write("\nSurrounding bytes (data block):\n")
-              for k in range(data_off, min(data_off+data_sz, fsize), 16):
+              log.write("\nSurrounding bytes:\n")
+              for k in range(max(0, data_off-16), min(data_off+256, fsize), 16):
                   line = data[k:k+16]
                   hex_str = ' '.join(f'{b:02X}' for b in line)
                   log.write(f"0x{k:08X}: {hex_str}\n")
