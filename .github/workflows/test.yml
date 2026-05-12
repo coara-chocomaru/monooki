@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: parse_and_rewrite
+      - name: process
         run: |
           python3 << 'PYEOF'
           import os, struct, random, sys, hashlib
@@ -25,32 +25,39 @@ jobs:
               sys.exit(1)
 
           with open(src, "rb") as f:
-              data = f.read()
-          fsize = len(data)
-          print(f"File size: {fsize} bytes (expected 5MB)")
+              data = bytearray(f.read())
 
-          target = b'WIFI'
-          candidates = []
-          step = 1
-          for i in range(0, fsize - 12, step):
-              if data[i:i+4] != target:
-                  continue
-              off = struct.unpack_from('<I', data, i+4)[0]
-              sz = struct.unpack_from('<I', data, i+8)[0]
-              if off < fsize and sz > 0 and (off + sz) <= fsize and off > 0x800:
-                  candidates.append((i, off, sz))
-
-          if not candidates:
-              print("No valid WIFI section found")
+          magic = struct.unpack_from('<I', data, 0)[0]
+          if magic != 0x4D52564E and magic != 0x4E565241:
+              print("No valid NVRAM magic")
               sys.exit(1)
 
-          entry_pos, sec_off, sec_size = candidates[0]
-          print(f"WIFI section entry at 0x{entry_pos:06X}, data offset 0x{sec_off:06X}, size 0x{sec_size:06X}")
+          header_size = struct.unpack_from('<I', data, 4)[0]
+          total_size = struct.unpack_from('<I', data, 8)[0]
+          data_offset = struct.unpack_from('<I', data, 12)[0]
+          item_count = struct.unpack_from('<I', data, 16)[0]
 
-          mac_off = sec_off + 4
-          old_mac = data[mac_off:mac_off+6]
+          item_base = 20
+          found = None
+          for i in range(item_count):
+              off = item_base + i * 12
+              lid = struct.unpack_from('<I', data, off)[0]
+              ioff = struct.unpack_from('<I', data, off + 4)[0]
+              isize = struct.unpack_from('<I', data, off + 8)[0]
+              if lid == 0x04D0:
+                  found = (ioff, isize)
+                  break
+
+          if found is None:
+              print("WIFI LID not found")
+              sys.exit(1)
+
+          item_off, item_sz = found
+          abs_off = data_offset + item_off
+          mac_off = abs_off + 4
+
+          old_mac = bytes(data[mac_off:mac_off+6])
           old_fmt = ':'.join(f'{b:02X}' for b in old_mac)
-          print(f"Existing MAC: {old_fmt}")
 
           user_mac = '${{ github.event.inputs.mac_addr }}'
           if user_mac:
@@ -67,30 +74,27 @@ jobs:
               new_mac = bytes(new_mac)
 
           new_fmt = ':'.join(f'{b:02X}' for b in new_mac)
-          print(f"New MAC: {new_fmt}")
-
-          mod_data = bytearray(data)
-          mod_data[mac_off:mac_off+6] = new_mac
+          data[mac_off:mac_off+6] = new_mac
 
           out_path = "nvram_modified.img"
           with open(out_path, "wb") as f:
-              f.write(mod_data)
+              f.write(data)
 
-          sha256 = hashlib.sha256(mod_data).hexdigest()
-          print(f"Modified SHA256: {sha256}")
+          sha256 = hashlib.sha256(data).hexdigest()
 
           with open("nvram_analysis.log", "w") as log:
-              log.write(f"File: nvram.img ({fsize} bytes)\n")
-              log.write(f"WIFI section entry: 0x{entry_pos:06X}\n")
-              log.write(f"WIFI data offset: 0x{sec_off:06X}\n")
-              log.write(f"MAC offset: 0x{mac_off:06X}\n")
+              log.write(f"File: nvram.img ({len(data)} bytes)\n")
+              log.write(f"Magic: 0x{magic:08X}\n")
+              log.write(f"Data offset: 0x{data_offset:08X}\n")
+              log.write(f"WIFI LID item offset: 0x{item_off:08X} size: 0x{item_sz:08X}\n")
+              log.write(f"MAC absolute offset: 0x{mac_off:08X}\n")
               log.write(f"Old MAC: {old_fmt}\n")
               log.write(f"New MAC: {new_fmt}\n")
               log.write(f"Modified SHA256: {sha256}\n")
 
           print("Done")
           PYEOF
-      - name: upload_artifacts
+      - name: upload
         uses: actions/upload-artifact@v4
         with:
           name: nvram-artifacts
