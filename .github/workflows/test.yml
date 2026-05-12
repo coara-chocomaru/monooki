@@ -18,7 +18,6 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, struct, random, sys, hashlib
-          from collections import namedtuple
 
           src = "nvram.img"
           if not os.path.exists(src):
@@ -27,70 +26,96 @@ jobs:
 
           with open(src, "rb") as f:
               data = bytearray(f.read())
-
           fsize = len(data)
-          print(f"File size: {fsize} bytes")
 
-          def find_wifi_item(data):
-              best = None
-              for i in range(0, fsize - 8, 2):
-                  maybe_lid = struct.unpack_from('<I', data, i)[0]
-                  if maybe_lid != 0x04D0:
-                      continue
-                  if i < 4:
-                      continue
-                  for check_off in range(i - 16, i, 4):
-                      if check_off < 0:
-                          continue
-                      hdr_candidate = data[check_off:check_off+12]
-                      if len(hdr_candidate) < 12:
-                          continue
-                      lid2, ioff, isize = struct.unpack_from('<III', hdr_candidate, 0)
-                      if lid2 == 0x04D0 and 0 < ioff < fsize and 0 < isize <= 16384 and ioff + isize <= fsize:
-                          print(f"Found WIFI item header at 0x{check_off:X}: LID=0x{lid2:08X} data_off=0x{ioff:08X} size=0x{isize:04X}")
-                          return (ioff, isize)
-                  maybe_ioff = struct.unpack_from('<I', data, i + 4)[0]
-                  maybe_size = struct.unpack_from('<I', data, i + 8)[0]
-                  if 0 < maybe_ioff < fsize and 0 < maybe_size <= 16384 and maybe_ioff + maybe_size <= fsize:
-                      print(f"Found probable WIFI item at LID offset 0x{i:X}: data_off=0x{maybe_ioff:08X} size=0x{maybe_size:04X}")
-                      return (maybe_ioff, maybe_size)
-              return None
+          def is_valid_mac(b):
+              if len(b) < 6:
+                  return False
+              if all(x == 0 for x in b) or all(x == 0xFF for x in b):
+                  return False
+              if b[0] & 0x01:
+                  return False
+              return True
 
-          result = find_wifi_item(data)
-          if result is None:
-              print("Searching for WIFI via filesystem strings...")
-              for i in range(0, fsize - 20, 1):
-                  if data[i:i+4] == b'WIFI':
-                      for t in range(max(0, i-128), i):
-                          if data[t:t+3] == b'/AP' or data[t:t+6] == b'APRDEB' or data[t:t+5] == b'APCFG':
-                              search_start = max(0, t-256)
-                              for j in range(search_start, min(t+256, fsize-6), 1):
-                                  if j + 6 <= fsize:
-                                      mac_test = data[j:j+6]
-                                      if all(b != 0 for b in mac_test) and (mac_test[0] & 0x01) == 0:
-                                          block_start = j - 4
-                                          if block_start >= 0:
-                                              print(f"Found potential MAC at offset 0x{block_start:X} near WIFI string")
-                                              result = (block_start, 256)
-                                              break
-                              if result:
+          candidate = None
+          best_score = 0
+
+          for i in range(0x20000, fsize - 12, 2):
+              if struct.unpack_from('<I', data, i)[0] != 0x04D0:
+                  continue
+              for rec_size in (12, 16, 20):
+                  if i + rec_size > fsize:
+                      continue
+                  lid, off, sz = struct.unpack_from('<III', data, i)
+                  if lid != 0x04D0:
+                      continue
+                  if off < 0x20000 or off >= fsize or sz < 6 or sz > 65536 or off + sz > fsize:
+                      continue
+                  mac_pos = off + 4
+                  if mac_pos + 6 > fsize:
+                      continue
+                  mac_bytes = data[mac_pos:mac_pos+6]
+                  if not is_valid_mac(mac_bytes):
+                      continue
+                  name = ""
+                  name_start = off + sz
+                  if name_start + 2 <= fsize:
+                      name_len = struct.unpack_from('<H', data, name_start)[0]
+                      if name_len > 0 and name_len < 256 and name_start + 2 + name_len <= fsize:
+                          name = data[name_start+2:name_start+2+name_len].decode('utf-8', errors='ignore')
+                  score = 0
+                  if "WIFI" in name.upper():
+                      score += 10
+                  if off > 0x100000:
+                      score += 2
+                  if score > best_score:
+                      best_score = score
+                      candidate = (off, sz, name, mac_pos, mac_bytes)
+
+          if candidate is None:
+              for i in range(0x20000, fsize - 6, 1):
+                  if data[i:i+6] == b'WIFI' or data[i:i+6] == b'wifi':
+                      for back in range(i - 256, i):
+                          if back < 0x20000:
+                              continue
+                          if back + 12 > fsize:
+                              continue
+                          lid = struct.unpack_from('<I', data, back)[0]
+                          if lid != 0x04D0:
+                              continue
+                          off, sz = struct.unpack_from('<II', data, back+4)
+                          mac_pos = off + 4
+                          if off >= 0x20000 and off + sz <= fsize and sz >= 6 and mac_pos + 6 <= fsize:
+                              mac_bytes = data[mac_pos:mac_pos+6]
+                              if is_valid_mac(mac_bytes):
+                                  candidate = (off, sz, "near_WIFI_string", mac_pos, mac_bytes)
                                   break
-                      if result:
+                      if candidate:
+                          break
+              if candidate is None:
+                  for i in range(0x20000, fsize - 256, 1):
+                      mac_bytes = data[i:i+6]
+                      if not is_valid_mac(mac_bytes):
+                          continue
+                      if data[i+6:i+8] == b'\x00\x00' or data[i+6:i+8] == b'\xFF\xFF':
+                          continue
+                      for j in range(i+8, min(i+256, fsize)):
+                          if data[j:j+4] == b'WIFI':
+                              candidate = (i, 128, "WIFI_string_after", i, mac_bytes)
+                              break
+                      if candidate:
                           break
 
-          if result is None:
-              print("Could not locate WIFI data block")
+          if candidate is None:
+              print("Could not locate WIFI MAC in nvram")
               sys.exit(1)
 
-          data_off, data_size = result
-          mac_off = data_off + 4
-          if mac_off + 6 > fsize:
-              print("MAC offset out of bounds")
-              sys.exit(1)
-
-          old_mac = bytes(data[mac_off:mac_off+6])
+          data_off, data_sz, item_name, mac_off, old_mac = candidate
           old_fmt = ':'.join(f'{b:02X}' for b in old_mac)
-          print(f"Existing MAC at 0x{mac_off:X}: {old_fmt}")
+          print(f"WIFI data offset: 0x{data_off:X}")
+          print(f"MAC offset: 0x{mac_off:X}")
+          print(f"Name hint: {item_name}")
+          print(f"Existing MAC: {old_fmt}")
 
           user_mac = '${{ github.event.inputs.mac_addr }}'
           if user_mac:
@@ -119,13 +144,15 @@ jobs:
 
           with open("nvram_analysis.log", "w") as log:
               log.write(f"File: nvram.img ({len(data)} bytes)\n")
-              log.write(f"WIFI data offset: 0x{data_off:X}\n")
+              log.write(f"WIFI data offset: 0x{data_off:X} size: 0x{data_sz:X}\n")
               log.write(f"MAC offset: 0x{mac_off:X}\n")
               log.write(f"Old MAC: {old_fmt}\n")
               log.write(f"New MAC: {new_fmt}\n")
               log.write(f"Modified SHA256: {sha256}\n")
-              log.write("\nFirst 64 bytes of WIFI data block:\n")
-              for k in range(data_off, min(data_off+64, fsize), 16):
+              if item_name:
+                  log.write(f"Associated name: {item_name}\n")
+              log.write("\nSurrounding bytes (data block):\n")
+              for k in range(data_off, min(data_off+data_sz, fsize), 16):
                   line = data[k:k+16]
                   hex_str = ' '.join(f'{b:02X}' for b in line)
                   log.write(f"0x{k:08X}: {hex_str}\n")
