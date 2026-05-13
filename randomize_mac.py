@@ -5,21 +5,6 @@ import struct
 import argparse
 import datetime
 
-def random_mac():
-    mac = [random.randint(0x00, 0xff) for _ in range(6)]
-    mac[0] = (mac[0] & 0xfc) | 0x02
-    return bytes(mac)
-
-def is_valid_mac(data, off):
-    if off + 6 > len(data):
-        return False
-    mac = data[off:off+6]
-    if mac == b'\x00'*6 or mac == b'\xff'*6:
-        return False
-    if mac[0] & 0x01:
-        return False
-    return True
-
 def crc16_ccitt(data):
     crc = 0xFFFF
     for b in data:
@@ -32,73 +17,56 @@ def crc16_ccitt(data):
             crc &= 0xFFFF
     return crc
 
-def find_wifi_offset(data):
-    pattern = bytes([0x01, 0x00, 0x08, 0x00, 0x00, 0x03])
-    idx = data.find(pattern)
-    if idx == -1:
-        return None
-    mac_start = idx + len(pattern)
-    if not is_valid_mac(data, mac_start):
-        for delta in (-3, -2, -1, 1, 2, 3):
-            cand = mac_start + delta
-            if is_valid_mac(data, cand):
-                return cand
-        return None
-    return mac_start
-
-def find_bt_offset(data, wifi_off):
-    cand = wifi_off + 0x802
-    if is_valid_mac(data, cand):
-        return cand
-    bt_str = b'BT_Addr'
-    idx = data.find(bt_str)
-    if idx != -1:
-        cand2 = idx + len(bt_str)
-        if cand2 < len(data) and data[cand2] == 0:
-            cand2 += 1
-        if is_valid_mac(data, cand2):
-            return cand2
-    if is_valid_mac(data, wifi_off + 0x800):
-        return wifi_off + 0x800
-    return None
-
-def get_lid_start(data, mac_off, lid_size=512):
-    start = mac_off - (mac_off % lid_size)
-    if start < 0 or start + lid_size > len(data):
-        return None
-    return start
-
-def update_version_and_checksum(data, mac_off, lid_size, log):
-    start = get_lid_start(data, mac_off, lid_size)
-    if start is None:
-        log.write(f"     ERROR: Cannot find LID start for offset 0x{mac_off:06x}\n")
+def is_valid_mac(data, off):
+    if off + 6 > len(data):
         return False
-    version_off = start
-    if version_off + 2 > len(data):
-        log.write(f"     ERROR: Version offset out of range\n")
+    mac = data[off:off+6]
+    if mac == b'\x00'*6 or mac == b'\xff'*6:
         return False
-    old_ver = struct.unpack('<H', data[version_off:version_off+2])[0]
-    new_ver = (old_ver + 1) & 0xFFFF
-    data[version_off:version_off+2] = struct.pack('<H', new_ver)
-    cksum_off = start + lid_size - 2
+    if mac[0] & 0x01:
+        return False
+    return True
+
+def find_lid_boundary(data, start, search_step=512):
+    """LIDの終了位置を推測 (デフォルト512バイト、次の非ゼロ領域まで)"""
+    end = start + search_step
+    while end + 2 < len(data):
+        if data[end:end+2] in (b'\x01\x00', b'\x00\x00') and data[end+2:end+4] != b'\x00\x00':
+            break
+        end += 1
+        if end - start > 4096:
+            end = start + 512
+            break
+    return end
+
+def update_lid_checksum(data, start, end, log, update_version=True):
+    """指定されたLID領域のバージョンとチェックサムを更新"""
+    if end - start < 4:
+        return False
+
+    if update_version:
+        old_ver = struct.unpack('<H', data[start:start+2])[0]
+        new_ver = (old_ver + 1) & 0xFFFF
+        data[start:start+2] = struct.pack('<H', new_ver)
+        log.write(f"       Version: 0x{old_ver:04x} -> 0x{new_ver:04x}\n")
+
+    cksum_off = end - 2
     if cksum_off + 2 > len(data):
-        log.write(f"     ERROR: Checksum offset out of range\n")
         return False
     old_csum = data[cksum_off:cksum_off+2]
     data[cksum_off:cksum_off+2] = b'\x00\x00'
-    new_csum = crc16_ccitt(data[start:start+lid_size])
+    new_csum = crc16_ccitt(data[start:end])
     data[cksum_off:cksum_off+2] = struct.pack('<H', new_csum)
-    log.write(f"     Version: 0x{old_ver:04x} -> 0x{new_ver:04x}\n")
-    log.write(f"     Checksum: 0x{old_csum.hex()} -> 0x{new_csum:04x}\n")
+    log.write(f"       Checksum: {old_csum.hex()} -> {new_csum:04x}\n")
     return True
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--wifi-offset', default=None)
-    parser.add_argument('--bt-offset', default=None)
-    parser.add_argument('--lid-size', default='512', help='LID size in bytes (default 512)')
+    parser.add_argument('--wifi-offset', type=lambda x: int(x,16), help='WiFi MAC address offset (hex)')
+    parser.add_argument('--bt-offset', type=lambda x: int(x,16), help='Bluetooth MAC address offset (hex)')
+    parser.add_argument('--lid-size', type=int, default=512, help='Fixed LID size (if auto-detect fails)')
+    parser.add_argument('--no-version-inc', action='store_true', help='Do not increment version number')
     args = parser.parse_args()
-    lid_size = int(args.lid_size)
 
     img_path = "nvram.img"
     if not os.path.exists(img_path):
@@ -112,46 +80,88 @@ def main():
     with open(log_path, 'w') as log:
         log.write(f"{datetime.datetime.now().isoformat()}\n")
         log.write(f"File size: {len(data)} bytes\n")
-        log.write(f"LID size: {lid_size} bytes\n\n")
+        log.write(f"LID size hint: {args.lid_size}\n\n")
 
-        if args.wifi_offset:
-            wifi_off = int(args.wifi_offset, 16)
+        if args.wifi_offset is not None:
+            wifi_off = args.wifi_offset
             log.write(f"WiFi offset manual: 0x{wifi_off:06x}\n")
         else:
-            wifi_off = find_wifi_offset(data)
-            if wifi_off is None:
-                log.write("ERROR: Cannot detect WiFi offset\n")
+            pattern = bytes([0x01, 0x00, 0x08, 0x00, 0x00, 0x03])
+            idx = data.find(pattern)
+            if idx == -1:
+                log.write("ERROR: Cannot find WiFi MAC pattern\n")
                 sys.exit(1)
+            wifi_off = idx + len(pattern)
             log.write(f"WiFi offset detected: 0x{wifi_off:06x}\n")
 
         if not is_valid_mac(data, wifi_off):
             log.write(f"ERROR: No valid MAC at 0x{wifi_off:06x}\n")
             sys.exit(1)
 
-        if args.bt_offset:
-            bt_off = int(args.bt_offset, 16)
+        if args.bt_offset is not None:
+            bt_off = args.bt_offset
             log.write(f"BT offset manual: 0x{bt_off:06x}\n")
         else:
-            bt_off = find_bt_offset(data, wifi_off)
-            if bt_off is None:
-                log.write("WARNING: BT offset not found, using fallback +0x802\n")
-                bt_off = wifi_off + 0x802
+            cand = wifi_off + 0x802
+            if is_valid_mac(data, cand):
+                bt_off = cand
+            else:
+                bt_str = b'BT_Addr'
+                idx = data.find(bt_str)
+                if idx != -1:
+                    cand2 = idx + len(bt_str) + 1
+                    if is_valid_mac(data, cand2):
+                        bt_off = cand2
+                    else:
+                        bt_off = cand
+                else:
+                    bt_off = cand
             log.write(f"BT offset detected: 0x{bt_off:06x}\n")
 
-        log.write("\n--- Randomization ---\n")
+        def get_lid_range(off):
+            start = off - (off % args.lid_size)
+            end = find_lid_boundary(data, start, args.lid_size)
+            if end <= start:
+                end = start + args.lid_size
+            if data[start] == 0 and data[start+1] == 0:
+                start2 = start + args.lid_size
+                if start2 + args.lid_size <= len(data):
+                    start = start2
+                    end = start + args.lid_size
+            return start, end
+
+        log.write("\n--- Randomization & Checksum Update ---\n")
         for name, off in [('WiFi', wifi_off), ('Bluetooth', bt_off)]:
-            old = bytes(data[off:off+6])
-            new = random_mac()
-            data[off:off+6] = new
-            log.write(f"{name}: 0x{off:06x}  old {old.hex(':')} -> new {new.hex(':')}\n")
-            if not update_version_and_checksum(data, off, lid_size, log):
-                log.write(f"     WARNING: Failed to update version/checksum for {name}\n")
+            old_mac = bytes(data[off:off+6])
+            new_mac = random_mac()
+            data[off:off+6] = new_mac
+            log.write(f"{name} MAC: 0x{off:06x}  {old_mac.hex(':')} -> {new_mac.hex(':')}\n")
+
+            start, end = get_lid_range(off)
+            log.write(f"  LID range: 0x{start:06x} - 0x{end:06x} ({end-start} bytes)\n")
+            if not update_lid_checksum(data, start, end, log, update_version=not args.no_version_inc):
+                log.write(f"  WARNING: Failed to update LID checksum for {name}\n")
+
+        if len(data) > 0x10 and data[0:2] != b'\x00\x00':
+            log.write("\n--- Global header checksum (experimental) ---\n")
+            global_csum_off = 0x04   # 仮定
+            if global_csum_off + 2 <= len(data):
+                old_global = data[global_csum_off:global_csum_off+2]
+                data[global_csum_off:global_csum_off+2] = b'\x00\x00'
+                new_global = crc16_ccitt(data[:0x200])  
+                data[global_csum_off:global_csum_off+2] = struct.pack('<H', new_global)
+                log.write(f"  Global checksum at 0x{global_csum_off:04x}: {old_global.hex()} -> {new_global:04x}\n")
 
         with open(img_path, 'wb') as f:
             f.write(data)
         log.write("\nDone.\n")
 
-    print("Done. Modified nvram.img and log saved.")
+    print("Modified nvram.img written. See nvram_analysis.log for details.")
+
+def random_mac():
+    mac = [random.randint(0x00, 0xff) for _ in range(6)]
+    mac[0] = (mac[0] & 0xfc) | 0x02 
+    return bytes(mac)
 
 if __name__ == "__main__":
     main()
