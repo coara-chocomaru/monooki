@@ -2,7 +2,7 @@ import os
 import sys
 import random
 import struct
-import hashlib
+import argparse
 import datetime
 
 def random_mac():
@@ -10,72 +10,146 @@ def random_mac():
     mac[0] = (mac[0] & 0xfc) | 0x02
     return bytes(mac)
 
-def mtk_crc64(data):
-    crc = 0
-    poly = 0x42F0E1EBA9EA3693
-    for b in data:
-        crc ^= (b << 56)
-        for _ in range(8):
-            if crc & (1 << 63):
-                crc = (crc << 1) ^ poly
-            else:
-                crc <<= 1
-            crc &= (1 << 64) - 1
-    return crc.to_bytes(8, 'little')
-
-def update_crc64(data, start, length):
-    checksum_offset = 0x308
-    if checksum_offset + 8 > len(data):
+def is_valid_mac(data, off):
+    if off + 6 > len(data):
         return False
-    data[start+checksum_offset:start+checksum_offset+8] = mtk_crc64(data[start:start+length])
+    mac = data[off:off+6]
+    if mac == b'\x00'*6 or mac == b'\xff'*6:
+        return False
+    if mac[0] & 0x01:
+        return False
     return True
 
-def update_version(data, offset, lid_size=512):
-    ver_offset = offset - 0x2A
-    if ver_offset + 4 > len(data):
+def crc16_ccitt(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= (b << 8)
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
+def find_wifi_offset(data):
+    pattern = bytes([0x01, 0x00, 0x08, 0x00, 0x00, 0x03])
+    idx = data.find(pattern)
+    if idx == -1:
+        return None
+    mac_start = idx + len(pattern)
+    if not is_valid_mac(data, mac_start):
+        for delta in (-3, -2, -1, 1, 2, 3):
+            cand = mac_start + delta
+            if is_valid_mac(data, cand):
+                return cand
+        return None
+    return mac_start
+
+def find_bt_offset(data, wifi_off):
+    cand = wifi_off + 0x802
+    if is_valid_mac(data, cand):
+        return cand
+    bt_str = b'BT_Addr'
+    idx = data.find(bt_str)
+    if idx != -1:
+        cand2 = idx + len(bt_str)
+        if cand2 < len(data) and data[cand2] == 0:
+            cand2 += 1
+        if is_valid_mac(data, cand2):
+            return cand2
+    if is_valid_mac(data, wifi_off + 0x800):
+        return wifi_off + 0x800
+    return None
+
+def get_lid_start(data, mac_off, lid_size=512):
+    start = mac_off - (mac_off % lid_size)
+    if start < 0 or start + lid_size > len(data):
+        return None
+    return start
+
+def update_version_and_checksum(data, mac_off, lid_size, log):
+    start = get_lid_start(data, mac_off, lid_size)
+    if start is None:
+        log.write(f"     ERROR: Cannot find LID start for offset 0x{mac_off:06x}\n")
         return False
-    ver = struct.unpack('<I', data[ver_offset:ver_offset+4])[0]
-    new_ver = ver + 1
-    data[ver_offset:ver_offset+4] = struct.pack('<I', new_ver)
+    version_off = start
+    if version_off + 2 > len(data):
+        log.write(f"     ERROR: Version offset out of range\n")
+        return False
+    old_ver = struct.unpack('<H', data[version_off:version_off+2])[0]
+    new_ver = (old_ver + 1) & 0xFFFF
+    data[version_off:version_off+2] = struct.pack('<H', new_ver)
+    cksum_off = start + lid_size - 2
+    if cksum_off + 2 > len(data):
+        log.write(f"     ERROR: Checksum offset out of range\n")
+        return False
+    old_csum = data[cksum_off:cksum_off+2]
+    data[cksum_off:cksum_off+2] = b'\x00\x00'
+    new_csum = crc16_ccitt(data[start:start+lid_size])
+    data[cksum_off:cksum_off+2] = struct.pack('<H', new_csum)
+    log.write(f"     Version: 0x{old_ver:04x} -> 0x{new_ver:04x}\n")
+    log.write(f"     Checksum: 0x{old_csum.hex()} -> 0x{new_csum:04x}\n")
     return True
 
 def main():
-    img_path = "nvram.img"
-    log_path = "nvram_analysis.log"
-    wifi_info = {'lid_name': 'AP_CFG_RDEB_FILE_WIFI_LID', 'file_ver_name': 'AP_CFG_RDEB_FILE_WIFI_LID_VERNO', 'detected_offset': None}
-    bt_info = {'lid_name': 'AP_CFG_RDEB_FILE_BT_ADDR_LID', 'file_ver_name': 'AP_CFG_RDEB_FILE_BT_ADDR_LID_VERNO', 'detected_offset': None}
-    wifi_offset = 0x20008
-    bt_offset = 0x2080A
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--wifi-offset', default=None)
+    parser.add_argument('--bt-offset', default=None)
+    parser.add_argument('--lid-size', default='512', help='LID size in bytes (default 512)')
+    args = parser.parse_args()
+    lid_size = int(args.lid_size)
 
+    img_path = "nvram.img"
     if not os.path.exists(img_path):
-        print(f"Error: {img_path} not found")
+        print(f"ERROR: {img_path} not found")
         sys.exit(1)
 
-    with open(img_path, 'r+b') as f:
+    with open(img_path, 'rb') as f:
         data = bytearray(f.read())
 
-    old_wifi = bytes(data[wifi_offset:wifi_offset+6])
-    new_wifi = random_mac()
-    data[wifi_offset:wifi_offset+6] = new_wifi
-
-    old_bt = bytes(data[bt_offset:bt_offset+6])
-    new_bt = random_mac()
-    data[bt_offset:bt_offset+6] = new_bt
-
-    update_version(data, wifi_offset - 0x2A, 512)
-    update_version(data, bt_offset, 512)
-
-    update_crc64(data, 0x20000, 512)
-    update_crc64(data, 0x20800, 512)
-
-    with open(img_path, 'wb') as f:
-        f.write(data)
-
+    log_path = "nvram_analysis.log"
     with open(log_path, 'w') as log:
         log.write(f"{datetime.datetime.now().isoformat()}\n")
-        log.write(f"WiFi MAC: {old_wifi.hex(':')} -> {new_wifi.hex(':')}\n")
-        log.write(f"Bluetooth MAC: {old_bt.hex(':')} -> {new_bt.hex(':')}\n")
-        log.write("Version numbers and CRC64 checksums have been updated.\n")
+        log.write(f"File size: {len(data)} bytes\n")
+        log.write(f"LID size: {lid_size} bytes\n\n")
+
+        if args.wifi_offset:
+            wifi_off = int(args.wifi_offset, 16)
+            log.write(f"WiFi offset manual: 0x{wifi_off:06x}\n")
+        else:
+            wifi_off = find_wifi_offset(data)
+            if wifi_off is None:
+                log.write("ERROR: Cannot detect WiFi offset\n")
+                sys.exit(1)
+            log.write(f"WiFi offset detected: 0x{wifi_off:06x}\n")
+
+        if not is_valid_mac(data, wifi_off):
+            log.write(f"ERROR: No valid MAC at 0x{wifi_off:06x}\n")
+            sys.exit(1)
+
+        if args.bt_offset:
+            bt_off = int(args.bt_offset, 16)
+            log.write(f"BT offset manual: 0x{bt_off:06x}\n")
+        else:
+            bt_off = find_bt_offset(data, wifi_off)
+            if bt_off is None:
+                log.write("WARNING: BT offset not found, using fallback +0x802\n")
+                bt_off = wifi_off + 0x802
+            log.write(f"BT offset detected: 0x{bt_off:06x}\n")
+
+        log.write("\n--- Randomization ---\n")
+        for name, off in [('WiFi', wifi_off), ('Bluetooth', bt_off)]:
+            old = bytes(data[off:off+6])
+            new = random_mac()
+            data[off:off+6] = new
+            log.write(f"{name}: 0x{off:06x}  old {old.hex(':')} -> new {new.hex(':')}\n")
+            if not update_version_and_checksum(data, off, lid_size, log):
+                log.write(f"     WARNING: Failed to update version/checksum for {name}\n")
+
+        with open(img_path, 'wb') as f:
+            f.write(data)
+        log.write("\nDone.\n")
 
     print("Done. Modified nvram.img and log saved.")
 
