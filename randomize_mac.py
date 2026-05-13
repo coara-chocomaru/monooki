@@ -84,12 +84,26 @@ def update_lid_checksum(data, lid_start, lid_size, log, update_version=True):
     log.write(f"     Checksum: 0x{old_csum.hex()} -> 0x{new_csum:04x}\n")
     return True
 
+def update_global_checksum(data, log):
+    if len(data) < 0x200:
+        return False
+    csum_off = 0x04
+    if csum_off + 2 > len(data):
+        return False
+    old = data[csum_off:csum_off+2]
+    data[csum_off:csum_off+2] = b'\x00\x00'
+    new = crc16_ccitt(data[0:0x200])
+    data[csum_off:csum_off+2] = struct.pack('<H', new)
+    log.write(f"Global header checksum at 0x{csum_off:04x}: 0x{old.hex()} -> 0x{new:04x}\n")
+    return True
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--wifi-offset', default=None, help='WiFi MAC offset in hex')
     parser.add_argument('--bt-offset', default=None, help='Bluetooth MAC offset in hex')
     parser.add_argument('--lid-size', default='512', help='LID size in bytes (default 512)')
     parser.add_argument('--no-version-inc', action='store_true', help='Do not increment version number')
+    parser.add_argument('--no-global-csum', action='store_true', help='Skip global header checksum update')
     args = parser.parse_args()
     lid_size = int(args.lid_size)
 
@@ -130,22 +144,35 @@ def main():
                 log.write("WARNING: BT offset not found, using fallback +0x802\n")
                 bt_off = wifi_off + 0x802
             log.write(f"BT offset detected: 0x{bt_off:06x}\n")
-
-        log.write("\n--- Randomization ---\n")
+            
+        log.write("\n--- Updating LID checksums ---\n")
+        updated_lids = set()
         for name, off in [('WiFi', wifi_off), ('Bluetooth', bt_off)]:
             old = bytes(data[off:off+6])
             new = random_mac()
             data[off:off+6] = new
-            log.write(f"{name}: 0x{off:06x}  old {old.hex(':')} -> new {new.hex(':')}\n")
+            log.write(f"{name} MAC: 0x{off:06x}  {old.hex(':')} -> {new.hex(':')}\n")
 
             lid_start = get_lid_start(data, off, lid_size)
             if lid_start is None:
-                log.write(f"     ERROR: Cannot find LID start for offset 0x{off:06x}\n")
+                log.write(f"  ERROR: Cannot find LID start for offset 0x{off:06x}\n")
                 continue
-            log.write(f"     LID start: 0x{lid_start:06x}\n")
-            if not update_lid_checksum(data, lid_start, lid_size, log, update_version=not args.no_version_inc):
-                log.write(f"     WARNING: Failed to update LID checksum\n")
+            if lid_start in updated_lids:
+                log.write(f"  LID at 0x{lid_start:06x} already updated, skip duplicate\n")
+                continue
+            log.write(f"  LID start: 0x{lid_start:06x}\n")
+            if update_lid_checksum(data, lid_start, lid_size, log, update_version=not args.no_version_inc):
+                updated_lids.add(lid_start)
+            else:
+                log.write(f"  WARNING: Failed to update LID checksum\n")
 
+        if not args.no_global_csum:
+            log.write("\n--- Updating global header checksum (experimental) ---\n")
+            if update_global_checksum(data, log):
+                log.write("Global checksum updated.\n")
+            else:
+                log.write("Skipped global checksum (not applicable or out of range).\n")
+                
         with open(img_path, 'wb') as f:
             f.write(data)
         log.write("\nDone.\n")
