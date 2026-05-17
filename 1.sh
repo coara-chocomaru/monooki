@@ -3,11 +3,11 @@ set -euo pipefail
 
 MANIFEST_URL='https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni'
 MANIFEST_BRANCH='twrp-9.0'
-DEVICE_TREE_URL='https://github.com/coara-chocomaru/test-ctab'
+DEVICE_TREE_URL='https://github.com/coara-chocomaru/TAB-A05-BD-Neo-TWRP'
 DEVICE_TREE_BRANCH='yoko'
-DEVICE_PATH='device/sts/a05ba'
-DEVICE_NAME='a05ba'
-MAKEFILE_NAME='omni_a05ba'
+DEVICE_PATH='device/sts/a05bd'
+DEVICE_NAME='a05bd'
+MAKEFILE_NAME='omni_a05bd'
 BUILD_TARGET='recovery'
 FIXED_SALT='95180092a2a9db10da47b2c8d0b5a239af3d9e3d9c49e87fccb81701cf2ee3c3'
 
@@ -75,7 +75,7 @@ echo "Setting up 12 GB swap..." | tee -a "$LOGFILE"
 sudo fallocate -l 12G /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
-sudo swapon /swapfile || true   # ignore if already active
+sudo swapon /swapfile || true 
 
 cd "$WORKSPACE_DIR"
 source build/envsetup.sh
