@@ -22,6 +22,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/doc \
+            /usr/share/man \
+            /var/lib/apt/lists \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean || true
+          docker system prune -af || true
+          df -h
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -96,12 +113,18 @@ jobs:
 
       - name: Run binwalk directly (fallback verbose)
         run: |
-          binwalk \
+          timeout 120 binwalk \
             --extract \
-            --depth=10 \
+            --depth=4 \
             --directory=extracted/binwalk_direct \
             "${{ github.event.inputs.filename }}" \
             2>&1 | tee extracted/binwalk_direct.log || true
+          DIR="extracted/binwalk_direct"
+          SIZE=$(du -sm "$DIR" 2>/dev/null | cut -f1 || echo 0)
+          if [ "$SIZE" -gt 500 ]; then
+            tar czf extracted/binwalk_direct.tar.gz "$DIR" \
+              --remove-files 2>/dev/null || true
+          fi
         continue-on-error: true
 
       - name: Try 7z extraction (fallback)
