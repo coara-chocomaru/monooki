@@ -1,0 +1,80 @@
+name: Extract Firmware with binwalk
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of firmware.bin'
+        required: true
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install binwalk and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binwalk p7zip-full
+
+      - name: Download firmware
+        run: wget -O firmware.bin "${{ github.event.inputs.url }}"
+
+      - name: Recursive extraction with binwalk (full auto)
+        run: |
+          mkdir -p extracted
+          timeout 300 binwalk -e -M --depth=6 --directory=extracted firmware.bin 2>&1 | tee extract.log || true
+
+      - name: Second pass – extract any missed LZMA chunks
+        run: |
+          # Some nested LZMA may need manual run; binwalk -M usually covers it
+          find extracted -type f -size +10c | while read f; do
+            if binwalk "$f" | grep -q "LZMA compressed data"; then
+              echo "Re-scanning $f"
+              binwalk -e -M --depth=3 --directory="$(dirname "$f")" "$f" 2>/dev/null || true
+            fi
+          done
+
+      - name: Collect Android boot images
+        run: |
+          find extracted -type f -exec file {} \; | grep -i "Android bootimg" | cut -d: -f1 | while read img; do
+            cp "$img" "boot_$(basename "$img").img"
+          done
+          if ls boot_*.img 1>/dev/null 2>&1; then
+            tar czf boot_images.tar.gz boot_*.img
+            echo "BOOT_COLLECTED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Collect DTB/DTBO files
+        run: |
+          find extracted -name "*.dtb" -o -name "*.dtbo" -o -name "*.dtb.*" | tar czf dtb_files.tar.gz -T - 2>/dev/null || true
+          if [ -s dtb_files.tar.gz ]; then
+            echo "DTB_COLLECTED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Collect cpio archives and rootfs
+        run: |
+          find extracted -type f -exec file {} \; | grep -i "cpio archive" | cut -d: -f1 | tar czf cpio_archives.tar.gz -T - 2>/dev/null || true
+
+      - name: Archive full extraction result
+        run: |
+          tar czf full_extracted.tar.gz extracted extract.log
+
+      - name: Upload full extracted data
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-extracted-firmware
+          path: full_extracted.tar.gz
+
+      - name: Upload boot images
+        if: env.BOOT_COLLECTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-images
+          path: boot_images.tar.gz
+
+      - name: Upload DTB files
+        if: env.DTB_COLLECTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtb-files
+          path: dtb_files.tar.gz
