@@ -1,0 +1,51 @@
+name: Extract boot.img from firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Firmware URL'
+        required: true
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install binwalk
+        run: sudo apt-get update && sudo apt-get install -y binwalk
+
+      - name: Download firmware
+        run: wget -O firmware.bin "${{ github.event.inputs.url }}"
+
+      - name: Recursive extraction with binwalk
+        run: binwalk -e -M --depth=5 --directory=extracted firmware.bin
+
+      - name: Find boot.img
+        run: |
+          find extracted -type f -exec sh -c 'file "{}" | grep -qi "Android bootimg" && echo "{}"' \; | head -1 > bootimg_path.txt
+          if [ -s bootimg_path.txt ]; then
+            BOOT_IMG=$(cat bootimg_path.txt)
+            cp "$BOOT_IMG" boot.img
+            echo "BOOT_FOUND=true" >> $GITHUB_ENV
+          fi
+
+      - name: Find dtb files
+        run: |
+          find extracted -name "*.dtb" -o -name "*.dtbo" -o -type f -exec sh -c 'file "{}" | grep -qi "device tree" && echo "{}"' \; | tar czf dtb.tar.gz -T - 2>/dev/null || true
+          if [ -s dtb.tar.gz ]; then
+            echo "DTB_FOUND=true" >> $GITHUB_ENV
+          fi
+
+      - name: Upload boot.img
+        if: env.BOOT_FOUND == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot
+          path: boot.img
+
+      - name: Upload dtb files
+        if: env.DTB_FOUND == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtb
+          path: dtb.tar.gz
