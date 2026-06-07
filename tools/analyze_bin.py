@@ -149,9 +149,11 @@ def try_extract_tar(path, outdir):
 
 
 def try_binwalk(path, outdir):
-    stdout, stderr, rc = run(f"binwalk --extract --depth=8 --directory={outdir} {path}", timeout=300)
+    stdout, stderr, rc = run(
+        f"binwalk --extract --depth=3 --count=50 --directory={outdir} {path}",
+        timeout=300
+    )
     return stdout, stderr
-
 
 def try_7z(path, outdir):
     stdout, stderr, rc = run(f"7z x -o{outdir} -y {path}", timeout=300)
