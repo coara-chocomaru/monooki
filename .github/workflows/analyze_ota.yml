@@ -1,0 +1,247 @@
+name: OTA BIN Analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      bin_url:
+        description: "Direct URL to .bin OTA file"
+        required: true
+        type: string
+      filename:
+        description: "Local filename to save as (default: firmware.bin)"
+        required: false
+        default: "firmware.bin"
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            binwalk \
+            p7zip-full \
+            lz4 \
+            bzip2 \
+            xz-utils \
+            e2tools \
+            e2fsprogs \
+            android-sdk-libsparse-utils \
+            xxd \
+            binutils \
+            file \
+            curl \
+            wget \
+            python3 \
+            python3-pip \
+            strings \
+            unzip \
+            tar \
+            gzip || true
+
+      - name: Install Python dependencies
+        run: |
+          pip3 install --quiet \
+            brotli \
+            protobuf \
+            six \
+            lz4 || true
+
+      - name: Install payload-dumper-go
+        run: |
+          ARCH="linux_amd64"
+          LATEST=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+            | grep "browser_download_url" \
+            | grep "$ARCH" \
+            | cut -d '"' -f 4 | head -1)
+          if [ -n "$LATEST" ]; then
+            wget -q "$LATEST" -O payload-dumper-go.tar.gz
+            tar xf payload-dumper-go.tar.gz
+            sudo mv payload-dumper-go /usr/local/bin/ 2>/dev/null || true
+          fi
+        continue-on-error: true
+
+      - name: Download OTA .bin file
+        run: |
+          echo "Downloading from: ${{ github.event.inputs.bin_url }}"
+          wget \
+            --no-check-certificate \
+            --retry-connrefused \
+            --tries=5 \
+            --timeout=300 \
+            --progress=dot:mega \
+            -O "${{ github.event.inputs.filename }}" \
+            "${{ github.event.inputs.bin_url }}"
+          ls -lh "${{ github.event.inputs.filename }}"
+          file "${{ github.event.inputs.filename }}"
+          xxd "${{ github.event.inputs.filename }}" | head -32
+
+      - name: Create output directory
+        run: mkdir -p extracted
+
+      - name: Run analysis script
+        env:
+          BIN_FILE: "${{ github.event.inputs.filename }}"
+          OUTPUT_DIR: "extracted"
+        run: |
+          python3 tools/analyze_bin.py
+        continue-on-error: true
+
+      - name: Run binwalk directly (fallback verbose)
+        run: |
+          binwalk \
+            --extract \
+            --depth=10 \
+            --directory=extracted/binwalk_direct \
+            "${{ github.event.inputs.filename }}" \
+            2>&1 | tee extracted/binwalk_direct.log || true
+        continue-on-error: true
+
+      - name: Try 7z extraction (fallback)
+        run: |
+          7z x \
+            -oextracted/7z_fallback \
+            -y \
+            "${{ github.event.inputs.filename }}" \
+            2>&1 | tee extracted/7z_fallback.log || true
+        continue-on-error: true
+
+      - name: Try simg2img
+        run: |
+          mkdir -p extracted/simg_fallback
+          simg2img \
+            "${{ github.event.inputs.filename }}" \
+            extracted/simg_fallback/converted.img \
+            2>&1 | tee extracted/simg_fallback.log || true
+        continue-on-error: true
+
+      - name: Try lz4 decompress
+        run: |
+          mkdir -p extracted/lz4_fallback
+          lz4 -d \
+            "${{ github.event.inputs.filename }}" \
+            extracted/lz4_fallback/decompressed.bin \
+            2>&1 | tee extracted/lz4_fallback.log || true
+        continue-on-error: true
+
+      - name: Try payload-dumper-go
+        run: |
+          mkdir -p extracted/payload_fallback
+          payload-dumper-go \
+            -output extracted/payload_fallback \
+            "${{ github.event.inputs.filename }}" \
+            2>&1 | tee extracted/payload_fallback.log || true
+        continue-on-error: true
+
+      - name: Try unzip
+        run: |
+          mkdir -p extracted/unzip_fallback
+          unzip -o \
+            "${{ github.event.inputs.filename }}" \
+            -d extracted/unzip_fallback \
+            2>&1 | tee extracted/unzip_fallback.log || true
+        continue-on-error: true
+
+      - name: Try tar
+        run: |
+          mkdir -p extracted/tar_fallback
+          tar xf \
+            "${{ github.event.inputs.filename }}" \
+            -C extracted/tar_fallback \
+            2>&1 | tee extracted/tar_fallback.log || true
+        continue-on-error: true
+
+      - name: Try ext2 debugfs listing
+        run: |
+          mkdir -p extracted/ext_fallback
+          debugfs -R "ls -l /" \
+            "${{ github.event.inputs.filename }}" \
+            > extracted/ext_fallback/ls.txt 2>&1 || true
+          debugfs -R "rdump / extracted/ext_fallback/rootfs" \
+            "${{ github.event.inputs.filename }}" \
+            >> extracted/ext_fallback/ls.txt 2>&1 || true
+        continue-on-error: true
+
+      - name: File header and strings analysis
+        run: |
+          {
+            echo "=== file ==="
+            file "${{ github.event.inputs.filename }}"
+            echo ""
+            echo "=== xxd header (first 512 bytes) ==="
+            xxd "${{ github.event.inputs.filename }}" | head -32
+            echo ""
+            echo "=== xxd at offset 0x100 ==="
+            xxd -s 0x100 -l 256 "${{ github.event.inputs.filename }}" || true
+            echo ""
+            echo "=== interesting strings ==="
+            strings -n 6 "${{ github.event.inputs.filename }}" \
+              | grep -iE \
+                "android|version|build|kernel|boot|system|recovery|partition|qualcomm|qcom|msm|vendor|product|model|[0-9]+\.[0-9]+\.[0-9]+" \
+              | head -200 || true
+          } > extracted/header_strings_analysis.txt 2>&1
+        continue-on-error: true
+
+      - name: Generate file tree
+        run: |
+          find extracted -type f \
+            | sort \
+            | xargs -I{} sh -c 'echo "$(du -sh {} 2>/dev/null | cut -f1)\t{}"' \
+            > extracted/file_tree.txt 2>&1 || true
+          wc -l extracted/file_tree.txt || true
+          cat extracted/file_tree.txt | head -100 || true
+        continue-on-error: true
+
+      - name: Check total extracted size
+        run: |
+          du -sh extracted/ || true
+          find extracted -type f | wc -l || true
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-analysis-${{ github.run_number }}
+          path: |
+            extracted/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload original .bin
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-bin-${{ github.run_number }}
+          path: "${{ github.event.inputs.filename }}"
+          retention-days: 7
+          if-no-files-found: warn
+        continue-on-error: true
+
+      - name: Print summary
+        run: |
+          echo "### Analysis Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**File:** ${{ github.event.inputs.filename }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ github.event.inputs.bin_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**SHA256:**" >> $GITHUB_STEP_SUMMARY
+          sha256sum "${{ github.event.inputs.filename }}" >> $GITHUB_STEP_SUMMARY || true
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**file output:**" >> $GITHUB_STEP_SUMMARY
+          file "${{ github.event.inputs.filename }}" >> $GITHUB_STEP_SUMMARY || true
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Extracted file count:**" >> $GITHUB_STEP_SUMMARY
+          find extracted -type f | wc -l >> $GITHUB_STEP_SUMMARY || true
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f extracted/summary.txt ]; then
+            echo "**Analysis Summary:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat extracted/summary.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
