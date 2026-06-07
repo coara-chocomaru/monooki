@@ -22,11 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Clean runner diag logs
-        run: |
-          find /home/runner/actions-runner -name "*.log" \
-            -mtime +1 -delete 2>/dev/null || true
-
       - name: Free disk space
         run: |
           sudo rm -rf \
@@ -41,8 +36,8 @@ jobs:
             /var/lib/apt/lists \
             "$AGENT_TOOLSDIRECTORY" || true
           sudo apt-get clean || true
-          docker system prune -af || true
           df -h
+          df -i
 
       - name: Install system dependencies
         run: |
@@ -63,7 +58,6 @@ jobs:
             wget \
             python3 \
             python3-pip \
-            strings \
             unzip \
             tar \
             gzip || true
@@ -118,9 +112,10 @@ jobs:
 
       - name: Run binwalk directly (fallback verbose)
         run: |
-          timeout 120 binwalk \
+          timeout 60 binwalk \
             --extract \
-            --depth=4 \
+            --depth=2 \
+            --count=30 \
             --directory=extracted/binwalk_direct \
             "${{ github.event.inputs.filename }}" \
             2>&1 | tee extracted/binwalk_direct.log || true
@@ -217,6 +212,16 @@ jobs:
           } > extracted/header_strings_analysis.txt 2>&1
         continue-on-error: true
 
+      - name: Check disk and inode usage before upload
+        run: |
+          df -h
+          df -i
+          du -sh extracted/ || true
+          find extracted -type f | wc -l || true
+          find extracted -type f -size +50M \
+            | xargs -I{} sh -c 'echo "Large: {}"; ls -lh {}' || true
+        continue-on-error: true
+
       - name: Generate file tree
         run: |
           find extracted -type f \
@@ -227,17 +232,11 @@ jobs:
           cat extracted/file_tree.txt | head -100 || true
         continue-on-error: true
 
-      - name: Check total extracted size
-        run: |
-          du -sh extracted/ || true
-          find extracted -type f | wc -l || true
-
       - name: Upload analysis artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ota-analysis-${{ github.run_number }}
-          path: |
-            extracted/
+          path: extracted/
           retention-days: 30
           if-no-files-found: warn
 
