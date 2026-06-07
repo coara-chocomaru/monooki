@@ -22,6 +22,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Clean runner diag logs
+        run: |
+          find /home/runner/actions-runner -name "*.log" \
+            -mtime +1 -delete 2>/dev/null || true
+
       - name: Free disk space
         run: |
           sudo rm -rf \
