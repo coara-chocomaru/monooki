@@ -19,57 +19,17 @@ jobs:
       - name: Download kernel.img
         run: |
           curl -fsSL -o kernel.img \
-            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/kernel.img"
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils gzip xz-utils bzip2 lzma lzop lz4 zstd u-boot-tools
+          sudo apt-get install -y binutils gzip xz-utils bzip2 lzma lzop lz4 zstd
 
-      - name: Inspect kernel.img
-        run: |
-          echo "=== file ==="
-          file kernel.img
-          echo "=== hexdump first 256 bytes ==="
-          hexdump -C kernel.img | head -20
+      - name: Decompress kernel.img to vmlinux
+        run: ./extract-vmlinux kernel.img > vmlinux
 
-      - name: Try to obtain vmlinux
-        run: |
-          if file kernel.img | grep -q ELF; then
-            echo "kernel.img is already an ELF file, using it directly"
-            cp kernel.img vmlinux
-          else
-            echo "Trying extract-vmlinux directly..."
-            ./extract-vmlinux kernel.img > vmlinux.tmp 2>/dev/null
-            if file vmlinux.tmp | grep -q ELF; then
-              mv vmlinux.tmp vmlinux
-              echo "Success using extract-vmlinux"
-            else
-              echo "Direct extract failed, checking for uImage header..."
-              if dd if=kernel.img bs=64 count=1 2>/dev/null | hexdump -C | grep -q "27 05 19 56"; then
-                echo "uImage header detected, stripping 64 bytes"
-                dd if=kernel.img of=kernel.img.stripped bs=64 skip=1 2>/dev/null
-                ./extract-vmlinux kernel.img.stripped > vmlinux 2>/dev/null
-                if ! file vmlinux | grep -q ELF; then
-                  echo "ERROR: Even after stripping uImage header, no ELF found"
-                  exit 1
-                fi
-              else
-                echo "ERROR: No known compression signature and no uImage header. kernel.img is not a valid kernel image."
-                exit 1
-              fi
-            fi
-          fi
-
-      - name: Validate vmlinux
-        run: |
-          if ! file vmlinux | grep -q ELF; then
-            echo "Final validation failed: vmlinux is not an ELF file"
-            exit 1
-          fi
-          echo "vmlinux validation passed"
-
-      - name: Extract kallsyms
+      - name: Extract kallsyms from vmlinux
         run: nm -n vmlinux > kallsyms.txt
 
       - name: Upload artifact
