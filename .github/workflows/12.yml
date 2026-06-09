@@ -1,4 +1,4 @@
-name: Extract vmlinux and kallsyms (vmlinux-to-elf)
+name: Extract vmlinux and kallsyms
 
 on:
   workflow_dispatch:
@@ -16,32 +16,27 @@ jobs:
             "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
           chmod +x extract-vmlinux
 
-      - name: Download zImage kernel.img
+      - name: Download kernel.img (zImage)
         run: |
           curl -fsSL -o kernel.img \
             "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
 
-      - name: Install dependencies and tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip
-          sudo pip3 install --upgrade lz4 zstandard git+https://github.com/marin-m/vmlinux-to-elf
+          sudo pip3 install vmlinux-to-elf
 
       - name: Decompress zImage to raw vmlinux
-        run: |
-          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
 
-      - name: Extract kallsyms addresses and symbols directly
-        run: |
-          kallsyms-finder vmlinux.raw > kallsyms.txt
+      - name: Convert raw vmlinux to fully analyzable ELF
+        run: vmlinux-to-elf vmlinux.raw vmlinux.elf
 
-      - name: Verify output
-        run: |
-          echo "Total lines: $(wc -l < kallsyms.txt)"
-          echo "First 5 entries:"
-          head -5 kallsyms.txt
+      - name: Extract kallsyms (addresses + symbols) from the ELF file
+        run: kallsyms-finder vmlinux.elf > kallsyms.txt
 
-      - name: Upload artifact
+      - name: Upload kallsyms artifact
         uses: actions/upload-artifact@v4
         with:
           name: kallsyms
