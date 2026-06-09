@@ -1,0 +1,53 @@
+name: Extract vmlinux and kallsyms (vmlinux-to-elf)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download zImage kernel.img
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip
+          sudo pip3 install --upgrade lz4 zstandard git+https://github.com/marin-m/vmlinux-to-elf
+
+      - name: Decompress zImage to raw vmlinux
+        run: |
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+
+      - name: Convert to ELF with explicit base address
+        run: |
+          vmlinux-to-elf --override-relative-base 0xffffff8008080000 --force vmlinux.raw vmlinux.elf
+
+      - name: Extract kallsyms with addresses
+        run: |
+          kallsyms-finder vmlinux.elf > kallsyms.txt
+
+      - name: Verify output
+        run: |
+          echo "Total lines: $(wc -l < kallsyms.txt)"
+          echo "First 5 entries:"
+          head -5 kallsyms.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
