@@ -21,16 +21,16 @@ jobs:
           curl -fsSL -o kernel.img \
             "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
 
-      - name: Install dependencies
+      - name: Install dependencies including ARM64 binutils
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils gzip xz-utils bzip2 lzma lzop lz4 zstd
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd
 
       - name: Decompress kernel.img to vmlinux
         run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux
 
-      - name: Extract kallsyms from vmlinux
-        run: nm -n vmlinux > kallsyms.txt
+      - name: Extract kallsyms from ARM64 vmlinux
+        run: aarch64-linux-gnu-nm -n vmlinux > kallsyms.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
