@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y binutils gzip xz-utils bzip2 lzma lzop lz4 zstd
 
       - name: Decompress kernel.img to vmlinux
-        run: ./extract-vmlinux kernel.img > vmlinux
+        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux
 
       - name: Extract kallsyms from vmlinux
         run: nm -n vmlinux > kallsyms.txt
