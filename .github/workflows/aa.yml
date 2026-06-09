@@ -1,0 +1,53 @@
+name: Extract vmlinux and kallsyms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download kernel.img (zImage)
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd
+
+      - name: Decompress zImage to vmlinux
+        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux
+
+      - name: Try to extract standard symbols via nm
+        run: |
+          aarch64-linux-gnu-nm -n vmlinux > kallsyms.txt 2>/dev/null || true
+          if [ ! -s kallsyms.txt ]; then
+            echo "nm produced no symbols, trying objdump..." >&2
+            aarch64-linux-gnu-objdump -t vmlinux | grep -E ' (t|T|d|D|b|B|r|R) ' | awk '{print $1 " " $4 " " $6}' | sort -n > kallsyms.txt
+          fi
+
+      - name: If still no symbols, search for specific kallsyms by patterns
+        run: |
+          if [ ! -s kallsyms.txt ]; then
+            echo "No standard symbol table found. Extracting possible kallsyms via strings and grep..." >&2
+            strings vmlinux | grep -E '^[_a-zA-Z][_a-zA-Z0-9]*$' | sort -u > possible_symbols.txt
+            grep -E '_head$|init_user_ns$|start_kernel$|rest_init$|kernel_init$|smp_init$|do_initcalls$|setup_arch$' possible_symbols.txt > kallsyms.txt || true
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
