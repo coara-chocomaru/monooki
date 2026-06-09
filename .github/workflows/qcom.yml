@@ -1,4 +1,4 @@
-name: Build
+name: Build CVE-2021-1961 (tamirzb)
 
 on:
   workflow_dispatch:
@@ -21,16 +21,14 @@ jobs:
       - name: Build with ndk-build
         run: |
           cd exploit
-          ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk
+          # The repository has jni/Android.mk and jni/Application.mk
+          # ndk-build automatically looks for jni/ folder
+          ndk-build NDK_PROJECT_PATH=. APP_ABI=arm64-v8a armeabi-v7a
 
-      - name: Upload artifact (armeabi-v7a)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: qseecom_exploit_v7a
-          path: exploit/libs/armeabi-v7a/qseecom_exploit
-
-      - name: Upload artifact (arm64-v8a)
-        uses: actions/upload-artifact@v4
-        with:
-          name: qseecom_exploit_v8a
-          path: exploit/libs/arm64-v8a/qseecom_exploit
+          name: qseecom_exploit
+          path: |
+            exploit/libs/arm64-v8a/qseecom_exploit
+            exploit/libs/armeabi-v7a/qseecom_exploit
