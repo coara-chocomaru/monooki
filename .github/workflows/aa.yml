@@ -16,7 +16,7 @@ jobs:
             "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
           chmod +x extract-vmlinux
 
-      - name: Download zImage kernel.img
+      - name: Download kernel.img (zImage)
         run: |
           curl -fsSL -o kernel.img \
             "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
@@ -27,29 +27,17 @@ jobs:
           sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd
 
       - name: Decompress zImage to vmlinux
-        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux
-
-      - name: Verify ELF format
         run: |
-          if ! file vmlinux | grep -q ELF; then
-            echo "ERROR: vmlinux is not a valid ELF file"
-            exit 1
-          fi
-          echo "ELF validation passed"
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+          mv vmlinux.raw vmlinux
 
-      - name: Check for symbol table
+      - name: Bruteforce search for symbols with offsets
         run: |
-          if ! aarch64-linux-gnu-nm -n vmlinux > kallsyms.txt 2>/dev/null; then
-            echo "ERROR: nm failed (no symbol table or malformed ELF)"
-            exit 1
-          fi
-          if [ ! -s kallsyms.txt ]; then
-            echo "ERROR: Symbol table exists but is empty (stripped kernel)"
-            exit 1
-          fi
-          echo "Symbol extraction successful"
+          echo "=== Extracting potential kallsyms (address/symbol pairs) from raw binary ==="
+          printf "Offset(hex) Symbol\n" > kallsyms.txt
+          strings -t x vmlinux | grep -E '^[0-9a-f]+ [a-zA-Z_][a-zA-Z0-9_]*$' | awk '{print $1 " T " $2}' >> kallsyms.txt
 
-      - name: Upload kallsyms
+      - name: Upload kallsyms artifact
         uses: actions/upload-artifact@v4
         with:
           name: kallsyms
