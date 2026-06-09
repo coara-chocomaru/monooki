@@ -1,0 +1,67 @@
+name: Extract vmlinux and kallsyms (accurate)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download zImage
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd
+
+      - name: Extract raw kernel image (vmlinux)
+        run: |
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+
+      - name: Parse ARM64 header and compute base address
+        run: |
+          # Read text_offset (4 bytes little-endian at offset 8)
+          TEXT_OFFSET_HEX=$(dd if=vmlinux.raw bs=1 skip=8 count=4 2>/dev/null | hexdump -e '1/4 "%08x\n"')
+          if [ -z "$TEXT_OFFSET_HEX" ] || [ "$TEXT_OFFSET_HEX" = "00000000" ]; then
+            TEXT_OFFSET_HEX="00080000"
+          fi
+          echo "text_offset = 0x$TEXT_OFFSET_HEX"
+
+          KERNEL_BASE="0xffffff8008000000"
+          TEXT_OFFSET_DEC=$((0x$TEXT_OFFSET_HEX))
+          BASE_ADDR=$((KERNEL_BASE + TEXT_OFFSET_DEC))
+          echo "Computed base address = 0x$(printf '%x' $BASE_ADDR)"
+          echo "BASE_ADDR=$BASE_ADDR" >> $GITHUB_ENV
+          echo "TEXT_OFFSET=0x$TEXT_OFFSET_HEX" >> $GITHUB_ENV
+
+      - name: Extract kallsyms with correct virtual addresses
+        run: |
+          printf "%-18s %s\n" "Virtual Address" "Symbol" > kallsyms.txt
+          # Use 'strings' with offsets, filter plausible symbol names
+          strings -t x vmlinux.raw | \
+            grep -E '^[0-9a-f]+ [a-zA-Z_][a-zA-Z0-9_]*$' | \
+            while read offset sym; do
+              addr=$((BASE_ADDR + 0x$offset))
+              printf "0x%016x T %s\n" $addr "$sym" >> kallsyms.txt
+            done
+
+          echo "Extracted $(wc -l < kallsyms.txt) entries."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
