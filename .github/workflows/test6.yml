@@ -1,0 +1,57 @@
+name: Extract vmlinux and kallsyms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux script from Linux kernel source
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download script from Linux kernel source
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/kernel.img"
+          chmod +x kernel.img
+
+      - name: Install decompression tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            gzip \
+            xz-utils \
+            bzip2 \
+            lzma \
+            lzop \
+            lz4 \
+            zstd
+
+      - name: Decompress kernel.img to vmlinux
+        run: ./extract-vmlinux kernel.img > vmlinux
+
+      - name: Validate vmlinux is a valid ELF
+        run: |
+          if ! file vmlinux | grep -q ELF; then
+            echo "Error: vmlinux is not a valid ELF file"
+            exit 1
+          fi
+          echo "vmlinux validation passed"
+
+      - name: Extract sorted kallsyms from vmlinux
+        run: nm -n vmlinux > kallsyms.txt
+
+      - name: Upload kallsyms as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
