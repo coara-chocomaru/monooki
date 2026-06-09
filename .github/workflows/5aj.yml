@@ -1,25 +1,51 @@
-name: Build CVE-2021-1961 Exploit
+name: Extract vmlinux and kallsyms
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  extract:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install cross compiler
-        run: sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
-
-      - name: Compile exploit
+      - name: Download extract-vmlinux
         run: |
-          aarch64-linux-gnu-gcc -static -o exploit exploit.c -lpthread
-          strip exploit
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
 
-      - name: Upload artifact
+      - name: Download zImage kernel.img
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd
+
+      - name: Decompress zImage to vmlinux (raw binary)
+        run: |
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+          mv vmlinux.raw vmlinux
+
+      - name: Install vmlinux-to-elf
+        run: |
+          sudo apt-get install -y python3-pip
+          sudo pip3 install --upgrade lz4 zstandard
+          sudo pip3 install git+https://github.com/marin-m/vmlinux-to-elf
+
+      - name: Convert vmlinux to fully analyzable ELF
+        run: vmlinux-to-elf vmlinux vmlinux.elf
+
+      - name: Extract kallsyms with addresses from ELF
+        run: kallsyms-finder vmlinux.elf > kallsyms.txt
+
+      - name: Upload kallsyms artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cve-2021-1961
-          path: exploit
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
