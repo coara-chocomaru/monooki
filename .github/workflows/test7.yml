@@ -1,0 +1,28 @@
+name: Extract zImage from Android boot image
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'URL to the boot.img file'
+        required: true
+        default: 'https://example.com/path/to/boot.img'
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install abootimg
+        run: sudo apt-get update && sudo apt-get install -y abootimg
+
+      - name: Download boot image
+        run: curl -L -o boot.img "${{ github.event.inputs.boot_img_url }}"
+
+      - name: Extract kernel image
+        run: abootimg -x boot.img
+
+      - name: Upload zImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zImage
+          path: zImage
