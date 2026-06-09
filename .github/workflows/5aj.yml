@@ -1,4 +1,4 @@
-name: Build MSM8940 Kernel Exploit
+name: Build CVE-2021-1961 Exploit
 
 on:
   workflow_dispatch:
@@ -13,13 +13,13 @@ jobs:
       - name: Install cross compiler
         run: sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
 
-      - name: Compile exploit for aarch64
+      - name: Compile exploit
         run: |
-          aarch64-linux-gnu-gcc -static -o exploit exploit.c
+          aarch64-linux-gnu-gcc -static -o exploit exploit.c -lpthread
           strip exploit
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: exploit-msm8940
+          name: cve-2021-1961
           path: exploit
