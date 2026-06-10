@@ -1,4 +1,4 @@
-name: Build
+name: Build CVE-2022-25721 PoC for ARM64 Android 9
 
 on:
   workflow_dispatch:
@@ -16,20 +16,12 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: Compile PoC with NDK (static, API 28)
+      - name: Compile PoC for ARM64 (dynamic PIE)
         run: |
           NDK_ROOT=${ANDROID_NDK_HOME}
           CLANG_PATH="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-          
-          if [ ! -f "${CLANG_PATH}" ]; then
-            echo "ERROR: clang not found at ${CLANG_PATH}"
-            exit 1
-          fi
-          
-          # コンパイル実行
           ${CLANG_PATH} \
             -target aarch64-linux-android28 \
-            -static \
             -O2 \
             -Wall \
             -Wno-unused-variable \
@@ -37,9 +29,6 @@ jobs:
             -Wno-int-to-void-pointer-cast \
             -o poc \
             test.c
-          
-          file poc
-          ls -la poc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
