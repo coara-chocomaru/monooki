@@ -7,11 +7,13 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <err.h>
 #include <signal.h>
 #include <pthread.h>
 #include <sched.h>
