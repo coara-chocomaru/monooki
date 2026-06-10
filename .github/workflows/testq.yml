@@ -1,4 +1,5 @@
 name: Build 
+
 on: workflow_dispatch
 
 jobs:
@@ -8,15 +9,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Android NDK
-        uses: nanasess/setup-ndk@v1
-        with:
-          ndk-version: 'r25c'
+      - name: Install cross compiler
+        run: sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
 
       - name: Compile PoC
-        run: |
-          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++ \
-            -o poc poc.cpp -lbinder -lutils
+        run: aarch64-linux-gnu-gcc -static -o poc test.c -lpthread
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
