@@ -28,7 +28,7 @@ jobs:
             -Wno-pointer-to-int-cast \
             -Wno-int-to-void-pointer-cast \
             -o poc \
-            poc.c
+            test.c
           file poc
           ls -la poc
 
