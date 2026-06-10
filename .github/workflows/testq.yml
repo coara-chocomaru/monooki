@@ -1,6 +1,7 @@
-name: Build 
+name: Build
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -9,14 +10,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install cross compiler
-        run: sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
 
-      - name: Compile PoC
-        run: aarch64-linux-gnu-gcc -static -o poc test.c -lpthread
+      - name: Compile PoC with NDK (static, API 28)
+        run: |
+          ${ANDROID_NDK_HOME}/bin/aarch64-linux-android28-clang \
+            -static \
+            -O2 \
+            -Wall \
+            -Wno-unused-variable \
+            -Wno-pointer-to-int-cast \
+            -Wno-int-to-void-pointer-cast \
+            -o poc \
+            test.c
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: poc
+          name: poc-android9-arm64
           path: poc
