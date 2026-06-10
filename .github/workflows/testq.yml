@@ -16,11 +16,11 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      - name: Compile PoC for ARM64 (dynamic PIE)
+      - name: Compile PoC (dynamic PIE, API 28)
         run: |
           NDK_ROOT=${ANDROID_NDK_HOME}
-          CLANG_PATH="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-          ${CLANG_PATH} \
+          CLANG="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          ${CLANG} \
             -target aarch64-linux-android28 \
             -O2 \
             -Wall \
@@ -28,7 +28,9 @@ jobs:
             -Wno-pointer-to-int-cast \
             -Wno-int-to-void-pointer-cast \
             -o poc \
-            test.c
+            poc.c
+          file poc
+          ls -la poc
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
