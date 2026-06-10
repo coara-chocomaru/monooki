@@ -1,4 +1,4 @@
-name: Build
+name: Build CVE-2022-25721 PoC for ARM64 Android 9
 
 on:
   workflow_dispatch:
@@ -18,7 +18,8 @@ jobs:
 
       - name: Compile PoC with NDK (static, API 28)
         run: |
-          ${ANDROID_NDK_HOME}/bin/aarch64-linux-android28-clang \
+          ${ANDROID_NDK_HOME}/bin/clang \
+            -target aarch64-linux-android28 \
             -static \
             -O2 \
             -Wall \
