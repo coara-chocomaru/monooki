@@ -1,0 +1,189 @@
+name: Ghidra MCP Full Assembly Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: '解析対象ファイルのダウンロードURL'
+        required: true
+        default: ''
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ghidra-mcp リポジトリの取得
+      - name: Checkout ghidra-mcp repository
+        uses: actions/checkout@v4
+        with:
+          repository: bethington/ghidra-mcp
+          path: ghidra-mcp
+
+      # JDK 17 のセットアップ (Ghidra の要件)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # Ghidra のダウンロードと展開
+      - name: Download and install Ghidra
+        run: |
+          GHIDRA_VERSION=11.2
+          GHIDRA_BUILD=20241219
+          wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_BUILD}.zip" -O ghidra.zip
+          unzip -q ghidra.zip -d /opt/
+          mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra
+          echo "GHIDRA_HOME=/opt/ghidra" >> $GITHUB_ENV
+
+      # Python 環境
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 必要な Python パッケージのインストール
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ghidra-bridge mcp
+          # ghidra-mcp 独自の依存関係があればインストール
+          if [ -f ghidra-mcp/requirements.txt ]; then
+            pip install -r ghidra-mcp/requirements.txt
+          fi
+
+      # 解析対象ファイルのダウンロード
+      - name: Download target file
+        run: |
+          FILE_URL="${{ github.event.inputs.file_url }}"
+          echo "Downloading from: $FILE_URL"
+          wget -q "$FILE_URL" -O /tmp/target.bin
+          file /tmp/target.bin
+
+      # Ghidra Bridge サーバの起動 (ヘッドレス)
+      - name: Start Ghidra Bridge Server in headless mode
+        run: |
+          export GHIDRA_HOME=/opt/ghidra
+          PROJECT_DIR=$(mktemp -d)
+          echo "Starting Ghidra Bridge Server with project directory: $PROJECT_DIR"
+          nohup ghidra_bridge_server --headless --project-location "$PROJECT_DIR" > /tmp/bridge_server.log 2>&1 &
+          echo $! > /tmp/bridge_server.pid
+          # サーバがポート 4768 で待ち受け始めるまで待つ
+          echo "Waiting for bridge server..."
+          for i in $(seq 1 30); do
+            if echo > /dev/tcp/localhost/4768 2>/dev/null; then
+              echo "Bridge server is ready."
+              break
+            fi
+            echo "Retry $i..."
+            sleep 2
+          done
+
+      # MCP クライアントスクリプトの作成
+      - name: Create MCP client analysis script
+        run: |
+          cat << 'PYEOF' > /tmp/client_analyze.py
+          import asyncio, sys, os, time, json
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          TARGET_FILE = os.environ["TARGET_FILE"]
+          OUTPUT_FILE = os.environ["OUTPUT_FILE"]
+          GHIDRA_MCP_DIR = "ghidra-mcp"   # checkout したディレクトリ
+
+          async def run_analysis():
+              # MCP サーバを stdio 経由で起動
+              server_params = StdioServerParameters(
+                  command=[sys.executable, "server.py"],
+                  cwd=GHIDRA_MCP_DIR,
+              )
+
+              async with stdio_client(server_params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      tools_result = await session.list_tools()
+                      tool_names = [t.name for t in tools_result.tools]
+                      print(f"Available tools: {tool_names}")
+
+                      # プログラムを開く (open_program / load_program のどちらか)
+                      if "open_program" in tool_names:
+                          print("Using open_program")
+                          await session.call_tool("open_program", {"path": TARGET_FILE})
+                      elif "load_program" in tool_names:
+                          print("Using load_program")
+                          await session.call_tool("load_program", {"path": TARGET_FILE})
+                      else:
+                          raise RuntimeError("No suitable tool to open a program found")
+
+                      # 解析完了を待つ (適宜調整)
+                      print("Waiting for auto-analysis...")
+                      for i in range(30):
+                          info = await session.call_tool("get_program_info", {})
+                          # ツールの出力形式によるが、analysis ステータスがあればチェック
+                          time.sleep(2)
+                      print("Analysis wait finished")
+
+                      # 解析結果のエクスポート
+                      # run_script ツールが使えれば Ghidra 内でスクリプト実行
+                      if "run_script" in tool_names:
+                          print("Exporting via run_script")
+                          export_script = r'''
+          import sys
+          listing = currentProgram.getListing()
+          with open("/tmp/disasm.txt", "w") as f:
+              inst_iter = listing.getInstructions(True)
+              while inst_iter.hasNext():
+                  inst = inst_iter.next()
+                  f.write("{}: {}\n".format(inst.getAddress(), inst))
+              data_iter = listing.getDefinedData(True)
+              while data_iter.hasNext():
+                  d = data_iter.next()
+                  f.write("{}: {}\n".format(d.getAddress(), d))
+          '''
+                          await session.call_tool("run_script", {"script": export_script})
+                      elif "list_functions" in tool_names and "get_assembly" in tool_names:
+                          print("Exporting function by function")
+                          funcs_resp = await session.call_tool("list_functions", {})
+                          # ツールの戻り値はテキストの可能性もあるので簡易パース
+                          func_names = [line.strip() for line in funcs_resp.content[0].text.splitlines() if line.strip()]
+                          with open(OUTPUT_FILE, "w") as f:
+                              for fname in func_names:
+                                  asm_resp = await session.call_tool("get_assembly", {"function_name": fname})
+                                  f.write(f"\n; Function: {fname}\n")
+                                  f.write(asm_resp.content[0].text + "\n")
+                      else:
+                          # 最終手段: ツール一覧を出力して手動確認を促す
+                          raise RuntimeError("Cannot export disassembly. Available tools: " + ", ".join(tool_names))
+
+                      print(f"Disassembly exported to {OUTPUT_FILE}")
+
+          if __name__ == "__main__":
+              asyncio.run(run_analysis())
+          PYEOF
+
+      # MCP サーバを起動しつつクライアントで解析実行
+      - name: Run MCP server and client analysis
+        run: |
+          cd ghidra-mcp
+          export PYTHONPATH=$PWD:$PYTHONPATH
+          python /tmp/client_analyze.py
+        env:
+          TARGET_FILE: /tmp/target.bin
+          OUTPUT_FILE: /tmp/disasm.txt
+
+      # アーティファクトとしてアップロード
+      - name: Upload disassembly artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-assembly-analysis
+          path: /tmp/disasm.txt
+
+      # 後片付け (任意)
+      - name: Stop Ghidra Bridge Server
+        if: always()
+        run: |
+          if [ -f /tmp/bridge_server.pid ]; then
+            kill "$(cat /tmp/bridge_server.pid)" || true
+          fi
