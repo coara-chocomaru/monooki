@@ -1,4 +1,4 @@
-name: Build CVE-2025-38352 PoC for 4.9 Kernel
+name: Build 
 
 on: workflow_dispatch
 
