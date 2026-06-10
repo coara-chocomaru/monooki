@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 static uint64_t commit_creds_addr = 0xffffff80080d82fc;
-static uint64_t prepare_kernel_cred_addr = 0xffffff8008a2b6e0;
+static uint64_t prepare_kernel_cred_addr = 0xffffff80080d87e4;
 
 static int mem_fd = -1;
 
