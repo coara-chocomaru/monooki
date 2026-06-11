@@ -1,4 +1,4 @@
-name: Analyze vmlinux.elf
+name: Analyze vmlinux.elf (Deep)
 
 on:
   workflow_dispatch:
@@ -13,12 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y wget curl file binutils jq python3 python3-requests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl file binutils jq python3 python3-requests radare2
 
       - name: Download vmlinux.elf
         run: wget -O vmlinux.elf "${{ github.event.inputs.url }}"
 
-      - name: Analyze binary
+      - name: Basic information
         run: |
           echo "=== Vulnerability Analysis Report for vmlinux.elf ===" > report.txt
           echo "Date: $(date)" >> report.txt
@@ -29,17 +31,26 @@ jobs:
           echo "MD5: $(md5sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
           echo "SHA256: $(sha256sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
           echo "" >> report.txt
-          echo "=== Binary Hardening (checksec) ===" >> report.txt
+
+      - name: Binary hardening check
+        run: |
           wget https://raw.githubusercontent.com/slimm609/checksec.sh/master/checksec -O checksec.sh
           chmod +x checksec.sh
+          echo "=== Binary Hardening (checksec) ===" >> report.txt
           ./checksec.sh --file=vmlinux.elf >> report.txt
           echo "" >> report.txt
+
+      - name: Kernel version & interesting strings
+        run: |
           echo "=== Kernel Version Strings ===" >> report.txt
           strings vmlinux.elf | grep -i 'Linux version' >> report.txt || echo "No Linux version string found." >> report.txt
           echo "" >> report.txt
           echo "=== Other Notable Strings ===" >> report.txt
           strings vmlinux.elf | grep -iE 'android|qualcomm|msm|qcom' | sort -u | head -50 >> report.txt
           echo "" >> report.txt
+
+      - name: CVE search via NVD (kernel version based)
+        run: |
           python3 - "$PWD" << 'PYEOF'
           import sys, os, re, json, subprocess
           import requests
@@ -120,10 +131,39 @@ jobs:
                   f.write(f"{sc}: {status}\n")
               f.write("\n")
           PYEOF
+
+      - name: Generate full disassembly (objdump)
+        run: |
+          mkdir -p decompiled
+          aarch64-linux-gnu-objdump -d vmlinux.elf > decompiled/full_disasm.txt
+          echo "=== Disassembly generated ===" >> report.txt
+
+      - name: Generate pseudo-C with radare2
+        run: |
+          # Export all function names and decompile one by one (limited to first 500 functions to avoid timeout)
+          r2 -q -c 'aaa; afl~[0]' vmlinux.elf | head -500 > funcs.txt
+          > decompiled/pseudocode.c
+          while IFS= read -r fname; do
+            echo "// Function: $fname" >> decompiled/pseudocode.c
+            r2 -q -c "aaa; s $fname; pdc" vmlinux.elf >> decompiled/pseudocode.c 2>/dev/null || true
+            echo "" >> decompiled/pseudocode.c
+          done < funcs.txt
+          echo "=== Pseudo-C generation completed ($(wc -l < funcs.txt) functions) ===" >> report.txt
+
+      - name: Search dangerous function calls
+        run: |
+          echo "=== Dangerous Function Usage ===" >> report.txt
+          strings vmlinux.elf | grep -iE '\b(strcpy|strcat|sprintf|vsprintf|gets|scanf|memcpy|memset|memmove|copy_from_user|copy_to_user)\b' | sort | uniq -c | sort -rn >> report.txt
+          echo "" >> report.txt
+
+      - name: Finalize report
+        run: |
           echo "=== Analysis Complete ===" >> report.txt
 
-      - name: Upload report
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vulnerability-report
-          path: report.txt
+          name: vulnerability-analysis
+          path: |
+            report.txt
+            decompiled/
