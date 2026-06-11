@@ -1,196 +1,181 @@
-name: Analyze vmlinux.elf (Deep)
-
+name: BootIMG to Device Tree
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: 'URL to vmlinux.elf'
-        required: true
-        type: string
-
+      boot_img_url:
+        description: 'Direct URL to boot.img (optional)'
+        required: false
+        default: ''
 jobs:
-  analyze:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl file binutils jq python3 python3-requests radare2 llvm
-
-      - name: Download vmlinux.elf
-        run: wget -O vmlinux.elf "${{ github.event.inputs.url }}"
-
-      - name: Basic information
+          sudo apt-get install -y wget unzip cpio device-tree-compiler python3 git gcc make flex bison libssl-dev
+      - name: Download boot.img
         run: |
-          echo "=== Vulnerability Analysis Report for vmlinux.elf ===" > report.txt
-          echo "Date: $(date)" >> report.txt
-          echo "" >> report.txt
-          echo "=== File Information ===" >> report.txt
-          file vmlinux.elf >> report.txt
-          echo "Size: $(stat -c %s vmlinux.elf) bytes" >> report.txt
-          echo "MD5: $(md5sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
-          echo "SHA256: $(sha256sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
-          echo "" >> report.txt
-
-      - name: Binary hardening check (checksec)
+          if [ -z "${{ github.event.inputs.boot_img_url }}" ]; then
+            echo "No URL provided, assuming boot.img is already in workspace"
+            if [ ! -f boot.img ]; then
+              echo "Error: boot.img not found and no URL given"
+              exit 1
+            fi
+          else
+            wget --tries=5 --timeout=30 --no-check-certificate -O boot.img "${{ github.event.inputs.boot_img_url }}"
+          fi
+          file boot.img
+          ls -lh boot.img
+      - name: Setup Android Image Kitchen
         run: |
-          wget https://raw.githubusercontent.com/slimm609/checksec.sh/master/checksec -O checksec.sh
-          chmod +x checksec.sh
-          echo "=== Binary Hardening (checksec) ===" >> report.txt
-          set +e
-          ./checksec.sh --file=vmlinux.elf >> report.txt 2>&1
-          echo "" >> report.txt
-          set -e
-
-      - name: Kernel version & interesting strings
+          git clone https://github.com/osm0sis/Android-Image-Kitchen.git aik
+          cd aik
+          chmod +x unpackimg.sh repackimg.sh
+      - name: Unpack boot.img with AIK
         run: |
-          echo "=== Kernel Version Strings ===" >> report.txt
-          strings vmlinux.elf | grep -i 'Linux version' >> report.txt || echo "No Linux version string found." >> report.txt
-          echo "" >> report.txt
-          echo "=== Other Notable Strings ===" >> report.txt
-          strings vmlinux.elf | grep -iE 'android|qualcomm|msm|qcom' | sort -u | head -50 >> report.txt
-          echo "" >> report.txt
-
-      - name: CVE search via NVD (kernel version based)
+          cd aik
+          ./unpackimg.sh ../boot.img
+          cp -r split_img ../split_img
+          cp -r ramdisk ../ramdisk 2>/dev/null || true
+          cd ..
+      - name: Extract DTB from boot.img-dtb
         run: |
-          python3 - "$PWD" << 'PYEOF'
-          import sys, os, re, json, subprocess
-          import requests
-          workspace = sys.argv[1]
-          vmlinux = os.path.join(workspace, "vmlinux.elf")
-          report_path = os.path.join(workspace, "report.txt")
-          def extract_strings(filepath):
-              try:
-                  res = subprocess.check_output(["strings", filepath], universal_newlines=True)
-              except:
-                  res = ""
-              return res
-          strings = extract_strings(vmlinux)
-          version = None
-          for line in strings.splitlines():
-              m = re.search(r'Linux version (\S+)', line)
-              if m:
-                  version = m.group(1)
+          if [ -f split_img/boot.img-dtb ]; then
+            cp split_img/boot.img-dtb ./dtb_original
+            echo "DTB extracted from boot.img"
+          else
+            echo "No combined dtb, trying to find dtb inside kernel"
+            if [ -f split_img/boot.img-zImage ]; then
+              dd if=split_img/boot.img-zImage of=kernel.gz bs=1 skip=$(($(strings -t d split_img/boot.img-zImage | grep -m1 'x00x00x00x00x00x00x00x00x00x00x00x00' | awk '{print $1}') 2>/dev/null || echo 0)) 2>/dev/null
+              echo "Kernel extracted"
+            fi
+            exit 1
+          fi
+      - name: Split DTB into multiple DTBs
+        run: |
+          if [ -f dtb_original ]; then
+            dtc -I dtb -O dts -o all_dump.dts dtb_original 2>/dev/null || true
+            if [ -f all_dump.dts ]; then
+              echo "Single DTS created"
+            else
+              python3 <<EOF
+          import struct
+          with open("dtb_original", "rb") as f:
+              data = f.read()
+          offset = 0
+          idx = 0
+          while offset < len(data):
+              if len(data) - offset < 8:
                   break
-          with open(report_path, "a") as f:
-              f.write("=== CVE Analysis based on kernel version ===\n")
-              if version:
-                  f.write(f"Detected kernel version: {version}\n")
-                  try:
-                      api_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-                      params = {
-                          "keywordSearch": f"Linux kernel {version}",
-                          "resultsPerPage": 50
-                      }
-                      resp = requests.get(api_url, params=params, timeout=30)
-                      if resp.status_code == 200:
-                          data = resp.json()
-                          vulns = data.get("vulnerabilities", [])
-                          f.write(f"Found {len(vulns)} potential CVEs mentioning this version.\n")
-                          f.write("Listing first 20:\n")
-                          for v in vulns[:20]:
-                              cve_id = v["cve"]["id"]
-                              desc = v["cve"]["descriptions"][0]["value"][:200] if v["cve"]["descriptions"] else "N/A"
-                              f.write(f"- {cve_id}: {desc}\n")
-                      else:
-                          f.write("Failed to query NVD.\n")
-                  except Exception as e:
-                      f.write(f"Error querying NVD: {e}\n")
+              magic = struct.unpack(">I", data[offset:offset+4])[0]
+              if magic == 0xd00dfeed:
+                  size = struct.unpack(">I", data[offset+4:offset+8])[0]
+                  with open(f"dtb_{idx:03d}.dtb", "wb") as out:
+                      out.write(data[offset:offset+size])
+                  idx += 1
+                  offset += size
               else:
-                  f.write("No Linux kernel version string found.\n")
-              f.write("\n")
-              f.write("=== Kernel Security Config Audit ===\n")
-              security_configs = [
-                  "CONFIG_DEBUG_RODATA",
-                  "CONFIG_DEBUG_SET_MODULE_RONX",
-                  "CONFIG_STRICT_KERNEL_RWX",
-                  "CONFIG_STRICT_MODULE_RWX",
-                  "CONFIG_STACKPROTECTOR",
-                  "CONFIG_STACKPROTECTOR_STRONG",
-                  "CONFIG_FORTIFY_SOURCE",
-                  "CONFIG_CC_STACKPROTECTOR",
-                  "CONFIG_SLAB_FREELIST_RANDOM",
-                  "CONFIG_SLAB_FREELIST_HARDENED",
-                  "CONFIG_HARDENED_USERCOPY",
-                  "CONFIG_RANDOMIZE_BASE",
-                  "CONFIG_PAGE_TABLE_ISOLATION",
-                  "CONFIG_RETPOLINE",
-                  "CONFIG_UNMAP_KERNEL_AT_EL0",
-                  "CONFIG_SECCOMP",
-                  "CONFIG_SECCOMP_FILTER",
-                  "CONFIG_SYN_COOKIES",
-                  "CONFIG_DEBUG_LIST",
-                  "CONFIG_BUG_ON_DATA_CORRUPTION",
-                  "CONFIG_SCHED_STACK_END_CHECK",
-                  "CONFIG_REFCOUNT_FULL",
-              ]
-              configs_found = set()
-              for line in strings.splitlines():
-                  if line.startswith("CONFIG_"):
-                      configs_found.add(line.split("=")[0].strip())
-              for sc in security_configs:
-                  status = "ENABLED" if sc in configs_found else "MISSING/Unknown"
-                  f.write(f"{sc}: {status}\n")
-              f.write("\n")
-          PYEOF
-
-      - name: Generate full disassembly (llvm-objdump)
+                  offset += 4
+          print(f"Split into {idx} dtb files")
+          EOF
+            fi
+          fi
+      - name: Convert all DTB to DTS
         run: |
-          mkdir -p decompiled
-          llvm-objdump-18 -d vmlinux.elf > decompiled/full_disasm.txt
-          echo "=== Full disassembly generated ===" >> report.txt
-
-      - name: Generate pseudo-C with radare2 (limited & timed)
+          mkdir dts_output
+          if [ -f all_dump.dts ]; then
+            cp all_dump.dts dts_output/device_tree.dts
+          else
+            for dtb in dtb_*.dtb; do
+              if [ -f "$dtb" ]; then
+                base=$(basename "$dtb" .dtb)
+                dtc -I dtb -O dts -o "dts_output/${base}.dts" "$dtb" 2>/dev/null
+              fi
+            done
+          fi
+          if [ -f split_img/boot.img-dtb ]; then
+            dtc -I dtb -O dts -o dts_output/full_dtb.dts split_img/boot.img-dtb 2>/dev/null || true
+          fi
+          echo "DTS files generated:"
+          ls -la dts_output/
+      - name: Auto-generate device tree makefiles
         run: |
-          mkdir -p decompiled
-          r2 -q -c 'aaa; afl~[0]' vmlinux.elf | head -200 > funcs.txt
-          echo "=== Starting decompilation of $(wc -l < funcs.txt) functions ===" >> report.txt
-          python3 - "$PWD" << 'PYEOF'
-          import subprocess, os, sys
-          workspace = sys.argv[1]
-          vmlinux = os.path.join(workspace, "vmlinux.elf")
-          funcs_file = os.path.join(workspace, "funcs.txt")
-          out_c = os.path.join(workspace, "decompiled", "pseudocode.c")
-          with open(funcs_file) as f:
-              funcs = [line.strip() for line in f if line.strip()]
-          with open(out_c, "w") as out:
-              for fn in funcs:
-                  out.write(f"// Function: {fn}\n")
-                  try:
-                      proc = subprocess.run(
-                          ["r2", "-q", "-c", f"aaa; s {fn}; pdc", vmlinux],
-                          capture_output=True,
-                          text=True,
-                          timeout=15
-                      )
-                      if proc.returncode == 0:
-                          out.write(proc.stdout)
-                      else:
-                          out.write(f"// Error: {proc.stderr.strip()}\n")
-                  except subprocess.TimeoutExpired:
-                      out.write("// Decompilation timed out (>15s)\n")
-                  except Exception as e:
-                      out.write(f"// Unexpected error: {e}\n")
-                  out.write("\n")
-          print(f"Decompilation completed: {len(funcs)} functions attempted", file=sys.stderr)
-          PYEOF
-          echo "=== Pseudo-C generation completed ===" >> report.txt
-
-      - name: Search dangerous function calls
+          mkdir device_tree_mk
+          SOC="MT6765"
+          MANUFACTURER="unknown"
+          DEVICE="iphone17_clone"
+          if ls dts_output/*.dts 1>/dev/null 2>&1; then
+            SOC=$(grep -oP 'compatible\s*=\s*"\K[^"]+' dts_output/*.dts | head -1 | grep -oP 'mt\d+' || echo "MT6765")
+            SOC=$(echo $SOC | tr '[:lower:]' '[:upper:]')
+            if grep -qi "mediatek" dts_output/*.dts; then
+              MANUFACTURER="mediatek"
+            fi
+          fi
+          cat > device_tree_mk/AndroidProducts.mk <<'MK1'
+          PRODUCT_MAKEFILES := \\
+              \$(LOCAL_DIR)/device.mk
+          MK1
+          cat > device_tree_mk/BoardConfig.mk <<'MK2'
+          USE_CAMERA_STUB := true
+          TARGET_ARCH := arm64
+          TARGET_ARCH_VARIANT := armv8-a
+          TARGET_CPU_ABI := arm64-v8a
+          TARGET_CPU_ABI2 :=
+          TARGET_CPU_VARIANT := generic
+          TARGET_CPU_VARIANT_RUNTIME := generic
+          TARGET_BOARD_PLATFORM := ${SOC,,}
+          TARGET_BOARD_PLATFORM_GPU := Mali-G52
+          TARGET_NO_BOOTLOADER := true
+          TARGET_NO_KERNEL := false
+          BOARD_USES_GENERIC_AUDIO := true
+          BOARD_USES_GENERIC_INVENSENSE := true
+          BOARD_KERNEL_CMDLINE := $(cat split_img/boot.img-cmdline 2>/dev/null || echo "console=tty0")
+          BOARD_KERNEL_BASE := $(cat split_img/boot.img-base 2>/dev/null || echo "0x40000000")
+          BOARD_KERNEL_PAGESIZE := $(cat split_img/boot.img-pagesize 2>/dev/null || echo "2048")
+          BOARD_MKBOOTIMG_ARGS := --ramdisk_offset $(cat split_img/boot.img-ramdisk_offset 2>/dev/null || echo "0x01000000") --tags_offset $(cat split_img/boot.img-tags_offset 2>/dev/null || echo "0x00000100")
+          BOARD_KERNEL_IMAGE_NAME := Image.gz-dtb
+          TARGET_KERNEL_CONFIG := ${SOC,,}_defconfig
+          MK2
+          cat > device_tree_mk/device.mk <<'MK3'
+          \$(call inherit-product, \$(SRC_TARGET_DIR)/product/languages_full.mk)
+          \$(call inherit-product, \$(SRC_TARGET_DIR)/product/base.mk)
+          PRODUCT_NAME := ${DEVICE}
+          PRODUCT_DEVICE := ${DEVICE}
+          PRODUCT_MANUFACTURER := ${MANUFACTURER}
+          PRODUCT_BRAND := ${MANUFACTURER}
+          PRODUCT_MODEL := ${DEVICE}
+          PRODUCT_PROPERTY_OVERRIDES += \\
+              ro.product.model=${DEVICE} \\
+              ro.product.manufacturer=${MANUFACTURER}
+          MK3
+          cat > device_tree_mk/device_dependencies.mk <<'MK4'
+          # Auto-generated dependencies for ${SOC}
+          $(echo "# DTB files: $(ls dts_output/ 2>/dev/null)")
+          MK4
+          cat > device_tree_mk/Android.mk <<'MK5'
+          LOCAL_PATH := \$(call my-dir)
+          include \$(CLEAR_VARS)
+          LOCAL_MODULE := device_tree_files
+          LOCAL_MODULE_TAGS := optional
+          include \$(BUILD_PHONY_PACKAGE)
+          MK5
+          echo "Generated .mk files:"
+          ls -la device_tree_mk/
+      - name: Create final ZIP
         run: |
-          echo "=== Dangerous Function Usage ===" >> report.txt
-          strings vmlinux.elf | grep -iE '\b(strcpy|strcat|sprintf|vsprintf|gets|scanf|memcpy|memset|memmove|copy_from_user|copy_to_user)\b' | sort | uniq -c | sort -rn >> report.txt
-          echo "" >> report.txt
-
-      - name: Finalize report
-        run: |
-          echo "=== Analysis Complete ===" >> report.txt
-
-      - name: Upload artifacts
+          mkdir final_artifact
+          cp -r dts_output final_artifact/
+          cp -r device_tree_mk final_artifact/
+          cp split_img/boot.img-dtb final_artifact/ 2>/dev/null || true
+          cp boot.img final_artifact/ 2>/dev/null || true
+          cd final_artifact
+          zip -r ../device_tree_complete.zip .
+          cd ..
+          ls -lh device_tree_complete.zip
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vulnerability-analysis
-          path: |
-            report.txt
-            decompiled/
+          name: device_tree_auto_generated
+          path: device_tree_complete.zip
+          retention-days: 7
