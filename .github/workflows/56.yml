@@ -1,0 +1,44 @@
+name: Extract vmlinux and kallsyms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download kernel.img (zImage)
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage2"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip
+          sudo pip3 install --upgrade lz4 zstandard git+https://github.com/marin-m/vmlinux-to-elf
+
+      - name: Decompress zImage to raw vmlinux
+        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+
+      - name: Convert raw vmlinux to ELF with explicit base address
+        run: vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf
+
+      - name: Extract kallsyms from ELF
+        run: kallsyms-finder vmlinux.elf > kallsyms.txt
+
+      - name: Upload kallsyms artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: kallsyms.txt
+          retention-days: 30
