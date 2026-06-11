@@ -11,11 +11,12 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl file binutils jq python3 python3-requests radare2
+          sudo apt-get install -y wget curl file binutils jq python3 python3-requests radare2 llvm
 
       - name: Download vmlinux.elf
         run: wget -O vmlinux.elf "${{ github.event.inputs.url }}"
@@ -134,22 +135,47 @@ jobs:
               f.write("\n")
           PYEOF
 
-      - name: Generate full disassembly with radare2
+      - name: Generate full disassembly (llvm-objdump)
         run: |
           mkdir -p decompiled
-          r2 -q -c 'aaa; s 0; pD $S' vmlinux.elf > decompiled/full_disasm.txt
+          llvm-objdump-18 -d vmlinux.elf > decompiled/full_disasm.txt
           echo "=== Full disassembly generated ===" >> report.txt
 
-      - name: Generate pseudo-C with radare2
+      - name: Generate pseudo-C with radare2 (limited & timed)
         run: |
-          r2 -q -c 'aaa; afl~[0]' vmlinux.elf | head -500 > funcs.txt
-          > decompiled/pseudocode.c
-          while IFS= read -r fname; do
-            echo "// Function: $fname" >> decompiled/pseudocode.c
-            r2 -q -c "aaa; s $fname; pdc" vmlinux.elf >> decompiled/pseudocode.c 2>/dev/null || true
-            echo "" >> decompiled/pseudocode.c
-          done < funcs.txt
-          echo "=== Pseudo-C generation completed ($(wc -l < funcs.txt) functions) ===" >> report.txt
+          mkdir -p decompiled
+          r2 -q -c 'aaa; afl~[0]' vmlinux.elf | head -200 > funcs.txt
+          echo "=== Starting decompilation of $(wc -l < funcs.txt) functions ===" >> report.txt
+          python3 - "$PWD" << 'PYEOF'
+          import subprocess, os, sys
+          workspace = sys.argv[1]
+          vmlinux = os.path.join(workspace, "vmlinux.elf")
+          funcs_file = os.path.join(workspace, "funcs.txt")
+          out_c = os.path.join(workspace, "decompiled", "pseudocode.c")
+          with open(funcs_file) as f:
+              funcs = [line.strip() for line in f if line.strip()]
+          with open(out_c, "w") as out:
+              for fn in funcs:
+                  out.write(f"// Function: {fn}\n")
+                  try:
+                      proc = subprocess.run(
+                          ["r2", "-q", "-c", f"aaa; s {fn}; pdc", vmlinux],
+                          capture_output=True,
+                          text=True,
+                          timeout=15
+                      )
+                      if proc.returncode == 0:
+                          out.write(proc.stdout)
+                      else:
+                          out.write(f"// Error: {proc.stderr.strip()}\n")
+                  except subprocess.TimeoutExpired:
+                      out.write("// Decompilation timed out (>15s)\n")
+                  except Exception as e:
+                      out.write(f"// Unexpected error: {e}\n")
+                  out.write("\n")
+          print(f"Decompilation completed: {len(funcs)} functions attempted", file=sys.stderr)
+          PYEOF
+          echo "=== Pseudo-C generation completed ===" >> report.txt
 
       - name: Search dangerous function calls
         run: |
