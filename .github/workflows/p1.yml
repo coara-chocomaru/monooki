@@ -1,9 +1,9 @@
-name: BootIMG to Device Tree
+name: Kernel to Device Tree
 on:
   workflow_dispatch:
     inputs:
-      boot_img_url:
-        description: 'Direct URL to boot.img (optional)'
+      kernel_url:
+        description: 'Direct URL to kernel image (optional)'
         required: false
         default: ''
 jobs:
@@ -13,98 +13,72 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget unzip cpio device-tree-compiler python3 git gcc make flex bison libssl-dev
-      - name: Download boot.img
+          sudo apt-get install -y wget device-tree-compiler python3 git gcc make
+      - name: Download kernel
         run: |
-          if [ -z "${{ github.event.inputs.boot_img_url }}" ]; then
-            echo "No URL provided, assuming boot.img is already in workspace"
-            if [ ! -f boot.img ]; then
-              echo "Error: boot.img not found and no URL given"
+          if [ -z "${{ github.event.inputs.kernel_url }}" ]; then
+            echo "No URL provided, assuming kernel file is already in workspace"
+            if [ ! -f kernel ]; then
+              echo "Error: kernel not found and no URL given"
               exit 1
             fi
           else
-            wget --tries=5 --timeout=30 --no-check-certificate -O boot.img "${{ github.event.inputs.boot_img_url }}"
+            wget --tries=5 --timeout=30 --no-check-certificate -O kernel "${{ github.event.inputs.kernel_url }}"
           fi
-          file boot.img
-          ls -lh boot.img
-      - name: Setup Android Image Kitchen
+          file kernel
+          ls -lh kernel
+      - name: Setup extract-dtb
         run: |
-          git clone https://github.com/osm0sis/Android-Image-Kitchen.git aik
-          cd aik
-          chmod +x unpackimg.sh repackimg.sh
-      - name: Unpack boot.img with AIK
-        run: |
-          cd aik
-          ./unpackimg.sh ../boot.img
-          cp -r split_img ../split_img
-          cp -r ramdisk ../ramdisk 2>/dev/null || true
+          git clone https://github.com/DSecurity/extract-dtb.git
+          cd extract-dtb
+          chmod +x extractdtb.sh
+          sudo cp extractdtb.sh /usr/local/bin/extract-dtb
           cd ..
-      - name: Extract DTB from boot.img-dtb
+      - name: Extract DTB from kernel
         run: |
-          if [ -f split_img/boot.img-dtb ]; then
-            cp split_img/boot.img-dtb ./dtb_original
-            echo "DTB extracted from boot.img"
-          else
-            echo "No combined dtb, trying to find dtb inside kernel"
-            if [ -f split_img/boot.img-zImage ]; then
-              dd if=split_img/boot.img-zImage of=kernel.gz bs=1 skip=$(($(strings -t d split_img/boot.img-zImage | grep -m1 'x00x00x00x00x00x00x00x00x00x00x00x00' | awk '{print $1}') 2>/dev/null || echo 0)) 2>/dev/null
-              echo "Kernel extracted"
-            fi
-            exit 1
-          fi
-      - name: Split DTB into multiple DTBs
-        run: |
-          if [ -f dtb_original ]; then
-            dtc -I dtb -O dts -o all_dump.dts dtb_original 2>/dev/null || true
-            if [ -f all_dump.dts ]; then
-              echo "Single DTS created"
+          mkdir dtb_output
+          extract-dtb kernel --output dtb_output
+          if [ ! "$(ls -A dtb_output)" ]; then
+            echo "extract-dtb failed, trying manual extraction"
+            dd if=kernel of=kernel_dump bs=1 skip=$(strings -t d kernel | grep -m1 'x00x00x00x00x00x00x00x00x00x00x00x00' | awk '{print $1}' 2>/dev/null || echo 0) 2>/dev/null
+            dtc -I dtb -O dts -o manual.dts kernel_dump 2>/dev/null || true
+            if [ -f manual.dts ]; then
+              mkdir -p dtb_output
+              cp manual.dts dtb_output/
             else
-              python3 <<EOF
-          import struct
-          with open("dtb_original", "rb") as f:
-              data = f.read()
-          offset = 0
-          idx = 0
-          while offset < len(data):
-              if len(data) - offset < 8:
-                  break
-              magic = struct.unpack(">I", data[offset:offset+4])[0]
-              if magic == 0xd00dfeed:
-                  size = struct.unpack(">I", data[offset+4:offset+8])[0]
-                  with open(f"dtb_{idx:03d}.dtb", "wb") as out:
-                      out.write(data[offset:offset+size])
-                  idx += 1
-                  offset += size
-              else:
-                  offset += 4
-          print(f"Split into {idx} dtb files")
-          EOF
+              echo "No DTB found in kernel"
+              exit 1
             fi
           fi
-      - name: Convert all DTB to DTS
+          echo "Extracted files:"
+          ls -la dtb_output/
+      - name: Convert DTB to DTS
         run: |
           mkdir dts_output
-          if [ -f all_dump.dts ]; then
-            cp all_dump.dts dts_output/device_tree.dts
-          else
-            for dtb in dtb_*.dtb; do
-              if [ -f "$dtb" ]; then
-                base=$(basename "$dtb" .dtb)
-                dtc -I dtb -O dts -o "dts_output/${base}.dts" "$dtb" 2>/dev/null
-              fi
-            done
+          for dtb in dtb_output/*.dtb; do
+            if [ -f "$dtb" ]; then
+              base=$(basename "$dtb" .dtb)
+              dtc -I dtb -O dts -o "dts_output/${base}.dts" "$dtb" 2>/dev/null
+            fi
+          done
+          for dump in dtb_output/*.dump; do
+            if [ -f "$dump" ]; then
+              base=$(basename "$dump" .dump)
+              dtc -I dtb -O dts -o "dts_output/${base}.dts" "$dump" 2>/dev/null
+            fi
+          done
+          if [ ! "$(ls -A dts_output)" ]; then
+            echo "No DTS files generated"
+            exit 1
           fi
-          if [ -f split_img/boot.img-dtb ]; then
-            dtc -I dtb -O dts -o dts_output/full_dtb.dts split_img/boot.img-dtb 2>/dev/null || true
-          fi
-          echo "DTS files generated:"
+          echo "DTS files:"
           ls -la dts_output/
       - name: Auto-generate device tree makefiles
         run: |
           mkdir device_tree_mk
           SOC="MT6765"
           MANUFACTURER="unknown"
-          DEVICE="iphone17_clone"
+          DEVICE="generic_mt6765"
           if ls dts_output/*.dts 1>/dev/null 2>&1; then
             SOC=$(grep -oP 'compatible\s*=\s*"\K[^"]+' dts_output/*.dts | head -1 | grep -oP 'mt\d+' || echo "MT6765")
             SOC=$(echo $SOC | tr '[:lower:]' '[:upper:]')
@@ -128,12 +102,10 @@ jobs:
           TARGET_BOARD_PLATFORM_GPU := Mali-G52
           TARGET_NO_BOOTLOADER := true
           TARGET_NO_KERNEL := false
-          BOARD_USES_GENERIC_AUDIO := true
-          BOARD_USES_GENERIC_INVENSENSE := true
-          BOARD_KERNEL_CMDLINE := $(cat split_img/boot.img-cmdline 2>/dev/null || echo "console=tty0")
-          BOARD_KERNEL_BASE := $(cat split_img/boot.img-base 2>/dev/null || echo "0x40000000")
-          BOARD_KERNEL_PAGESIZE := $(cat split_img/boot.img-pagesize 2>/dev/null || echo "2048")
-          BOARD_MKBOOTIMG_ARGS := --ramdisk_offset $(cat split_img/boot.img-ramdisk_offset 2>/dev/null || echo "0x01000000") --tags_offset $(cat split_img/boot.img-tags_offset 2>/dev/null || echo "0x00000100")
+          BOARD_KERNEL_CMDLINE := console=tty0
+          BOARD_KERNEL_BASE := 0x40000000
+          BOARD_KERNEL_PAGESIZE := 2048
+          BOARD_MKBOOTIMG_ARGS := --ramdisk_offset 0x01000000 --tags_offset 0x00000100
           BOARD_KERNEL_IMAGE_NAME := Image.gz-dtb
           TARGET_KERNEL_CONFIG := ${SOC,,}_defconfig
           MK2
@@ -167,8 +139,7 @@ jobs:
           mkdir final_artifact
           cp -r dts_output final_artifact/
           cp -r device_tree_mk final_artifact/
-          cp split_img/boot.img-dtb final_artifact/ 2>/dev/null || true
-          cp boot.img final_artifact/ 2>/dev/null || true
+          cp kernel final_artifact/ 2>/dev/null || true
           cd final_artifact
           zip -r ../device_tree_complete.zip .
           cd ..
