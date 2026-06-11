@@ -1,0 +1,141 @@
+name: Analyze vmlinux.elf
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to vmlinux.elf'
+        required: true
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y wget curl file binutils jq python3 python3-pip && sudo pip3 install cve-bin-tool requests
+      - name: Update CVE database
+        run: cve-bin-tool -u now
+      - name: Download vmlinux.elf
+        run: wget -O vmlinux.elf "${{ github.event.inputs.url }}"
+      - name: Analyze binary
+        run: |
+          echo "=== Vulnerability Analysis Report for vmlinux.elf ===" > report.txt
+          echo "Date: $(date)" >> report.txt
+          echo "" >> report.txt
+          echo "=== File Information ===" >> report.txt
+          file vmlinux.elf >> report.txt
+          echo "Size: $(stat -c %s vmlinux.elf) bytes" >> report.txt
+          echo "MD5: $(md5sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
+          echo "SHA256: $(sha256sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
+          echo "" >> report.txt
+          echo "=== Binary Hardening (checksec) ===" >> report.txt
+          wget https://raw.githubusercontent.com/slimm609/checksec.sh/master/checksec -O checksec.sh
+          chmod +x checksec.sh
+          ./checksec.sh --file=vmlinux.elf >> report.txt
+          echo "" >> report.txt
+          echo "=== Kernel Version Strings ===" >> report.txt
+          strings vmlinux.elf | grep -i 'Linux version' >> report.txt || echo "No Linux version string found." >> report.txt
+          echo "" >> report.txt
+          echo "=== Other Notable Strings ===" >> report.txt
+          strings vmlinux.elf | grep -iE 'android|qualcomm|msm|qcom' | sort -u | head -50 >> report.txt
+          echo "" >> report.txt
+          python3 - "$PWD" << 'PYEOF'
+          import sys, os, re, json, subprocess, requests
+          workspace = sys.argv[1]
+          vmlinux = os.path.join(workspace, "vmlinux.elf")
+          report_path = os.path.join(workspace, "report.txt")
+          def extract_strings(filepath):
+              try:
+                  res = subprocess.check_output(["strings", filepath], universal_newlines=True)
+              except:
+                  res = ""
+              return res
+          strings = extract_strings(vmlinux)
+          version = None
+          for line in strings.splitlines():
+              m = re.search(r'Linux version (\S+)', line)
+              if m:
+                  version = m.group(1)
+                  break
+          with open(report_path, "a") as f:
+              f.write("=== CVE Analysis based on kernel version ===\n")
+              if version:
+                  f.write(f"Detected kernel version: {version}\n")
+                  try:
+                      api_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+                      params = {
+                          "keywordSearch": f"Linux kernel {version}",
+                          "resultsPerPage": 50
+                      }
+                      resp = requests.get(api_url, params=params, timeout=30)
+                      if resp.status_code == 200:
+                          data = resp.json()
+                          vulns = data.get("vulnerabilities", [])
+                          f.write(f"Found {len(vulns)} potential CVEs mentioning this version.\n")
+                          f.write("Listing first 20:\n")
+                          for v in vulns[:20]:
+                              cve_id = v["cve"]["id"]
+                              desc = v["cve"]["descriptions"][0]["value"][:200] if v["cve"]["descriptions"] else "N/A"
+                              f.write(f"- {cve_id}: {desc}\n")
+                      else:
+                          f.write("Failed to query NVD.\n")
+                  except Exception as e:
+                      f.write(f"Error querying NVD: {e}\n")
+              else:
+                  f.write("No Linux kernel version string found.\n")
+              f.write("\n")
+              f.write("=== Kernel Security Config Audit ===\n")
+              security_configs = [
+                  "CONFIG_DEBUG_RODATA",
+                  "CONFIG_DEBUG_SET_MODULE_RONX",
+                  "CONFIG_STRICT_KERNEL_RWX",
+                  "CONFIG_STRICT_MODULE_RWX",
+                  "CONFIG_STACKPROTECTOR",
+                  "CONFIG_STACKPROTECTOR_STRONG",
+                  "CONFIG_FORTIFY_SOURCE",
+                  "CONFIG_CC_STACKPROTECTOR",
+                  "CONFIG_SLAB_FREELIST_RANDOM",
+                  "CONFIG_SLAB_FREELIST_HARDENED",
+                  "CONFIG_HARDENED_USERCOPY",
+                  "CONFIG_RANDOMIZE_BASE",
+                  "CONFIG_PAGE_TABLE_ISOLATION",
+                  "CONFIG_RETPOLINE",
+                  "CONFIG_UNMAP_KERNEL_AT_EL0",
+                  "CONFIG_SECCOMP",
+                  "CONFIG_SECCOMP_FILTER",
+                  "CONFIG_SYN_COOKIES",
+                  "CONFIG_DEBUG_LIST",
+                  "CONFIG_BUG_ON_DATA_CORRUPTION",
+                  "CONFIG_SCHED_STACK_END_CHECK",
+                  "CONFIG_REFCOUNT_FULL",
+              ]
+              configs_found = set()
+              for line in strings.splitlines():
+                  if line.startswith("CONFIG_"):
+                      configs_found.add(line.split("=")[0].strip())
+              for sc in security_configs:
+                  status = "ENABLED" if sc in configs_found else "MISSING/Unknown"
+                  f.write(f"{sc}: {status}\n")
+              f.write("\n")
+          PYEOF
+          echo "=== CVE Binary Tool Scan ===" >> report.txt
+          cve-bin-tool --disable-version-check -f json -o cve-tool-report.json vmlinux.elf >> report.txt 2>&1 || echo "cve-bin-tool scan completed with warnings." >> report.txt
+          if [ -f cve-tool-report.json ]; then
+            python3 -c "
+          import json
+          with open('cve-tool-report.json') as f:
+              data = json.load(f)
+          with open('report.txt', 'a') as r:
+              r.write(json.dumps(data, indent=2))
+          "
+          fi
+          echo "" >> report.txt
+          echo "=== Analysis Complete ===" >> report.txt
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-report
+          path: |
+            report.txt
+            cve-tool-report.json
