@@ -19,7 +19,7 @@ jobs:
       - name: Download kernel.img (zImage)
         run: |
           curl -fsSL -o kernel.img \
-            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage2"
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
 
       - name: Install system dependencies
         run: |
