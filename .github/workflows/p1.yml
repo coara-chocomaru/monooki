@@ -15,7 +15,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl file binutils jq python3 python3-requests radare2
+          sudo apt-get install -y wget curl file binutils binutils-aarch64-linux-gnu jq python3 python3-requests radare2
 
       - name: Download vmlinux.elf
         run: wget -O vmlinux.elf "${{ github.event.inputs.url }}"
@@ -32,13 +32,15 @@ jobs:
           echo "SHA256: $(sha256sum vmlinux.elf | cut -d' ' -f1)" >> report.txt
           echo "" >> report.txt
 
-      - name: Binary hardening check
+      - name: Binary hardening check (checksec)
         run: |
           wget https://raw.githubusercontent.com/slimm609/checksec.sh/master/checksec -O checksec.sh
           chmod +x checksec.sh
           echo "=== Binary Hardening (checksec) ===" >> report.txt
-          ./checksec.sh --file=vmlinux.elf >> report.txt
+          set +e
+          ./checksec.sh --file=vmlinux.elf >> report.txt 2>&1
           echo "" >> report.txt
+          set -e
 
       - name: Kernel version & interesting strings
         run: |
@@ -136,11 +138,10 @@ jobs:
         run: |
           mkdir -p decompiled
           aarch64-linux-gnu-objdump -d vmlinux.elf > decompiled/full_disasm.txt
-          echo "=== Disassembly generated ===" >> report.txt
+          echo "=== Full disassembly generated ===" >> report.txt
 
       - name: Generate pseudo-C with radare2
         run: |
-          # Export all function names and decompile one by one (limited to first 500 functions to avoid timeout)
           r2 -q -c 'aaa; afl~[0]' vmlinux.elf | head -500 > funcs.txt
           > decompiled/pseudocode.c
           while IFS= read -r fname; do
