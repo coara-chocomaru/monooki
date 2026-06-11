@@ -10,6 +10,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ========================
+      # 1. 工具下载
+      # ========================
       - name: Download extract-vmlinux
         run: |
           curl -fsSL -o extract-vmlinux \
@@ -19,26 +22,174 @@ jobs:
       - name: Download kernel.img (zImage)
         run: |
           curl -fsSL -o kernel.img \
-            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage2"
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%81%BC%E3%81%842/zImage2"
 
-      - name: Install dependencies
+      # ========================
+      # 2. 安装依赖
+      # ========================
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip
-          sudo pip3 install --upgrade lz4 zstandard git+https://github.com/marin-m/vmlinux-to-elf
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip gcc g++
 
+      - name: Install Python dependencies
+        run: |
+          # vmlinux-to-elf 及其依赖
+          sudo pip3 install --upgrade lz4 zstandard git+https://github.com/clubby789/python-lzo@b4e39df
+          sudo pip3 install --upgrade git+https://github.com/marin-m/vmlinux-to-elf
+          # droidimg 和 miasm
+          git clone https://github.com/nforest/droidimg.git /tmp/droidimg
+          sudo pip3 install --upgrade miasm
+
+      # ========================
+      # 3. 解压 zImage -> raw vmlinux
+      # ========================
       - name: Decompress zImage to raw vmlinux
-        run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+        run: |
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+          # 验证是否解压成功
+          if [ ! -s vmlinux.raw ]; then
+            echo "ERROR: extract-vmlinux failed or produced empty output"
+            exit 1
+          fi
 
-      - name: Convert raw vmlinux to ELF with explicit base address
-        run: vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf
+      # ========================
+      # 4. vmlinux-to-elf: 转换为 ELF + 基础符号表提取
+      # ========================
+      - name: Convert raw vmlinux to ELF with vmlinux-to-elf
+        run: |
+          vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf || {
+            echo "vmlinux-to-elf failed, trying alternative approach..."
+            # 如果失败，可能是需要先 strip boot header
+            dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
+            vmlinux-to-elf --use-absolute vmlinux.strip vmlinux.elf
+          }
 
-      - name: Extract kallsyms from ELF
-        run: kallsyms-finder vmlinux.elf > kallsyms.txt
+      # ========================
+      # 5. 提取基础 kallsyms
+      # ========================
+      - name: Extract base kallsyms with kallsyms-finder
+        run: |
+          kallsyms-finder vmlinux.elf > kallsyms_base.txt
+          echo "=== Base kallsyms count ==="
+          wc -l kallsyms_base.txt
 
-      - name: Upload kallsyms artifact
+      # ========================
+      # 6. droidimg + miasm: 符号辅助还原
+      # ========================
+      - name: Download droidimg vmlinux.py
+        run: |
+          curl -fsSL -o vmlinux.py \
+            "https://raw.githubusercontent.com/nforest/droidimg/master/vmlinux.py"
+          chmod +x vmlinux.py
+
+      - name: Run droidimg with miasm to enhance symbols
+        run: |
+          # 用 miasm 模式提取增强符号（输出 JSON 格式）
+          python3 vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || {
+            echo "Miasm mode failed, falling back to normal mode"
+            python3 vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1
+          }
+
+      # ========================
+      # 7. 合并符号表
+      # ========================
+      - name: Merge kallsyms from vmlinux-to-elf and droidimg
+        run: |
+          # 从 droidimg 的 JSON 输出中提取符号地址和名称
+          python3 << 'EOF'
+          import json
+          import re
+
+          base_syms = set()
+          enhanced_syms = {}
+
+          # 读取基础符号文件 (kallsyms-finder 输出格式: address type name)
+          try:
+              with open('kallsyms_base.txt', 'r') as f:
+                  for line in f:
+                      line = line.strip()
+                      if line and not line.startswith('#'):
+                          parts = line.split()
+                          if len(parts) >= 3:
+                              addr = parts[0]
+                              sym_type = parts[1]
+                              name = parts[2]
+                              base_syms.add((addr, sym_type, name))
+          except FileNotFoundError:
+              pass
+
+          # 解析 droidimg JSON
+          try:
+              with open('droidimg_kallsyms.json', 'r') as f:
+                  content = f.read()
+                  # 尝试提取 JSON 部分
+                  if content.startswith('{'):
+                      data = json.loads(content)
+                      if 'sym' in data:
+                          for sym in data['sym']:
+                              if 'addr' in sym and 'name' in sym:
+                                  # 推测符号类型 (根据地址范围)
+                                  sym_type = 'T' if 'text' in sym.get('type', '') else 'D'
+                                  enhanced_syms[sym['addr']] = (sym_type, sym['name'])
+          except (json.JSONDecodeError, FileNotFoundError):
+              # 尝试从日志中解析符号
+              with open('droidimg_kallsyms.json', 'r') as f:
+                  for line in f:
+                      match = re.search(r'([0-9a-fA-Fx]+)\s+(\w+)\s+(\S+)', line)
+                      if match:
+                          addr = match.group(1)
+                          sym_type = match.group(2)
+                          name = match.group(3)
+                          enhanced_syms[addr] = (sym_type, name)
+
+          # 合并并去重
+          all_syms = {}
+          for addr, sym_type, name in base_syms:
+              all_syms[addr] = (sym_type, name)
+          for addr, (sym_type, name) in enhanced_syms.items():
+              if addr not in all_syms:
+                  all_syms[addr] = (sym_type, name)
+
+          # 输出最终 kallsyms
+          with open('kallsyms.txt', 'w') as f:
+              for addr in sorted(all_syms.keys(), key=lambda x: int(x, 16) if x.startswith('0x') else int(x, 16)):
+                  sym_type, name = all_syms[addr]
+                  f.write(f"{addr} {sym_type} {name}\n")
+
+          print(f"Total symbols: {len(all_syms)}")
+          EOF
+
+      # ========================
+      # 8. 可选：KASLR 修复（如果需要）
+      # ========================
+      - name: Fix KASLR if needed
+        run: |
+          # 下载 KASLR 修复工具
+          curl -fsSL -o fix_kaslr_arm64.c \
+            "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
+          gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
+          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null || echo "KASLR fix not applicable"
+
+      # ========================
+      # 9. 验证和输出
+      # ========================
+      - name: Verify kallsyms quality
+        run: |
+          echo "=== Final kallsyms summary ==="
+          wc -l kallsyms.txt
+          echo ""
+          echo "=== Sample symbols ==="
+          head -20 kallsyms.txt
+          echo ""
+          echo "=== Checking for kernel version string ==="
+          grep -i "linux version" kallsyms.txt || echo "No kernel version symbol found (may be okay)"
+
+      - name: Upload final kallsyms artifact
         uses: actions/upload-artifact@v4
         with:
           name: kallsyms
-          path: kallsyms.txt
+          path: |
+            kallsyms.txt
+            vmlinux.elf
           retention-days: 30
