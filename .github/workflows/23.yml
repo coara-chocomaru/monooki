@@ -31,7 +31,7 @@ jobs:
         run: ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
 
       - name: Convert raw vmlinux to ELF with explicit base address
-        run: vmlinux-to-elf --base-address 0xffffff8008080000 --use-absolute vmlinux.raw vmlinux.elf
+        run: vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf
 
       - name: Extract kallsyms from ELF
         run: kallsyms-finder vmlinux.elf > kallsyms.txt
