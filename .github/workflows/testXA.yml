@@ -1,0 +1,258 @@
+name: SC9850K Fastboot Command Deep Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: 'SC9850KファームウェアファイルのダウンロードURL'
+        required: true
+        type: string
+      file_name:
+        description: '保存するファイル名（省略可）'
+        required: false
+        default: 'sc9850k_firmware.bin'
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: リポジトリのチェックアウト
+        uses: actions/checkout@v4
+
+      - name: 解析ツールのインストール
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binwalk radare2 xxd wget zip python3 python3-pip
+          pip3 install --upgrade pip
+
+      - name: ファームウェアのダウンロード
+        continue-on-error: true
+        run: |
+          wget -O "${{ inputs.file_name }}" "${{ inputs.firmware_url }}" || echo "ダウンロード失敗"
+          ls -lh "${{ inputs.file_name }}" || echo "ファイルが存在しません"
+
+      - name: 基本情報の取得
+        continue-on-error: true
+        run: |
+          file "${{ inputs.file_name }}" || echo "fileコマンド失敗"
+          ls -lh "${{ inputs.file_name }}" || echo "ls失敗"
+
+      - name: 文字列抽出（ASCII / UTF-16LE / UTF-16BE）
+        continue-on-error: true
+        run: |
+          if [ -f "${{ inputs.file_name }}" ]; then
+            strings -n 4 "${{ inputs.file_name }}" > strings_raw.txt 2>/dev/null || echo "" > strings_raw.txt
+            strings -n 4 -e l "${{ inputs.file_name }}" > strings_utf16le.txt 2>/dev/null || echo "" > strings_utf16le.txt
+            strings -n 4 -e b "${{ inputs.file_name }}" > strings_utf16be.txt 2>/dev/null || echo "" > strings_utf16be.txt
+          else
+            echo "ファイルなし" > strings_raw.txt
+            echo "ファイルなし" > strings_utf16le.txt
+            echo "ファイルなし" > strings_utf16be.txt
+          fi
+
+      - name: ヘックスダンプ（先頭・末尾100KB）
+        continue-on-error: true
+        run: |
+          if [ -f "${{ inputs.file_name }}" ]; then
+            head -c 102400 "${{ inputs.file_name }}" | xxd > hexdump_head.txt 2>/dev/null || echo "xxdエラー" > hexdump_head.txt
+            tail -c 102400 "${{ inputs.file_name }}" | xxd > hexdump_tail.txt 2>/dev/null || echo "xxdエラー" > hexdump_tail.txt
+          else
+            echo "ファイルなし" > hexdump_head.txt
+            echo "ファイルなし" > hexdump_tail.txt
+          fi
+
+      - name: binwalkによる抽出
+        continue-on-error: true
+        run: |
+          if [ -f "${{ inputs.file_name }}" ]; then
+            mkdir -p extracted
+            binwalk -e -M -C extracted "${{ inputs.file_name }}" || echo "binwalk失敗" > extracted/error.txt
+            ls -R extracted/ > extracted_filelist.txt 2>/dev/null || echo "リスト作成失敗" > extracted_filelist.txt
+          else
+            mkdir -p extracted
+            echo "ファイルなし" > extracted_filelist.txt
+          fi
+
+      - name: radare2による文字列・構造解析
+        continue-on-error: true
+        run: |
+          if [ -f "${{ inputs.file_name }}" ]; then
+            r2 -q -c 'izz' "${{ inputs.file_name }}" > radare2_strings.txt 2>/dev/null || echo "radare2失敗" > radare2_strings.txt
+          else
+            echo "ファイルなし" > radare2_strings.txt
+          fi
+
+      - name: grepによる高速パターン検索
+        continue-on-error: true
+        run: |
+          if [ -f strings_raw.txt ]; then
+            grep -i -E "fastboot|oem|unlock|flashing|bootloader|format|erase" strings_raw.txt > grep_fastboot_basic.txt 2>/dev/null || echo "該当なし" > grep_fastboot_basic.txt
+          else
+            echo "strings_raw.txt なし" > grep_fastboot_basic.txt
+          fi
+
+      - name: Pythonによる高度なコマンド探索
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF' > fastboot_commands_found.txt 2>/dev/null || echo "Python解析エラー" > fastboot_commands_found.txt
+          import re, sys, os, codecs
+
+          filename = "${{ inputs.file_name }}"
+          if not os.path.exists(filename):
+              print("ファームウェアファイルが存在しません")
+              sys.exit(0)
+
+          with open(filename, 'rb') as f:
+              data = f.read()
+          total_size = len(data)
+          print(f"ファイルサイズ: {total_size} バイト")
+
+          pattern = re.compile(b'[\x20-\x7e]{4,}')
+          ascii_strings = set()
+          for match in pattern.finditer(data):
+              s = match.group().decode('ascii', errors='ignore')
+              ascii_strings.add(s)
+
+          fastboot_candidates = sorted([s for s in ascii_strings if 'fastboot' in s.lower() or 'oem' in s.lower()])
+          print("\n=== ASCII文字列内のfastboot/oem候補 ===")
+          for c in fastboot_candidates:
+              print(c)
+
+          unlock_keywords = [b'unlock', b'oem unlock', b'flashing unlock', b'fastboot oem', b'fastboot flashing']
+          for kw in unlock_keywords:
+              if kw in data.lower():
+                  print(f"\n[発見] バイナリ内に '{kw.decode()}' が存在します")
+
+          scan_limit = min(total_size, 5 * 1024 * 1024)
+          scan_data = data[:scan_limit]
+          target = b'fastboot'
+          xor_found = False
+          for key in range(256):
+              decoded = bytes([b ^ key for b in scan_data])
+              if target in decoded:
+                  idx = decoded.find(target)
+                  start = max(0, idx - 100)
+                  end = min(len(decoded), idx + 200)
+                  snippet = decoded[start:end]
+                  strings_in_snippet = re.findall(b'[\x20-\x7e]{4,}', snippet)
+                  print(f"\n=== XOR key=0x{key:02X} で 'fastboot' を検出 ===")
+                  for s in strings_in_snippet:
+                      print(s.decode('ascii', errors='ignore'))
+                  xor_found = True
+                  break
+          if not xor_found:
+              print("\nXORによる'fastboot'文字列は見つかりませんでした（先頭5MB）")
+
+          try:
+              text_portion = data[:scan_limit].decode('latin-1')
+              rot13 = codecs.encode(text_portion, 'rot_13')
+              if 'fastboot' in rot13.lower():
+                  print("\n=== ROT13で 'fastboot' 検出 ===")
+                  idx = rot13.lower().find('fastboot')
+                  print(rot13[max(0,idx-80):idx+80])
+          except Exception as e:
+              print(f"ROT13解析中エラー: {e}")
+
+          print("\n=== 解析終了 ===")
+          PYEOF
+
+      - name: binwalk抽出物に対する追加解析
+        continue-on-error: true
+        run: |
+          if [ -d extracted ]; then
+            find extracted -type f -exec grep -I -l -i -E "fastboot|oem|unlock" {} \; > extracted_files_with_hits.txt 2>/dev/null || echo "検索エラー" > extracted_files_with_hits.txt
+            python3 << 'PYEOF' > extracted_commands.txt 2>/dev/null || echo "抽出解析エラー" > extracted_commands.txt
+          import os, re
+          extracted_dir = "extracted"
+          output_file = "extracted_commands.txt"
+          with open(output_file, 'w', encoding='utf-8') as out:
+              if os.path.exists(extracted_dir):
+                  for root, dirs, files in os.walk(extracted_dir):
+                      for file in files:
+                          path = os.path.join(root, file)
+                          try:
+                              with open(path, 'rb') as f:
+                                  data = f.read()
+                              strings = re.findall(b'[\x20-\x7e]{4,}', data)
+                              cmds = [s.decode() for s in strings if 'fastboot' in s.decode().lower() or 'oem' in s.decode().lower()]
+                              if cmds:
+                                  out.write(f"\n--- {path} ---\n")
+                                  for c in cmds:
+                                      out.write(c + "\n")
+                          except Exception:
+                              pass
+              else:
+                  out.write("binwalkによる抽出ディレクトリが存在しません\n")
+          PYEOF
+          else
+            echo "抽出ディレクトリなし" > extracted_commands.txt
+            echo "" > extracted_files_with_hits.txt
+          fi
+
+      - name: 日本語サマリーレポート作成
+        if: always()
+        run: |
+          cat << 'EOF' > analysis_summary_ja.txt
+          SC9850K ファームウェア fastboot コマンド解析レポート
+          =====================================================
+          解析対象ファイル: ${{ inputs.file_name }}
+          ダウンロード元URL: ${{ inputs.firmware_url }}
+          解析日時: $(date -u)
+
+          【実施した解析手順】
+          1. ファイル種別・サイズ確認
+          2. 全文字列抽出 (ASCII, UTF-16LE, UTF-16BE)
+          3. 先頭/末尾 ヘックスダンプ
+          4. binwalk 埋め込みファイル抽出
+          5. radare2 文字列解析
+          6. grep キーワード検索
+          7. Python スクリプト (XOR/ROT13難読化解除含む)
+          8. binwalk抽出物の追加スキャン
+
+          【出力ファイル一覧】
+          - fastboot_commands_found.txt
+          - grep_fastboot_basic.txt
+          - extracted_commands.txt
+          - extracted_files_with_hits.txt
+          - radare2_strings.txt
+          - strings_raw.txt / strings_utf16le.txt / strings_utf16be.txt
+          - hexdump_head.txt / hexdump_tail.txt
+          - extracted_filelist.txt
+          - 本サマリーレポート
+
+          【注意】
+          エラーが発生した場合も可能な限り解析を継続し、成果物をアップロードしています。
+          詳細は各ファイルを参照してください。
+          EOF
+
+      - name: 全解析結果をZIPにアーカイブ
+        if: always()
+        continue-on-error: true
+        run: |
+          zip -r analysis_results.zip \
+            strings_raw.txt \
+            strings_utf16le.txt \
+            strings_utf16be.txt \
+            hexdump_head.txt \
+            hexdump_tail.txt \
+            grep_fastboot_basic.txt \
+            fastboot_commands_found.txt \
+            extracted_commands.txt \
+            extracted_files_with_hits.txt \
+            extracted_filelist.txt \
+            radare2_strings.txt \
+            analysis_summary_ja.txt \
+            extracted/ \
+            || true
+
+      - name: アーティファクトとしてアップロード
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC9850K-fastboot-analysis
+          path: analysis_results.zip
