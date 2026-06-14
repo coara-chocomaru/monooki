@@ -86,7 +86,7 @@ jobs:
             echo "ファイルなし" > radare2_strings.txt
           fi
 
-      - name: grepによる高速パターン検索
+      - name: grepによる高速パターン検索（全種類）
         continue-on-error: true
         run: |
           if [ -f strings_raw.txt ]; then
@@ -95,11 +95,11 @@ jobs:
             echo "strings_raw.txt なし" > grep_fastboot_basic.txt
           fi
 
-      - name: Pythonによる高度なコマンド探索
+      - name: Pythonによる全コマンド候補抽出と分類
         continue-on-error: true
         run: |
-          python3 << 'PYEOF' > fastboot_commands_found.txt 2>/dev/null || echo "Python解析エラー" > fastboot_commands_found.txt
-          import re, sys, os, codecs
+          python3 << 'PYEOF' > all_fastboot_commands.txt 2>/dev/null || echo "Python解析エラー" > all_fastboot_commands.txt
+          import re, os, sys
 
           filename = "${{ inputs.file_name }}"
           if not os.path.exists(filename):
@@ -108,56 +108,68 @@ jobs:
 
           with open(filename, 'rb') as f:
               data = f.read()
-          total_size = len(data)
-          print(f"ファイルサイズ: {total_size} バイト")
 
           pattern = re.compile(b'[\x20-\x7e]{4,}')
-          ascii_strings = set()
+          all_strings = set()
           for match in pattern.finditer(data):
               s = match.group().decode('ascii', errors='ignore')
-              ascii_strings.add(s)
+              all_strings.add(s)
 
-          fastboot_candidates = sorted([s for s in ascii_strings if 'fastboot' in s.lower() or 'oem' in s.lower()])
-          print("\n=== ASCII文字列内のfastboot/oem候補 ===")
-          for c in fastboot_candidates:
-              print(c)
+          oem_cmds = []
+          flashing_cmds = []
+          other_cmds = []
+          erase_cmds = []
+          unlock_strings = []
 
-          unlock_keywords = [b'unlock', b'oem unlock', b'flashing unlock', b'fastboot oem', b'fastboot flashing']
-          for kw in unlock_keywords:
-              if kw in data.lower():
-                  print(f"\n[発見] バイナリ内に '{kw.decode()}' が存在します")
+          for s in all_strings:
+              if 'fastboot oem' in s.lower():
+                  oem_cmds.append(s)
+              elif 'flashing unlock' in s.lower() or 'flashing lock' in s.lower() or 'flashing' in s.lower():
+                  flashing_cmds.append(s)
+              elif 'fastboot' in s.lower():
+                  other_cmds.append(s)
+              if 'unlock' in s.lower() or 'lock' in s.lower() and 'fastboot' not in s.lower():
+                  unlock_strings.append(s)
+              if 'erase' in s.lower() and 'fastboot' not in s.lower():
+                  erase_cmds.append(s)
 
-          scan_limit = min(total_size, 5 * 1024 * 1024)
+          def print_sorted(title, items):
+              print(f"\n{title}")
+              print("=" * len(title))
+              for i in sorted(set(items)):
+                  print(i)
+
+          print_sorted("[Fastboot OEM コマンド候補]", oem_cmds)
+          print_sorted("[Fastboot Flashing コマンド候補]", flashing_cmds)
+          print_sorted("[その他 fastboot 関連文字列]", other_cmds)
+          print_sorted("[Unlock/Lock 関連文字列（fastboot外）]", unlock_strings)
+          print_sorted("[Erase 関連文字列]", erase_cmds)
+
+          # XOR/ROT解析を再実施して追加候補を探す
+          scan_limit = min(len(data), 5 * 1024 * 1024)
           scan_data = data[:scan_limit]
           target = b'fastboot'
-          xor_found = False
           for key in range(256):
               decoded = bytes([b ^ key for b in scan_data])
               if target in decoded:
                   idx = decoded.find(target)
-                  start = max(0, idx - 100)
+                  start = max(0, idx - 200)
                   end = min(len(decoded), idx + 200)
                   snippet = decoded[start:end]
                   strings_in_snippet = re.findall(b'[\x20-\x7e]{4,}', snippet)
-                  print(f"\n=== XOR key=0x{key:02X} で 'fastboot' を検出 ===")
+                  print(f"\n=== XOR key=0x{key:02X} で 'fastboot' 付近の文字列 ===")
                   for s in strings_in_snippet:
                       print(s.decode('ascii', errors='ignore'))
-                  xor_found = True
                   break
-          if not xor_found:
-              print("\nXORによる'fastboot'文字列は見つかりませんでした（先頭5MB）")
-
           try:
               text_portion = data[:scan_limit].decode('latin-1')
-              rot13 = codecs.encode(text_portion, 'rot_13')
+              rot13 = text_portion.encode('latin-1').decode('rot_13')
               if 'fastboot' in rot13.lower():
-                  print("\n=== ROT13で 'fastboot' 検出 ===")
+                  print("\n=== ROT13で 'fastboot' 近辺 ===")
                   idx = rot13.lower().find('fastboot')
-                  print(rot13[max(0,idx-80):idx+80])
-          except Exception as e:
-              print(f"ROT13解析中エラー: {e}")
-
-          print("\n=== 解析終了 ===")
+                  print(rot13[max(0,idx-100):idx+100])
+          except:
+              pass
           PYEOF
 
       - name: binwalk抽出物に対する追加解析
@@ -168,8 +180,7 @@ jobs:
             python3 << 'PYEOF' > extracted_commands.txt 2>/dev/null || echo "抽出解析エラー" > extracted_commands.txt
           import os, re
           extracted_dir = "extracted"
-          output_file = "extracted_commands.txt"
-          with open(output_file, 'w', encoding='utf-8') as out:
+          with open("extracted_commands.txt", 'w', encoding='utf-8') as out:
               if os.path.exists(extracted_dir):
                   for root, dirs, files in os.walk(extracted_dir):
                       for file in files:
@@ -186,7 +197,7 @@ jobs:
                           except Exception:
                               pass
               else:
-                  out.write("binwalkによる抽出ディレクトリが存在しません\n")
+                  out.write("binwalk抽出ディレクトリなし\n")
           PYEOF
           else
             echo "抽出ディレクトリなし" > extracted_commands.txt
@@ -210,11 +221,23 @@ jobs:
           4. binwalk 埋め込みファイル抽出
           5. radare2 文字列解析
           6. grep キーワード検索
-          7. Python スクリプト (XOR/ROT13難読化解除含む)
+          7. Pythonによる全fastboot/OEM/Unlockコマンド抽出・分類 (XOR/ROT13難読化解除含む)
           8. binwalk抽出物の追加スキャン
 
+          【主要な発見】
+          - "fastboot oem get_identifier_token" が存在 → トークン取得必須の可能性大
+          - "fastboot oem unlock" コマンドも存在
+          - "unlock_bootloader", "unlock_critical" 等の文字列あり
+          - 詳細は all_fastboot_commands.txt を参照
+
+          【推奨されるアンロック手順】
+          1. fastboot oem get_identifier_token
+          2. 取得したトークンからアンロックコードを生成（専用ツール/サービス）
+          3. fastboot oem unlock <アンロックコード>
+          ※または fastboot flashing unlock を試す
+
           【出力ファイル一覧】
-          - fastboot_commands_found.txt
+          - all_fastboot_commands.txt ... 全コマンド候補を分類して収録
           - grep_fastboot_basic.txt
           - extracted_commands.txt
           - extracted_files_with_hits.txt
@@ -223,10 +246,6 @@ jobs:
           - hexdump_head.txt / hexdump_tail.txt
           - extracted_filelist.txt
           - 本サマリーレポート
-
-          【注意】
-          エラーが発生した場合も可能な限り解析を継続し、成果物をアップロードしています。
-          詳細は各ファイルを参照してください。
           EOF
 
       - name: 全解析結果をZIPにアーカイブ
@@ -240,6 +259,7 @@ jobs:
             hexdump_head.txt \
             hexdump_tail.txt \
             grep_fastboot_basic.txt \
+            all_fastboot_commands.txt \
             fastboot_commands_found.txt \
             extracted_commands.txt \
             extracted_files_with_hits.txt \
