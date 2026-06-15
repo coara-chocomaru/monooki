@@ -1,0 +1,165 @@
+name: Analyze bootctrl SO
+
+on:
+  workflow_dispatch:
+    inputs:
+      so_url:
+        description: "URL of android.hardware.boot@1.0-impl-1.2-mtkimpl.so"
+        required: true
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            binutils \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabihf \
+            file \
+            patchelf \
+            python3
+
+      - name: Download .so
+        run: |
+          mkdir -p work
+          curl -fSL "${{ github.event.inputs.so_url }}" \
+            -o work/android.hardware.boot@1.0-impl-1.2-mtkimpl.so
+          echo "Downloaded: $(du -sh work/*.so)"
+
+      - name: Detect architecture
+        id: arch
+        run: |
+          SO=work/android.hardware.boot@1.0-impl-1.2-mtkimpl.so
+          FILE_OUT=$(file "$SO")
+          echo "file_output=$FILE_OUT" >> "$GITHUB_OUTPUT"
+
+          if echo "$FILE_OUT" | grep -q "aarch64"; then
+            echo "arch=64" >> "$GITHUB_OUTPUT"
+            echo "OBJDUMP=aarch64-linux-gnu-objdump" >> "$GITHUB_ENV"
+            echo "READELF=aarch64-linux-gnu-readelf" >> "$GITHUB_ENV"
+            echo "NM=aarch64-linux-gnu-nm" >> "$GITHUB_OUTPUT"
+          elif echo "$FILE_OUT" | grep -q "ARM"; then
+            echo "arch=32" >> "$GITHUB_OUTPUT"
+            echo "OBJDUMP=arm-linux-gnueabihf-objdump" >> "$GITHUB_ENV"
+            echo "READELF=arm-linux-gnueabihf-readelf" >> "$GITHUB_ENV"
+            echo "NM=arm-linux-gnueabihf-nm" >> "$GITHUB_OUTPUT"
+          else
+            echo "arch=unknown" >> "$GITHUB_OUTPUT"
+            echo "OBJDUMP=objdump" >> "$GITHUB_ENV"
+            echo "READELF=readelf" >> "$GITHUB_ENV"
+          fi
+
+      - name: Analyze ELF headers
+        run: |
+          SO=work/android.hardware.boot@1.0-impl-1.2-mtkimpl.so
+          OUT=work/report.txt
+
+          {
+            echo "========================================"
+            echo " bootctrl SO Analysis Report"
+            echo " $(date -u)"
+            echo "========================================"
+            echo ""
+
+            echo "### file output ###"
+            file "$SO"
+            echo ""
+
+            echo "### ELF Header ###"
+            $READELF -h "$SO"
+            echo ""
+
+            echo "### Dynamic section (NEEDED / SONAME / RPATH / RUNPATH) ###"
+            $READELF -d "$SO" | grep -E "NEEDED|SONAME|RPATH|RUNPATH|FLAGS"
+            echo ""
+
+            echo "### Shared library dependencies (NEEDED) ###"
+            $READELF -d "$SO" | grep NEEDED | awk '{print $5}' | tr -d '[]'
+            echo ""
+
+            echo "### Program Headers ###"
+            $READELF -l "$SO"
+            echo ""
+
+            echo "### Section Headers ###"
+            $READELF -S "$SO"
+            echo ""
+
+            echo "### Dynamic symbols (exported) ###"
+            $READELF --dyn-syms "$SO"
+            echo ""
+
+            echo "### All symbols (nm) ###"
+            if command -v aarch64-linux-gnu-nm &>/dev/null && [[ "${{ steps.arch.outputs.arch }}" == "64" ]]; then
+              aarch64-linux-gnu-nm -D "$SO" 2>/dev/null || true
+            elif command -v arm-linux-gnueabihf-nm &>/dev/null && [[ "${{ steps.arch.outputs.arch }}" == "32" ]]; then
+              arm-linux-gnueabihf-nm -D "$SO" 2>/dev/null || true
+            else
+              nm -D "$SO" 2>/dev/null || true
+            fi
+            echo ""
+
+            echo "### Relocations ###"
+            $READELF -r "$SO" 2>/dev/null | head -200 || true
+            echo ""
+
+            echo "### patchelf: needed libs ###"
+            patchelf --print-needed "$SO" 2>/dev/null || echo "(patchelf failed)"
+            echo ""
+
+            echo "### Interesting strings (HAL / IPC / MTK) ###"
+            strings "$SO" | grep -iE \
+              "android\.hardware\.boot|IBootControl|slot|suffix|_a|_b|mtk|mediatek|hidl|aidl|hwbinder|vndk|partition|misc|bootctrl" \
+              | sort -u
+            echo ""
+
+            echo "### All printable strings ###"
+            strings "$SO"
+
+          } | tee "$OUT"
+
+      - name: Generate dependency summary (JSON)
+        run: |
+          SO=work/android.hardware.boot@1.0-impl-1.2-mtkimpl.so
+          ARCH=${{ steps.arch.outputs.arch }}
+
+          NEEDED=$($READELF -d "$SO" | grep NEEDED | awk '{print $5}' | tr -d '[]' | python3 -c "
+          import sys, json
+          libs = [l.strip() for l in sys.stdin if l.strip()]
+          print(json.dumps(libs, indent=2))
+          ")
+
+          SONAME=$($READELF -d "$SO" | grep SONAME | awk '{print $5}' | tr -d '[]')
+
+          python3 - <<EOF
+          import json
+          data = {
+            "file": "android.hardware.boot@1.0-impl-1.2-mtkimpl.so",
+            "arch_bits": "$ARCH",
+            "soname": "$SONAME",
+            "needed": $NEEDED,
+            "notes": {
+              "vndk_libs": [l for l in $NEEDED if "hidl" in l or "hwbinder" in l or "binder" in l],
+              "mtk_libs": [l for l in $NEEDED if "mtk" in l.lower() or "mediatek" in l.lower()],
+              "system_libs": [l for l in $NEEDED if l.startswith("lib") and "mtk" not in l.lower()]
+            }
+          }
+          with open("work/dependency_summary.json", "w") as f:
+            json.dump(data, f, indent=2)
+          print(json.dumps(data, indent=2))
+          EOF
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootctrl-analysis
+          path: |
+            work/report.txt
+            work/dependency_summary.json
+            work/android.hardware.boot@1.0-impl-1.2-mtkimpl.so
+          retention-days: 7
