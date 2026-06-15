@@ -1,0 +1,92 @@
+name: Generate Unlock Signature
+
+on:
+  workflow_dispatch:
+    inputs:
+      identifier_token:
+        description: 'Identifier Token (SN付き16進文字列)'
+        required: true
+        type: string
+        default: 'SN555033584d4c43483139435330303134'
+
+jobs:
+  generate_signature:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: リポジトリのチェックアウト
+        uses: actions/checkout@v4
+
+      - name: スクリプトに実行権限を付与
+        run: |
+          if [ -f signidentifier_unlockbootloader.sh ]; then
+            chmod +x signidentifier_unlockbootloader.sh
+          else
+            echo "signidentifier_unlockbootloader.sh がリポジトリに存在しません" > error.txt
+            exit 1
+          fi
+
+      - name: 必要な鍵ファイルの存在確認
+        run: |
+          missing_keys=""
+          if [ ! -f rsa4096_vbmeta.pem ]; then
+            missing_keys="$missing_keys rsa4096_vbmeta.pem"
+          fi
+          if [ ! -f vbmeta.pem ]; then
+            missing_keys="$missing_keys vbmeta.pem"
+          fi
+          if [ -n "$missing_keys" ]; then
+            echo "不足している鍵ファイル:$missing_keys" > error.txt
+            exit 1
+          fi
+
+      - name: トークンの前処理
+        id: token
+        run: |
+          TOKEN="${{ inputs.identifier_token }}"
+          CLEAN_TOKEN=$(echo "$TOKEN" | sed 's/^SN//')
+          echo "clean_token=$CLEAN_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: rsa4096_vbmeta.pem で署名生成
+        continue-on-error: true
+        run: |
+          CLEAN_TOKEN="${{ steps.token.outputs.clean_token }}"
+          echo "rsa4096_vbmeta.pem を使用して署名を生成します..."
+          ./signidentifier_unlockbootloader.sh "$CLEAN_TOKEN" rsa4096_vbmeta.pem signature_rsa4096.bin 2>&1 | tee sign_rsa4096.log
+          if [ -f signature_rsa4096.bin ]; then
+            echo "rsa4096 署名成功"
+          else
+            echo "rsa4096 署名失敗" > signature_rsa4096.bin
+          fi
+
+      - name: vbmeta.pem で署名生成
+        continue-on-error: true
+        run: |
+          CLEAN_TOKEN="${{ steps.token.outputs.clean_token }}"
+          echo "vbmeta.pem を使用して署名を生成します..."
+          ./signidentifier_unlockbootloader.sh "$CLEAN_TOKEN" vbmeta.pem signature_vbmeta.bin 2>&1 | tee sign_vbmeta.log
+          if [ -f signature_vbmeta.bin ]; then
+            echo "vbmeta 署名成功"
+          else
+            echo "vbmeta 署名失敗" > signature_vbmeta.bin
+          fi
+
+      - name: 結果をZIPにまとめる
+        if: always()
+        continue-on-error: true
+        run: |
+          zip -r signatures.zip \
+            signature_rsa4096.bin \
+            signature_vbmeta.bin \
+            sign_rsa4096.log \
+            sign_vbmeta.log \
+            error.txt \
+            || true
+
+      - name: アーティファクトとしてアップロード
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unlock-signatures
+          path: signatures.zip
