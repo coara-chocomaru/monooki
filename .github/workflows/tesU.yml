@@ -7,7 +7,7 @@ on:
         description: 'Identifier Token (SN付き16進文字列)'
         required: true
         type: string
-        default: 'SN555033584d4c43483139435330303134'
+        default: '555033584d4c43483139435330303134'
 
 jobs:
   generate_signature:
