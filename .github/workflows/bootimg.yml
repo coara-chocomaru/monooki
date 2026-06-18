@@ -1,0 +1,143 @@
+name: Analyze Android 9 boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_image_url:
+        description: 'boot.img URL'
+        required: true
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 xz-utils cpio zip python3
+
+      - name: Download boot.img
+        run: curl -L -o boot.img "${{ github.event.inputs.boot_image_url }}"
+
+      - name: Parse header and extract ramdisk
+        run: |
+          python3 << 'EOF'
+          import struct, hashlib
+
+          with open('boot.img', 'rb') as f:
+              data = f.read()
+          if data[:8] != b'ANDROID!':
+              raise SystemExit('Invalid Android boot image')
+          def u32(off):
+              return struct.unpack('<I', data[off:off+4])[0]
+          kernel_size = u32(8)
+          kernel_addr = u32(12)
+          ramdisk_size = u32(16)
+          ramdisk_addr = u32(20)
+          second_size = u32(24)
+          second_addr = u32(28)
+          tags_addr = u32(32)
+          page_size = u32(36)
+          header_version = u32(40)
+          os_version = u32(44)
+          name = data[48:64].split(b'\x00')[0].decode('utf-8', errors='ignore')
+          cmdline = data[64:576].split(b'\x00')[0].decode('utf-8', errors='ignore')
+          extra_cmdline = data[608:1120].split(b'\x00')[0].decode('utf-8', errors='ignore')
+
+          recovery_dtbo_size = 0
+          recovery_dtbo_offset = 0
+          v1_header_size = 0
+          if header_version >= 1:
+              recovery_dtbo_size = u32(1120)
+              recovery_dtbo_offset = u32(1124)
+              v1_header_size = u32(1128)
+
+          def round_up(n, p):
+              return (n + p - 1) // p * p
+
+          ramdisk_off = page_size + round_up(kernel_size, page_size)
+          ramdisk_end = ramdisk_off + ramdisk_size
+          if ramdisk_end > len(data):
+              raise SystemExit('ramdisk beyond file')
+          with open('ramdisk.bin', 'wb') as f:
+              f.write(data[ramdisk_off:ramdisk_end])
+
+          base = None
+          if (kernel_addr & 0xfff) == 0x8000 and kernel_addr >= 0x80008000:
+              base = kernel_addr - 0x8000
+          offsets = {}
+          if base is not None:
+              offsets['kernel'] = kernel_addr - base
+              offsets['ramdisk'] = ramdisk_addr - base
+              offsets['second'] = second_addr - base
+              offsets['tags'] = tags_addr - base
+
+          signed_avb = False
+          if len(data) >= 64:
+              footer = data[-64:]
+              if footer[:4] == b'AVBf':
+                  signed_avb = True
+          sha256 = hashlib.sha256(data).hexdigest()
+
+          with open('info.txt', 'w') as f:
+              f.write(f"Magic: ANDROID!\n")
+              f.write(f"Header version: {header_version}\n")
+              f.write(f"Kernel size: {kernel_size} (0x{kernel_size:X})\n")
+              f.write(f"Kernel addr: 0x{kernel_addr:08X}\n")
+              f.write(f"Ramdisk size: {ramdisk_size} (0x{ramdisk_size:X})\n")
+              f.write(f"Ramdisk addr: 0x{ramdisk_addr:08X}\n")
+              f.write(f"Second size: {second_size} (0x{second_size:X})\n")
+              f.write(f"Second addr: 0x{second_addr:08X}\n")
+              f.write(f"Tags addr: 0x{tags_addr:08X}\n")
+              f.write(f"Page size: {page_size}\n")
+              f.write(f"OS version: {os_version} (0x{os_version:08X})\n")
+              f.write(f"Product name: {name}\n")
+              f.write(f"Kernel cmdline: {cmdline}\n")
+              f.write(f"Extra cmdline: {extra_cmdline}\n")
+              if base is not None:
+                  f.write(f"Inferred kernel base: 0x{base:08X}\n")
+                  f.write(f"Kernel offset (from base): 0x{offsets['kernel']:08X}\n")
+                  f.write(f"Ramdisk offset: 0x{offsets['ramdisk']:08X}\n")
+                  f.write(f"Second offset: 0x{offsets['second']:08X}\n")
+                  f.write(f"Tags offset: 0x{offsets['tags']:08X}\n")
+              else:
+                  f.write("Base could not be inferred.\n")
+              if header_version >= 1:
+                  f.write(f"Recovery DTBO size: {recovery_dtbo_size}\n")
+                  f.write(f"Recovery DTBO offset: 0x{recovery_dtbo_offset:X}\n")
+                  f.write(f"Total header size (v0+v1): {v1_header_size}\n")
+              f.write(f"SHA256: {sha256}\n")
+              f.write(f"AVB Signed: {'Yes' if signed_avb else 'No'}\n")
+          EOF
+
+      - name: Decompress ramdisk and list contents
+        run: |
+          mkdir -p ramdisk
+          magic2=$(head -c 2 ramdisk.bin | xxd -p)
+          magic4=$(head -c 4 ramdisk.bin | xxd -p)
+          magic6=$(head -c 6 ramdisk.bin | xxd -p)
+          if [ "$magic2" = "1f8b" ]; then
+            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+          elif [ "$magic4" = "04224d18" ]; then
+            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+          elif [ "$magic4" = "02214c18" ]; then
+            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+          elif [ "$magic6" = "fd377a585a00" ]; then
+            xz -d -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+          else
+            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || echo "fallback failed"
+          fi
+          ls -laR ramdisk
+
+      - name: Package results
+        run: zip -r boot_analysis.zip ramdisk/ info.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-analysis
+          path: boot_analysis.zip
