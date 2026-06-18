@@ -129,7 +129,6 @@ jobs:
           best_count=0
           best_dir=""
 
-          # 1. ramdisk.bin を試す
           if [ -s ramdisk.bin ]; then
             echo "=== Trying ramdisk.bin ==="
             mkdir -p test_rd1
@@ -141,7 +140,6 @@ jobs:
             fi
           fi
 
-          # 2. カーネルを展開し、そこから全 cpio / gzip を抽出
           echo "=== Decompressing kernel ==="
           kernel_decomp="kernel_decompressed.bin"
           decompressed=0
@@ -168,7 +166,6 @@ jobs:
           if [ $decompressed -eq 1 ]; then
             echo "Decompressed kernel size: $(stat -c %s "$kernel_decomp")"
 
-            # 2-1. 展開後の cpio マジックをすべて試す
             offsets=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_decomp" | cut -d: -f1)
             offsets="$offsets"$'\n'"$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_decomp" | cut -d: -f1)"
             for off in $offsets; do
@@ -182,14 +179,12 @@ jobs:
               fi
             done
 
-            # 2-2. 展開後バイナリ内に gzip マジックがあれば展開し、さらに cpio 抽出
             gz_offsets=$(grep -abo $'\x1f\x8b' "$kernel_decomp" | cut -d: -f1)
             for gz_off in $gz_offsets; do
               echo "Found gzip magic at offset $gz_off in decompressed kernel"
               dd if="$kernel_decomp" bs=1 skip="$gz_off" 2>/dev/null > temp_gz_chunk.gz
               gunzip -c temp_gz_chunk.gz > temp_gz_decomp 2>/dev/null || continue
               [ -s temp_gz_decomp ] || continue
-              # その中に cpio があれば抽出
               mkdir -p "test_gz_$gz_off"
               ( cpio -idm --no-absolute-filenames -D "test_gz_$gz_off" < temp_gz_decomp 2>/dev/null ) || \
               ( cat temp_gz_decomp | cpio -idm --no-absolute-filenames -D "test_gz_$gz_off" 2>/dev/null ) || true
@@ -201,9 +196,7 @@ jobs:
             done
           fi
 
-          # 3. 生 kernel.bin からも同様に cpio / gzip を試す（未展開カーネル後方）
           echo "=== Searching raw kernel.bin ==="
-          # cpio
           raw_offsets=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | cut -d: -f1)
           raw_offsets="$raw_offsets"$'\n'"$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | cut -d: -f1)"
           for off in $raw_offsets; do
@@ -215,7 +208,7 @@ jobs:
               best_dir="test_raw_$off"
             fi
           done
-          # gzip in raw kernel.bin
+
           raw_gz_offsets=$(grep -abo $'\x1f\x8b' kernel.bin | cut -d: -f1)
           for gz_off in $raw_gz_offsets; do
             dd if=kernel.bin bs=1 skip="$gz_off" 2>/dev/null > temp_raw_gz.gz
@@ -230,7 +223,6 @@ jobs:
             fi
           done
 
-          # 最もファイル数が多いものを最終 ramdisk に採用
           rm -rf ramdisk
           if [ -n "$best_dir" ]; then
             mv "$best_dir" ramdisk
@@ -240,8 +232,11 @@ jobs:
             echo "No ramdisk found"
           fi
 
+          # Fix permissions so everything is readable (ignore errors)
+          chmod -R u+rwX ramdisk/ 2>/dev/null || true
+
           echo "=== Final Ramdisk contents ==="
-          ls -laR ramdisk
+          ls -laR ramdisk 2>/dev/null || true
           echo "============================="
 
       - name: Gather APatch information
@@ -252,22 +247,22 @@ jobs:
               echo "APatch binaries found:" >> info.txt
               [ -f ramdisk/apd ] && echo "- apd daemon" >> info.txt
               [ -f ramdisk/kernel ] && echo "- kernel binary" >> info.txt
-              strings ramdisk/kernel 2>/dev/null | grep -iE 'apatch|version' | head -n 10 >> info.txt
+              strings ramdisk/kernel 2>/dev/null | grep -iE 'apatch|version' | head -n 10 >> info.txt || true
           fi
           if [ -f ramdisk/version ]; then
               echo "APatch version file:" >> info.txt
-              cat ramdisk/version >> info.txt
+              cat ramdisk/version 2>/dev/null >> info.txt || true
           fi
           if [ -d ramdisk/overlay.d ]; then
               echo "Overlay directory:" >> info.txt
-              find ramdisk/overlay.d -ls >> info.txt
+              find ramdisk/overlay.d -ls 2>/dev/null >> info.txt || true
           fi
           if [ -f ramdisk/init ]; then
               echo "Custom init script present" >> info.txt
           fi
 
       - name: Package results
-        run: zip -r boot_analysis.zip ramdisk/ info.txt
+        run: zip -r boot_analysis.zip ramdisk/ info.txt || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
