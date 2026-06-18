@@ -67,7 +67,7 @@ jobs:
               f.write(data[ramdisk_off:ramdisk_end])
 
           base = None
-          if (kernel_addr & 0xfff) == 0x8000 and kernel_addr >= 0x80008000:
+          if (kernel_addr & 0xfff) == 0x8000:
               base = kernel_addr - 0x8000
           offsets = {}
           if base is not None:
@@ -114,24 +114,30 @@ jobs:
               f.write(f"AVB Signed: {'Yes' if signed_avb else 'No'}\n")
           EOF
 
-      - name: Decompress ramdisk and list contents
+      - name: Decompress and extract ramdisk
         run: |
+          set +e
           mkdir -p ramdisk
           magic2=$(head -c 2 ramdisk.bin | xxd -p)
           magic4=$(head -c 4 ramdisk.bin | xxd -p)
           magic6=$(head -c 6 ramdisk.bin | xxd -p)
+          extracted=0
           if [ "$magic2" = "1f8b" ]; then
-            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
-          elif [ "$magic4" = "04224d18" ]; then
-            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
-          elif [ "$magic4" = "02214c18" ]; then
-            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
+          elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
+            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
           elif [ "$magic6" = "fd377a585a00" ]; then
-            xz -d -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+            xz -d -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
           else
-            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || echo "fallback failed"
+            cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null && extracted=1
           fi
+          if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
+            echo "Magic-based extraction failed or empty, trying raw cpio..."
+            cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null
+          fi
+          echo "=== Ramdisk contents ==="
           ls -laR ramdisk
+          echo "======================="
 
       - name: Package results
         run: zip -r boot_analysis.zip ramdisk/ info.txt
