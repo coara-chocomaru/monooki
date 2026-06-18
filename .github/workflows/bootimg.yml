@@ -127,7 +127,8 @@ jobs:
         run: |
           mkdir -p ramdisk
           extracted=0
-          # 1. 通常の ramdisk.bin があれば展開を試みる
+
+          # 1. ramdisk.bin がある場合は先に試す
           if [ -s ramdisk.bin ]; then
             set +e
             magic2=$(head -c 2 ramdisk.bin | xxd -p)
@@ -145,54 +146,70 @@ jobs:
             set -e
           fi
 
+          # 2. kernel.bin から埋め込み initramfs を探す (APatch対策)
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
-            echo "ramdisk.bin empty or ramdisk_size=0. Searching for APatch embedded initramfs in kernel.bin..."
+            echo "=== kernel.bin compression detection ==="
+            magic2=$(head -c 2 kernel.bin | xxd -p)
+            magic4=$(head -c 4 kernel.bin | xxd -p)
+            magic6=$(head -c 6 kernel.bin | xxd -p)
+            echo "First 2 bytes: $magic2"
+            echo "First 4 bytes: $magic4"
+            echo "First 6 bytes: $magic6"
 
-            # 生 kernel.bin から cpio マジックを直接検索
-            cpio_offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | head -1 | cut -d: -f1)
-            if [ -z "$cpio_offset_hex" ]; then
-              cpio_offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | head -1 | cut -d: -f1)
-            fi
-            cpio_offset_dec="$cpio_offset_hex"
-
-            if [ -n "$cpio_offset_dec" ]; then
-              echo "Found cpio magic at offset $cpio_offset_dec in raw kernel.bin"
-              dd if=kernel.bin bs=1 skip="$cpio_offset_dec" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
-              if [ -n "$(ls -A ramdisk)" ]; then
-                echo "APatch embedded initramfs extracted successfully"
-                extracted=1
-              fi
+            kernel_decomp="kernel_decompressed.bin"
+            decompressed=0
+            if [ "$magic2" = "1f8b" ]; then
+              echo "Trying gzip decompression..."
+              gunzip -c kernel.bin > "$kernel_decomp" 2>/dev/null && decompressed=1
+            elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
+              echo "Trying lz4 decompression..."
+              lz4 -d kernel.bin "$kernel_decomp" 2>/dev/null && decompressed=1
+            elif [ "$magic6" = "fd377a585a00" ]; then
+              echo "Trying xz decompression..."
+              xz -d -c kernel.bin > "$kernel_decomp" 2>/dev/null && decompressed=1
+            elif [ "$magic2" = "5d00" ]; then
+              echo "Trying zstd decompression..."
+              zstd -d -c kernel.bin > "$kernel_decomp" 2>/dev/null && decompressed=1
             else
-              echo "No cpio magic in raw kernel.bin. Trying decompression of kernel..."
-              # 圧縮カーネルを想定したフォールバック
-              decompressed=0
-              kernel_raw="kernel_raw.bin"
-              rm -f "$kernel_raw"
-              magic2=$(head -c 2 kernel.bin | xxd -p)
-              magic4=$(head -c 4 kernel.bin | xxd -p)
-              magic6=$(head -c 6 kernel.bin | xxd -p)
-              if [ "$magic2" = "1f8b" ]; then
-                gunzip -c kernel.bin > "$kernel_raw" && decompressed=1
-              elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
-                lz4 -d kernel.bin "$kernel_raw" && decompressed=1
-              elif [ "$magic6" = "fd377a585a00" ]; then
-                xz -d -c kernel.bin > "$kernel_raw" && decompressed=1
-              elif [ "$magic2" = "5d00" ]; then
-                zstd -d -c kernel.bin > "$kernel_raw" && decompressed=1
-              else
-                lzma -d -c kernel.bin > "$kernel_raw" 2>/dev/null && decompressed=1
+              echo "Unknown compression, attempting lzma..."
+              lzma -d -c kernel.bin > "$kernel_decomp" 2>/dev/null && decompressed=1
+            fi
+
+            if [ $decompressed -eq 1 ] && [ -s "$kernel_decomp" ]; then
+              echo "Decompressed kernel size: $(stat -c %s "$kernel_decomp") bytes"
+              # decompressed カーネルから cpio マジックを検索
+              offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_decomp" | head -1 | cut -d: -f1)
+              if [ -z "$offset_hex" ]; then
+                offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_decomp" | head -1 | cut -d: -f1)
               fi
-              if [ $decompressed -eq 1 ] && [ -s "$kernel_raw" ]; then
-                cpio_offset_dec2=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_raw" | head -1 | cut -d: -f1)
-                if [ -z "$cpio_offset_dec2" ]; then
-                  cpio_offset_dec2=$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_raw" | head -1 | cut -d: -f1)
-                fi
-                if [ -n "$cpio_offset_dec2" ]; then
-                  echo "Found cpio magic in decompressed kernel at offset $cpio_offset_dec2"
-                  dd if="$kernel_raw" bs=1 skip="$cpio_offset_dec2" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              if [ -n "$offset_hex" ]; then
+                echo "Found cpio magic at offset $offset_hex in decompressed kernel"
+                dd if="$kernel_decomp" bs=1 skip="$offset_hex" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+                if [ -n "$(ls -A ramdisk)" ]; then
+                  echo "Initramfs extracted from decompressed kernel"
                   extracted=1
                 fi
+              else
+                echo "No cpio magic in decompressed kernel"
               fi
+            else
+              echo "Kernel decompression failed or produced empty file"
+            fi
+          fi
+
+          # 3. それでも空なら、未展開の kernel.bin から直接末尾cpioを試す
+          if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
+            echo "Trying raw kernel.bin for appended cpio..."
+            offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | head -1 | cut -d: -f1)
+            if [ -z "$offset_hex" ]; then
+              offset_hex=$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | head -1 | cut -d: -f1)
+            fi
+            if [ -n "$offset_hex" ]; then
+              echo "Found cpio magic at offset $offset_hex in raw kernel.bin"
+              dd if=kernel.bin bs=1 skip="$offset_hex" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              extracted=1
+            else
+              echo "No cpio magic anywhere"
             fi
           fi
 
