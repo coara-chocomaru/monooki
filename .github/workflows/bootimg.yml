@@ -128,26 +128,26 @@ jobs:
           mkdir -p ramdisk
           extracted=0
 
-          # 1. ramdisk.bin の展開を試みる
+          # 1. ramdisk.bin の展開
           if [ -s ramdisk.bin ]; then
             set +e
             magic2=$(head -c 2 ramdisk.bin | xxd -p)
             magic4=$(head -c 4 ramdisk.bin | xxd -p)
             magic6=$(head -c 6 ramdisk.bin | xxd -p)
             if [ "$magic2" = "1f8b" ]; then
-              gunzip -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              gunzip -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
             elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
-              lz4 -d ramdisk.bin - 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              lz4 -d ramdisk.bin - 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
             elif [ "$magic6" = "fd377a585a00" ]; then
-              xz -d -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              xz -d -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
             else
-              cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null
+              cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null || true
             fi
             [ -n "$(ls -A ramdisk)" ] && extracted=1
             set -e
           fi
 
-          # 2. kernel.bin から埋め込み initramfs を検索
+          # 2. カーネル展開＋内部cpio検索
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
             echo "=== kernel.bin compression ==="
             magic2=$(head -c 2 kernel.bin | xxd -p)
@@ -184,9 +184,9 @@ jobs:
               offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_decomp" | head -1 | cut -d: -f1)
               [ -z "$offset" ] && offset=$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_decomp" | head -1 | cut -d: -f1)
               if [ -n "$offset" ]; then
-                echo "cpio at offset $offset (decompressed)"
-                dd if="$kernel_decomp" bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
-                [ -n "$(ls -A ramdisk)" ] && extracted=1
+                echo "cpio at offset $offset (decompressed) – extracting..."
+                dd if="$kernel_decomp" bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
+                [ -n "$(ls -A ramdisk)" ] && extracted=1 && echo "Extraction successful"
               else
                 echo "No cpio in decompressed kernel"
               fi
@@ -195,14 +195,15 @@ jobs:
             fi
           fi
 
-          # 3. 生 kernel.bin からの末尾 cpio 検索
+          # 3. 生 kernel.bin 末尾 cpio
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
             echo "Tailing raw kernel.bin for appended cpio..."
             offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | head -1 | cut -d: -f1)
             [ -z "$offset" ] && offset=$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | head -1 | cut -d: -f1)
             if [ -n "$offset" ]; then
-              echo "cpio at offset $offset (raw)"
-              dd if=kernel.bin bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+              echo "cpio at offset $offset (raw) – extracting..."
+              dd if=kernel.bin bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
+              [ -n "$(ls -A ramdisk)" ] && echo "Raw extraction gave files"
             else
               echo "No cpio anywhere"
             fi
