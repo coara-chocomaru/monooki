@@ -128,7 +128,6 @@ jobs:
           mkdir -p ramdisk
           extracted=0
 
-          # 1. ramdisk.bin の展開
           if [ -s ramdisk.bin ]; then
             set +e
             magic2=$(head -c 2 ramdisk.bin | xxd -p)
@@ -147,7 +146,6 @@ jobs:
             set -e
           fi
 
-          # 2. カーネル展開＋内部cpio検索
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
             echo "=== kernel.bin compression ==="
             magic2=$(head -c 2 kernel.bin | xxd -p)
@@ -195,7 +193,6 @@ jobs:
             fi
           fi
 
-          # 3. 生 kernel.bin 末尾 cpio
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
             echo "Tailing raw kernel.bin for appended cpio..."
             offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | head -1 | cut -d: -f1)
@@ -212,6 +209,40 @@ jobs:
           echo "=== Ramdisk contents ==="
           ls -laR ramdisk
           echo "======================="
+
+      - name: Gather APatch information
+        run: |
+          echo "" >> info.txt
+          echo "=== APatch analysis ===" >> info.txt
+          if [ -f ramdisk/kernel ]; then
+              echo "Found APatch kernel binary" >> info.txt
+              echo "File type:" >> info.txt
+              file ramdisk/kernel >> info.txt
+              echo "Version strings:" >> info.txt
+              strings ramdisk/kernel | grep -iE 'apatch|version' | head -n 10 >> info.txt
+          fi
+          if [ -f ramdisk/version ]; then
+              echo "APatch version file:" >> info.txt
+              cat ramdisk/version >> info.txt
+          fi
+          if [ -f ramdisk/apd ]; then
+              echo "Found APatch daemon (apd)" >> info.txt
+          fi
+          if [ -d ramdisk/overlay.d ]; then
+              echo "Overlay directory present" >> info.txt
+              ls -lR ramdisk/overlay.d >> info.txt
+          fi
+          if [ -f ramdisk/init ]; then
+              echo "Init script found" >> info.txt
+          fi
+          # Additional checks for Magisk-like structure
+          if [ -f ramdisk/magisk ]; then
+              echo "Magisk binary detected" >> info.txt
+          fi
+          if [ -d ramdisk/.backup ]; then
+              echo ".backup directory present (Magisk backup)" >> info.txt
+          fi
+          echo "APatch info appended to info.txt"
 
       - name: Package results
         run: zip -r boot_analysis.zip ramdisk/ info.txt
