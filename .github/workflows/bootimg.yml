@@ -18,12 +18,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y lz4 xz-utils cpio zip python3
+          sudo apt-get install -y lz4 xz-utils cpio zip python3 zstd
 
       - name: Download boot.img
         run: curl -L -o boot.img "${{ github.event.inputs.boot_image_url }}"
 
-      - name: Parse header and extract ramdisk
+      - name: Parse header
         run: |
           python3 << 'EOF'
           import struct, hashlib
@@ -59,12 +59,21 @@ jobs:
           def round_up(n, p):
               return (n + p - 1) // p * p
 
+          kernel_off = page_size
+          kernel_end = kernel_off + kernel_size
           ramdisk_off = page_size + round_up(kernel_size, page_size)
           ramdisk_end = ramdisk_off + ramdisk_size
-          if ramdisk_end > len(data):
-              raise SystemExit('ramdisk beyond file')
-          with open('ramdisk.bin', 'wb') as f:
-              f.write(data[ramdisk_off:ramdisk_end])
+
+          with open('kernel.bin', 'wb') as f:
+              f.write(data[kernel_off:kernel_end])
+
+          if ramdisk_size > 0:
+              if ramdisk_end > len(data):
+                  raise SystemExit('ramdisk beyond file')
+              with open('ramdisk.bin', 'wb') as f:
+                  f.write(data[ramdisk_off:ramdisk_end])
+          else:
+              open('ramdisk.bin', 'w').close()
 
           base = None
           if (kernel_addr & 0xfff) == 0x8000:
@@ -114,27 +123,65 @@ jobs:
               f.write(f"AVB Signed: {'Yes' if signed_avb else 'No'}\n")
           EOF
 
-      - name: Decompress and extract ramdisk
+      - name: Extract ramdisk (with embedded initramfs fallback)
         run: |
-          set +e
           mkdir -p ramdisk
-          magic2=$(head -c 2 ramdisk.bin | xxd -p)
-          magic4=$(head -c 4 ramdisk.bin | xxd -p)
-          magic6=$(head -c 6 ramdisk.bin | xxd -p)
           extracted=0
-          if [ "$magic2" = "1f8b" ]; then
-            gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
-          elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
-            lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
-          elif [ "$magic6" = "fd377a585a00" ]; then
-            xz -d -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
-          else
-            cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null && extracted=1
+          if [ -s ramdisk.bin ]; then
+            set +e
+            magic2=$(head -c 2 ramdisk.bin | xxd -p)
+            magic4=$(head -c 4 ramdisk.bin | xxd -p)
+            magic6=$(head -c 6 ramdisk.bin | xxd -p)
+            if [ "$magic2" = "1f8b" ]; then
+              gunzip -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
+            elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
+              lz4 -d ramdisk.bin - | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
+            elif [ "$magic6" = "fd377a585a00" ]; then
+              xz -d -c ramdisk.bin | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null && extracted=1
+            else
+              cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null && extracted=1
+            fi
+            set -e
           fi
+
           if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
-            echo "Magic-based extraction failed or empty, trying raw cpio..."
-            cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null
+            echo "Ramdisk empty or header had zero size, trying embedded initramfs from kernel..."
+            dd if=kernel.bin of=kernel_compressed bs=1 skip=0 2>/dev/null
+            decompressed=0
+            magic2=$(head -c 2 kernel_compressed | xxd -p)
+            magic4=$(head -c 4 kernel_compressed | xxd -p)
+            magic6=$(head -c 6 kernel_compressed | xxd -p)
+            kernel_raw="kernel_raw.bin"
+
+            if [ "$magic2" = "1f8b" ]; then
+              gunzip -c kernel_compressed > "$kernel_raw" && decompressed=1
+            elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
+              lz4 -d kernel_compressed "$kernel_raw" && decompressed=1
+            elif [ "$magic6" = "fd377a585a00" ]; then
+              xz -d -c kernel_compressed > "$kernel_raw" && decompressed=1
+            elif [ "$magic2" = "5d00" ]; then
+              zstd -d -c kernel_compressed > "$kernel_raw" && decompressed=1
+            else
+              lzma -d -c kernel_compressed > "$kernel_raw" 2>/dev/null && decompressed=1
+            fi
+
+            if [ $decompressed -eq 1 ] && [ -s "$kernel_raw" ]; then
+              cpio_offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_raw" | head -1 | cut -d: -f1)
+              if [ -z "$cpio_offset" ]; then
+                cpio_offset=$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_raw" | head -1 | cut -d: -f1)
+              fi
+              if [ -n "$cpio_offset" ]; then
+                echo "Found cpio archive at offset $cpio_offset"
+                dd if="$kernel_raw" bs=1 skip="$cpio_offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null
+                if [ -n "$(ls -A ramdisk)" ]; then
+                  echo "Embedded initramfs extracted successfully"
+                fi
+              else
+                echo "No cpio magic found in decompressed kernel"
+              fi
+            fi
           fi
+
           echo "=== Ramdisk contents ==="
           ls -laR ramdisk
           echo "======================="
