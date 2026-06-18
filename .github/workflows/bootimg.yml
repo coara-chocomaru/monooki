@@ -123,126 +123,148 @@ jobs:
               f.write(f"AVB Signed: {'Yes' if signed_avb else 'No'}\n")
           EOF
 
-      - name: Extract ramdisk/embedded initramfs
+      - name: Extract all possible ramdisks (APatch overlay search)
         run: |
-          mkdir -p ramdisk
-          extracted=0
+          mkdir -p ramdisk_extracted
+          best_count=0
+          best_dir=""
 
+          # 1. ramdisk.bin を試す
           if [ -s ramdisk.bin ]; then
-            set +e
-            magic2=$(head -c 2 ramdisk.bin | xxd -p)
-            magic4=$(head -c 4 ramdisk.bin | xxd -p)
-            magic6=$(head -c 6 ramdisk.bin | xxd -p)
-            if [ "$magic2" = "1f8b" ]; then
-              gunzip -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
-            elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
-              lz4 -d ramdisk.bin - 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
-            elif [ "$magic6" = "fd377a585a00" ]; then
-              xz -d -c ramdisk.bin 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
-            else
-              cpio -idm --no-absolute-filenames -D ramdisk < ramdisk.bin 2>/dev/null || true
+            echo "=== Trying ramdisk.bin ==="
+            mkdir -p test_rd1
+            ( gunzip -c ramdisk.bin 2>/dev/null || cat ramdisk.bin ) | cpio -idm --no-absolute-filenames -D test_rd1 2>/dev/null || true
+            cnt=$(find test_rd1 -type f 2>/dev/null | wc -l)
+            if [ "$cnt" -gt "$best_count" ]; then
+              best_count=$cnt
+              best_dir="test_rd1"
             fi
-            [ -n "$(ls -A ramdisk)" ] && extracted=1
-            set -e
           fi
 
-          if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
-            echo "=== kernel.bin compression ==="
-            magic2=$(head -c 2 kernel.bin | xxd -p)
-            magic4=$(head -c 4 kernel.bin | xxd -p)
-            magic6=$(head -c 6 kernel.bin | xxd -p)
-            echo "Magic: $magic2 / $magic4 / $magic6"
+          # 2. カーネルを展開し、そこから全 cpio / gzip を抽出
+          echo "=== Decompressing kernel ==="
+          kernel_decomp="kernel_decompressed.bin"
+          decompressed=0
+          magic2=$(head -c 2 kernel.bin | xxd -p)
+          magic4=$(head -c 4 kernel.bin | xxd -p)
+          magic6=$(head -c 6 kernel.bin | xxd -p)
+          if [ "$magic2" = "1f8b" ]; then
+            gunzip -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
+            [ -s "$kernel_decomp" ] && decompressed=1
+          elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
+            lz4 -d kernel.bin "$kernel_decomp" 2>/dev/null || true
+            [ -s "$kernel_decomp" ] && decompressed=1
+          elif [ "$magic6" = "fd377a585a00" ]; then
+            xz -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
+            [ -s "$kernel_decomp" ] && decompressed=1
+          elif [ "$magic2" = "5d00" ]; then
+            zstd -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
+            [ -s "$kernel_decomp" ] && decompressed=1
+          else
+            lzma -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
+            [ -s "$kernel_decomp" ] && decompressed=1
+          fi
 
-            kernel_decomp="kernel_decompressed.bin"
-            decompressed=0
-            if [ "$magic2" = "1f8b" ]; then
-              echo "Trying gzip (exit code ignored)..."
-              gunzip -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
-              [ -s "$kernel_decomp" ] && decompressed=1
-            elif [ "$magic4" = "04224d18" ] || [ "$magic4" = "02214c18" ]; then
-              echo "Trying lz4..."
-              lz4 -d kernel.bin "$kernel_decomp" 2>/dev/null || true
-              [ -s "$kernel_decomp" ] && decompressed=1
-            elif [ "$magic6" = "fd377a585a00" ]; then
-              echo "Trying xz..."
-              xz -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
-              [ -s "$kernel_decomp" ] && decompressed=1
-            elif [ "$magic2" = "5d00" ]; then
-              echo "Trying zstd..."
-              zstd -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
-              [ -s "$kernel_decomp" ] && decompressed=1
-            else
-              echo "Trying lzma..."
-              lzma -d -c kernel.bin > "$kernel_decomp" 2>/dev/null || true
-              [ -s "$kernel_decomp" ] && decompressed=1
-            fi
+          if [ $decompressed -eq 1 ]; then
+            echo "Decompressed kernel size: $(stat -c %s "$kernel_decomp")"
 
-            if [ $decompressed -eq 1 ]; then
-              echo "Decompressed kernel size: $(stat -c %s "$kernel_decomp")"
-              offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_decomp" | head -1 | cut -d: -f1)
-              [ -z "$offset" ] && offset=$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_decomp" | head -1 | cut -d: -f1)
-              if [ -n "$offset" ]; then
-                echo "cpio at offset $offset (decompressed) – extracting..."
-                dd if="$kernel_decomp" bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
-                [ -n "$(ls -A ramdisk)" ] && extracted=1 && echo "Extraction successful"
-              else
-                echo "No cpio in decompressed kernel"
+            # 2-1. 展開後の cpio マジックをすべて試す
+            offsets=$(grep -abo $'\x30\x37\x30\x37\x30\x31' "$kernel_decomp" | cut -d: -f1)
+            offsets="$offsets"$'\n'"$(grep -abo $'\x30\x37\x30\x37\x30\x32' "$kernel_decomp" | cut -d: -f1)"
+            for off in $offsets; do
+              echo "Found cpio at offset $off in decompressed kernel"
+              mkdir -p "test_rd2_$off"
+              dd if="$kernel_decomp" bs=1 skip="$off" 2>/dev/null | cpio -idm --no-absolute-filenames -D "test_rd2_$off" 2>/dev/null || true
+              cnt=$(find "test_rd2_$off" -type f 2>/dev/null | wc -l)
+              if [ "$cnt" -gt "$best_count" ]; then
+                best_count=$cnt
+                best_dir="test_rd2_$off"
               fi
-            else
-              echo "Decompression failed"
-            fi
+            done
+
+            # 2-2. 展開後バイナリ内に gzip マジックがあれば展開し、さらに cpio 抽出
+            gz_offsets=$(grep -abo $'\x1f\x8b' "$kernel_decomp" | cut -d: -f1)
+            for gz_off in $gz_offsets; do
+              echo "Found gzip magic at offset $gz_off in decompressed kernel"
+              dd if="$kernel_decomp" bs=1 skip="$gz_off" 2>/dev/null > temp_gz_chunk.gz
+              gunzip -c temp_gz_chunk.gz > temp_gz_decomp 2>/dev/null || continue
+              [ -s temp_gz_decomp ] || continue
+              # その中に cpio があれば抽出
+              mkdir -p "test_gz_$gz_off"
+              ( cpio -idm --no-absolute-filenames -D "test_gz_$gz_off" < temp_gz_decomp 2>/dev/null ) || \
+              ( cat temp_gz_decomp | cpio -idm --no-absolute-filenames -D "test_gz_$gz_off" 2>/dev/null ) || true
+              cnt=$(find "test_gz_$gz_off" -type f 2>/dev/null | wc -l)
+              if [ "$cnt" -gt "$best_count" ]; then
+                best_count=$cnt
+                best_dir="test_gz_$gz_off"
+              fi
+            done
           fi
 
-          if [ $extracted -eq 0 ] || [ -z "$(ls -A ramdisk)" ]; then
-            echo "Tailing raw kernel.bin for appended cpio..."
-            offset=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | head -1 | cut -d: -f1)
-            [ -z "$offset" ] && offset=$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | head -1 | cut -d: -f1)
-            if [ -n "$offset" ]; then
-              echo "cpio at offset $offset (raw) – extracting..."
-              dd if=kernel.bin bs=1 skip="$offset" 2>/dev/null | cpio -idm --no-absolute-filenames -D ramdisk 2>/dev/null || true
-              [ -n "$(ls -A ramdisk)" ] && echo "Raw extraction gave files"
-            else
-              echo "No cpio anywhere"
+          # 3. 生 kernel.bin からも同様に cpio / gzip を試す（未展開カーネル後方）
+          echo "=== Searching raw kernel.bin ==="
+          # cpio
+          raw_offsets=$(grep -abo $'\x30\x37\x30\x37\x30\x31' kernel.bin | cut -d: -f1)
+          raw_offsets="$raw_offsets"$'\n'"$(grep -abo $'\x30\x37\x30\x37\x30\x32' kernel.bin | cut -d: -f1)"
+          for off in $raw_offsets; do
+            mkdir -p "test_raw_$off"
+            dd if=kernel.bin bs=1 skip="$off" 2>/dev/null | cpio -idm --no-absolute-filenames -D "test_raw_$off" 2>/dev/null || true
+            cnt=$(find "test_raw_$off" -type f 2>/dev/null | wc -l)
+            if [ "$cnt" -gt "$best_count" ]; then
+              best_count=$cnt
+              best_dir="test_raw_$off"
             fi
+          done
+          # gzip in raw kernel.bin
+          raw_gz_offsets=$(grep -abo $'\x1f\x8b' kernel.bin | cut -d: -f1)
+          for gz_off in $raw_gz_offsets; do
+            dd if=kernel.bin bs=1 skip="$gz_off" 2>/dev/null > temp_raw_gz.gz
+            gunzip -c temp_raw_gz.gz > temp_raw_gz_decomp 2>/dev/null || continue
+            [ -s temp_raw_gz_decomp ] || continue
+            mkdir -p "test_raw_gz_$gz_off"
+            cpio -idm --no-absolute-filenames -D "test_raw_gz_$gz_off" < temp_raw_gz_decomp 2>/dev/null || true
+            cnt=$(find "test_raw_gz_$gz_off" -type f 2>/dev/null | wc -l)
+            if [ "$cnt" -gt "$best_count" ]; then
+              best_count=$cnt
+              best_dir="test_raw_gz_$gz_off"
+            fi
+          done
+
+          # 最もファイル数が多いものを最終 ramdisk に採用
+          rm -rf ramdisk
+          if [ -n "$best_dir" ]; then
+            mv "$best_dir" ramdisk
+            echo "Best ramdisk found: $best_dir with $best_count files"
+          else
+            mkdir ramdisk
+            echo "No ramdisk found"
           fi
 
-          echo "=== Ramdisk contents ==="
+          echo "=== Final Ramdisk contents ==="
           ls -laR ramdisk
-          echo "======================="
+          echo "============================="
 
       - name: Gather APatch information
         run: |
           echo "" >> info.txt
           echo "=== APatch analysis ===" >> info.txt
-          if [ -f ramdisk/kernel ]; then
-              echo "Found APatch kernel binary" >> info.txt
-              echo "File type:" >> info.txt
-              file ramdisk/kernel >> info.txt
-              echo "Version strings:" >> info.txt
-              strings ramdisk/kernel | grep -iE 'apatch|version' | head -n 10 >> info.txt
+          if [ -f ramdisk/apd ] || [ -f ramdisk/kernel ]; then
+              echo "APatch binaries found:" >> info.txt
+              [ -f ramdisk/apd ] && echo "- apd daemon" >> info.txt
+              [ -f ramdisk/kernel ] && echo "- kernel binary" >> info.txt
+              strings ramdisk/kernel 2>/dev/null | grep -iE 'apatch|version' | head -n 10 >> info.txt
           fi
           if [ -f ramdisk/version ]; then
               echo "APatch version file:" >> info.txt
               cat ramdisk/version >> info.txt
           fi
-          if [ -f ramdisk/apd ]; then
-              echo "Found APatch daemon (apd)" >> info.txt
-          fi
           if [ -d ramdisk/overlay.d ]; then
-              echo "Overlay directory present" >> info.txt
-              ls -lR ramdisk/overlay.d >> info.txt
+              echo "Overlay directory:" >> info.txt
+              find ramdisk/overlay.d -ls >> info.txt
           fi
           if [ -f ramdisk/init ]; then
-              echo "Init script found" >> info.txt
+              echo "Custom init script present" >> info.txt
           fi
-          # Additional checks for Magisk-like structure
-          if [ -f ramdisk/magisk ]; then
-              echo "Magisk binary detected" >> info.txt
-          fi
-          if [ -d ramdisk/.backup ]; then
-              echo ".backup directory present (Magisk backup)" >> info.txt
-          fi
-          echo "APatch info appended to info.txt"
 
       - name: Package results
         run: zip -r boot_analysis.zip ramdisk/ info.txt
