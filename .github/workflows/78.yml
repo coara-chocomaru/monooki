@@ -51,10 +51,10 @@ jobs:
       - name: Convert raw vmlinux to ELF with vmlinux-to-elf
         run: |
           source /tmp/venv/bin/activate
-          vmlinux-to-elf --use-absolute --base-address 0xffffffe1c6801000 vmlinux.raw vmlinux.elf || {
+          vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf || {
             echo "vmlinux-to-elf failed, trying alternative approach..."
             dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
-            vmlinux-to-elf --use-absolute --base-address 0xffffffe1c6801000 vmlinux.strip vmlinux.elf
+            vmlinux-to-elf --use-absolute vmlinux.strip vmlinux.elf
           }
 
       - name: Extract base kallsyms with kallsyms-finder
@@ -82,6 +82,10 @@ jobs:
           base_syms = set()
           enhanced_syms = {}
 
+          # 基準となる元の自動判定ベースアドレスと実機ターゲットアドレス
+          DEFAULT_BASE = 0xffffffc010080000
+          TARGET_BASE  = 0xffffffe1c6801000
+
           try:
               with open('kallsyms_base.txt', 'r') as f:
                   for line in f:
@@ -92,6 +96,16 @@ jobs:
                               addr = parts[0]
                               sym_type = parts[1]
                               name = parts[2]
+                              
+                              # ffffffc010080000 ベースのアドレスを 0xffffffe1c6801000 ベースへオフセット計算で変換
+                              try:
+                                  addr_val = int(addr, 16)
+                                  if addr_val >= DEFAULT_BASE and addr_val < 0xffffffe000000000:
+                                      offset = addr_val - DEFAULT_BASE
+                                      addr = f"0x{TARGET_BASE + offset:016x}"
+                              except ValueError:
+                                  pass
+                                  
                               base_syms.add((addr, sym_type, name))
           except FileNotFoundError:
               pass
@@ -105,7 +119,17 @@ jobs:
                           for sym in data['sym']:
                               if 'addr' in sym and 'name' in sym:
                                   sym_type = 'T' if 'text' in sym.get('type', '') else 'D'
-                                  enhanced_syms[sym['addr']] = (sym_type, sym['name'])
+                                  
+                                  addr_str = sym['addr']
+                                  try:
+                                      addr_val = int(addr_str, 16) if addr_str.startswith('0x') else int(addr_str, 16)
+                                      if addr_val >= DEFAULT_BASE and addr_val < 0xffffffe000000000:
+                                          offset = addr_val - DEFAULT_BASE
+                                          addr_str = f"0x{TARGET_BASE + offset:016x}"
+                                  except ValueError:
+                                      pass
+                                      
+                                  enhanced_syms[addr_str] = (sym_type, sym['name'])
           except (json.JSONDecodeError, FileNotFoundError):
               with open('droidimg_kallsyms.json', 'r') as f:
                   for line in f:
@@ -114,6 +138,15 @@ jobs:
                           addr = match.group(1)
                           sym_type = match.group(2)
                           name = match.group(3)
+                          
+                          try:
+                              addr_val = int(addr, 16) if addr.startswith('0x') else int(addr, 16)
+                              if addr_val >= DEFAULT_BASE and addr_val < 0xffffffe000000000:
+                                  offset = addr_val - DEFAULT_BASE
+                                  addr = f"0x{TARGET_BASE + offset:016x}"
+                          except ValueError:
+                              pass
+                              
                           enhanced_syms[addr] = (sym_type, name)
 
           all_syms = {}
