@@ -37,10 +37,10 @@ jobs:
       - name: Convert raw vmlinux to ELF with vmlinux-to-elf
         run: |
           source /tmp/venv/bin/activate
-          vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf || {
+          if ! vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf 2>/dev/null; then
             dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
             vmlinux-to-elf --use-absolute vmlinux.strip vmlinux.elf
-          }
+          fi
 
       - name: Extract base kallsyms with kallsyms-finder
         run: |
