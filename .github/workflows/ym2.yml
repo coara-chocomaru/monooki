@@ -48,7 +48,12 @@ jobs:
 
       - name: Write GKI kallsyms extractor
         run: |
-          cat > /tmp/extract_kallsyms.py << 'PYEOF'
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          import textwrap
+          import ast
+
+          script = textwrap.dedent("""\
           import struct, sys
           from vmlinux_to_elf.core.kallsyms import KallsymsFinder
           from vmlinux_to_elf.core.auto_unpack import VmlinuzDecompressor
@@ -122,7 +127,6 @@ jobs:
               best_ratio = null_ratio(best_addrs)
               print(f"Initial null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-              # --- Phase 1: fix relative_base if null ratio is high ---
               if best_ratio >= NULL_THRESHOLD and finder.has_base_relative and fo:
                   base_candidates = []
                   if rba:
@@ -139,7 +143,12 @@ jobs:
                       base_candidates.append(('gki-canonical', gki))
 
                   seen = set()
-                  dedup = [(l, v) for l, v in base_candidates if not (v in seen or seen.add(v))]
+                  dedup = []
+                  for label2, value in base_candidates:
+                      if value in seen:
+                          continue
+                      seen.add(value)
+                      dedup.append((label2, value))
 
                   print(f"Trying {len(dedup)} relative_base candidates", file=sys.stderr)
                   for label2, base in dedup:
@@ -157,8 +166,6 @@ jobs:
 
               print(f"Post-phase1 null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-              # --- Phase 2: KASLR slide correction using selinux_state anchor ---
-              # Find selinux_state link-time VA in the current (possibly still imperfect) symbol list
               slide = None
               if selinux_state_runtime_va is not None:
                   for addr, name in zip(best_addrs, finder.symbol_names):
@@ -172,15 +179,7 @@ jobs:
                   if slide is None:
                       print("WARNING: selinux_state not found in symbol list", file=sys.stderr)
 
-              # --- Phase 3: if null ratio still high AND we have runtime anchor,
-              #     try to derive link-time base from KASLR info and retry recompute ---
               if best_ratio >= NULL_THRESHOLD and selinux_state_runtime_va is not None and fo:
-                  # We know: runtime_selinux_va - slide = link_time_selinux_va
-                  # And: link_time_selinux_va = relative_base + offset_of_selinux_in_table
-                  # Without knowing offset_of_selinux we can't directly get relative_base,
-                  # but we can try: relative_base = runtime_kaslr_base - slide (if slide known)
-                  # or relative_base = first non-null runtime_addr - first_offset
-                  # Try: scan pre-table bytes, add slide correction
                   print("Phase 3: retry with KASLR-corrected base candidates", file=sys.stderr)
                   extra_candidates = []
                   for step in range(8, 512, 8):
@@ -188,12 +187,11 @@ jobs:
                       if pos >= 0:
                           val = struct.unpack_from('<Q', kernel_img, pos)[0]
                           if 0xffffff8000000000 <= val <= 0xffffffffffffffff:
-                              # This is a runtime VA stored in binary; subtract slide to get link-time base
                               if slide is not None:
                                   extra_candidates.append((f'pre-{step}-slide', val - slide))
                               extra_candidates.append((f'pre-{step}', val))
 
-                  seen2 = set(v for _, v in ([] if not hasattr(best_addrs, '__len__') else []))
+                  seen2 = set()
                   for label3, base in extra_candidates:
                       if base in seen2:
                           continue
@@ -206,12 +204,11 @@ jobs:
                       if ratio < best_ratio:
                           best_ratio = ratio
                           best_addrs = addrs
-                          slide = None  # recompute slide from new addresses below
+                          slide = None
                           if best_ratio < NULL_THRESHOLD:
                               print(f"  => Accepted", file=sys.stderr)
                               break
 
-              # Recompute slide after phase 3 if needed
               if slide is None and selinux_state_runtime_va is not None:
                   for addr, name in zip(best_addrs, finder.symbol_names):
                       if name[1:] == 'selinux_state':
@@ -222,9 +219,6 @@ jobs:
 
               print(f"Final null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-              # --- Write output ---
-              # Emit link-time addresses (what kallsyms normally contains).
-              # Also write a runtime-address version if slide is known.
               pairs = [(a, n) for a, n in zip(best_addrs, finder.symbol_names) if a != 0]
 
               with open(out_path, 'w') as f:
@@ -244,9 +238,11 @@ jobs:
           if __name__ == '__main__':
               runtime_va = int(sys.argv[3], 16) if len(sys.argv) > 3 else None
               extract(sys.argv[1], sys.argv[2], runtime_va)
+          """)
+          Path('/tmp/extract_kallsyms.py').write_text(script, encoding='utf-8')
+          ast.parse(Path('/tmp/extract_kallsyms.py').read_text(encoding='utf-8'))
+          print('syntax OK')
           PYEOF
-          sed -i 's/^          //' /tmp/extract_kallsyms.py
-          python3 -c "import ast; ast.parse(open('/tmp/extract_kallsyms.py').read()); print('syntax OK')"
 
       - name: Convert raw vmlinux to ELF
         run: |
