@@ -13,7 +13,7 @@ jobs:
       - name: Download vmlinux
         run: |
           curl -fsSL -o vmlinux.raw \
-            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/zImage"
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/vmlinux"
 
       - name: Install system dependencies
         run: |
