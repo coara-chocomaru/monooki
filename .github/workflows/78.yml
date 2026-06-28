@@ -67,24 +67,10 @@ jobs:
       - name: Run droidimg with miasm to enhance symbols
         run: |
           source /tmp/venv/bin/activate
-          echo "=== Trying droidimg with KASLR offset or direct extraction ==="
-          
-          # 1. まずはベースアドレス/KASLR指定を試みる (--kaslr オプションを使用)
-          python3 /tmp/droidimg/vmlinux.py -m --kaslr 0xffffffe1c6801000 --json vmlinux.raw > droidimg_kallsyms.json 2>droidimg_err.log || {
-            echo "Miasm with --kaslr failed, trying without Miasm..."
-            python3 /tmp/droidimg/vmlinux.py --kaslr 0xffffffe1c6801000 --json vmlinux.raw > droidimg_kallsyms.json 2>droidimg_err.log || {
-              
-              # 2. オプションエラー等で落ちる場合、標準の自動解析で抽出を試みる
-              echo "KASLR option failed, falling back to standard extraction..."
-              python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>droidimg_err.log || \
-              python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>droidimg_err.log || {
-                echo "WARNING: droidimg completely failed. Error log below:"
-                cat droidimg_err.log
-                echo "{}" > droidimg_kallsyms.json
-              }
-            }
+          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || {
+            echo "Miasm mode failed, falling back to normal mode"
+            python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1
           }
-          echo "=== Droidimg task completed ==="
 
       - name: Merge kallsyms from both sources
         run: |
@@ -95,9 +81,7 @@ jobs:
 
           base_syms = set()
           enhanced_syms = {}
-          TARGET_BASE = 0xffffffe1c6801000
 
-          # 1. kallsyms_base.txtの読み込み
           try:
               with open('kallsyms_base.txt', 'r') as f:
                   for line in f:
@@ -110,61 +94,41 @@ jobs:
                               name = parts[2]
                               base_syms.add((addr, sym_type, name))
           except FileNotFoundError:
-              print("Warning: kallsyms_base.txt not found.")
+              pass
 
-          # 2. droidimg_kallsyms.jsonの読み込みとアドレス調整
           try:
               with open('droidimg_kallsyms.json', 'r') as f:
-                  content = f.read().strip()
-                  if content and content.startswith('{'):
+                  content = f.read()
+                  if content.startswith('{'):
                       data = json.loads(content)
                       if 'sym' in data:
                           for sym in data['sym']:
                               if 'addr' in sym and 'name' in sym:
-                                  addr_val = int(sym['addr'], 16) if sym['addr'].startswith('0x') else int(sym['addr'], 16)
-                                  
-                                  # もしベースアドレスがずれて出力されていた場合、0xffffffe1c6801000ベースに補正
-                                  # (典型的なデフォルトベース 0xffffffc010080000 からのオフセット計算)
-                                  if addr_val < 0xffffffe000000000 and addr_val >= 0xffffffc010080000:
-                                      offset = addr_val - 0xffffffc010080000
-                                      addr_val = TARGET_BASE + offset
-                                  
-                                  addr_str = f"0x{addr_val:x}"
                                   sym_type = 'T' if 'text' in sym.get('type', '') else 'D'
-                                  enhanced_syms[addr_str] = (sym_type, sym['name'])
-          except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
-              print(f"Notice: Could not parse droidimg JSON natively ({e}), trying regex fallback...")
-              try:
-                  with open('droidimg_kallsyms.json', 'r') as f:
-                      for line in f:
-                          match = re.search(r'([0-9a-fA-Fx]+)\s+(\w+)\s+(\S+)', line)
-                          if match:
-                              addr = match.group(1)
-                              sym_type = match.group(2)
-                              name = match.group(3)
-                              enhanced_syms[addr] = (sym_type, name)
-              except Exception:
-                  pass
+                                  enhanced_syms[sym['addr']] = (sym_type, sym['name'])
+          except (json.JSONDecodeError, FileNotFoundError):
+              with open('droidimg_kallsyms.json', 'r') as f:
+                  for line in f:
+                      match = re.search(r'([0-9a-fA-Fx]+)\s+(\w+)\s+(\S+)', line)
+                      if match:
+                          addr = match.group(1)
+                          sym_type = match.group(2)
+                          name = match.group(3)
+                          enhanced_syms[addr] = (sym_type, name)
 
-          # 3. 双方のシンボルを結合
           all_syms = {}
           for addr, sym_type, name in base_syms:
-              # 一貫性のためにプレフィックスや数値を正規化
-              val = int(addr, 16)
-              all_syms[val] = (sym_type, name)
+              all_syms[addr] = (sym_type, name)
+          for addr, (sym_type, name) in enhanced_syms.items():
+              if addr not in all_syms:
+                  all_syms[addr] = (sym_type, name)
 
-          for addr_str, (sym_type, name) in enhanced_syms.items():
-              val = int(addr_str, 16)
-              if val not in all_syms:
-                  all_syms[val] = (sym_type, name)
-
-          # 4. 固定ベースアドレスにソートして出力
           with open('kallsyms.txt', 'w') as f:
-              for addr_val in sorted(all_syms.keys()):
-                  sym_type, name = all_syms[addr_val]
-                  f.write(f"0x{addr_val:016x} {sym_type} {name}\n")
+              for addr in sorted(all_syms.keys(), key=lambda x: int(x, 16) if x.startswith('0x') else int(x, 16)):
+                  sym_type, name = all_syms[addr]
+                  f.write(f"{addr} {sym_type} {name}\n")
 
-          print(f"Total merged symbols: {len(all_syms)}")
+          print(f"Total symbols: {len(all_syms)}")
           EOF
 
       - name: Fix KASLR if needed
