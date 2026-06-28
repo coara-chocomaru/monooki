@@ -84,7 +84,7 @@ jobs:
 
           # 基準となる元の自動判定ベースアドレスと実機ターゲットアドレス
           DEFAULT_BASE = 0xffffffc010080000
-          TARGET_BASE  = 0xffffffe1c6801000
+          TARGET_BASE  = 0xffffffe1c6800000
 
           try:
               with open('kallsyms_base.txt', 'r') as f:
