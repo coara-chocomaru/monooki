@@ -1,0 +1,298 @@
+name: Extract vmlinux and kallsyms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download vmlinux
+        run: |
+          curl -fsSL -o vmlinux.raw \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/vmlinux"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip python3-venv gcc g++
+
+      - name: Setup Python virtual environment
+        run: |
+          python3 -m venv /tmp/venv
+          source /tmp/venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+
+      - name: Install Python dependencies in venv
+        run: |
+          source /tmp/venv/bin/activate
+          pip install lz4 zstandard git+https://github.com/clubby789/python-lzo@b4e39df
+          pip install git+https://github.com/marin-m/vmlinux-to-elf
+          pip install miasm
+          git clone https://github.com/nforest/droidimg.git /tmp/droidimg
+
+      - name: Detect GKI base address
+        run: |
+          python3 << 'EOF'
+          import struct
+          import sys
+          import os
+
+          def scan_kernel_va_candidates(data):
+              candidates = {}
+              for i in range(0, len(data) - 8, 4):
+                  val = struct.unpack_from('<Q', data, i)[0]
+                  if 0xffffff8000000000 <= val <= 0xffffffffffffffff:
+                      page_base = val & 0xFFFFFFFFFFFFE000
+                      candidates[page_base] = candidates.get(page_base, 0) + 1
+              return candidates
+
+          def best_candidate(candidates, min_count=10):
+              ranked = sorted(
+                  [(addr, cnt) for addr, cnt in candidates.items() if cnt >= min_count],
+                  key=lambda x: x[1],
+                  reverse=True,
+              )
+              # Prefer 0xffffffc0xxxxxxxx (39-bit VA, typical GKI AArch64)
+              gki = [x for x in ranked if (x[0] >> 32) == 0xffffffc0]
+              return gki[0][0] if gki else (ranked[0][0] if ranked else None)
+
+          with open('vmlinux.raw', 'rb') as f:
+              data = f.read()
+
+          candidates = scan_kernel_va_candidates(data)
+          base = best_candidate(candidates)
+
+          # Fallback to well-known GKI defaults if scan yields nothing
+          if base is None:
+              base = 0xffffffc008080000
+
+          print(f'Detected GKI base: 0x{base:016x}')
+          with open('detected_base.txt', 'w') as f:
+              f.write(f'0x{base:016x}\n')
+          EOF
+
+      - name: Convert raw vmlinux to ELF with vmlinux-to-elf
+        run: |
+          source /tmp/venv/bin/activate
+          DETECTED_BASE=$(cat detected_base.txt)
+          echo "Using base address: ${DETECTED_BASE}"
+
+          # Strip potential 20-byte prepended header (some MediaTek images)
+          dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
+
+          convert_elf() {
+            local INPUT="$1"
+            local OUTPUT="$2"
+            local BASE="$3"
+            local EXTRA_FLAGS="$4"
+            # Do NOT pass --use-absolute for GKI/relative-mode kernels.
+            # --base-address overrides ELF load VA; let kallsyms_relative_base
+            # drive symbol reconstruction.
+            vmlinux-to-elf ${EXTRA_FLAGS} --base-address "${BASE}" \
+              "${INPUT}" "${OUTPUT}" 2>&1
+          }
+
+          # Attempt 1: detected base, full image
+          if convert_elf vmlinux.raw vmlinux.elf "${DETECTED_BASE}" ""; then
+            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
+            echo "ELF_BASE=${DETECTED_BASE}" >> "$GITHUB_ENV"
+          # Attempt 2: detected base, stripped image
+          elif convert_elf vmlinux.strip vmlinux.elf "${DETECTED_BASE}" ""; then
+            echo "ELF_SOURCE=vmlinux.strip" >> "$GITHUB_ENV"
+            echo "ELF_BASE=${DETECTED_BASE}" >> "$GITHUB_ENV"
+          # Attempt 3: GKI canonical base, full image
+          elif convert_elf vmlinux.raw vmlinux.elf "0xffffffc008080000" ""; then
+            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
+            echo "ELF_BASE=0xffffffc008080000" >> "$GITHUB_ENV"
+          # Attempt 4: secondary GKI base
+          elif convert_elf vmlinux.raw vmlinux.elf "0xffffffc010080000" ""; then
+            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
+            echo "ELF_BASE=0xffffffc010080000" >> "$GITHUB_ENV"
+          else
+            echo "All ELF conversion attempts failed" >&2
+            exit 1
+          fi
+
+      - name: Validate null address ratio
+        run: |
+          source /tmp/venv/bin/activate
+
+          check_null_ratio() {
+            local KALLSYMS_FILE="$1"
+            local THRESHOLD=20
+
+            kallsyms-finder vmlinux.elf > "${KALLSYMS_FILE}" 2>/dev/null
+
+            python3 << PYEOF
+          import sys
+
+          with open('${KALLSYMS_FILE}') as f:
+              lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+
+          if not lines:
+              print("ERROR: empty kallsyms output")
+              sys.exit(1)
+
+          null_addrs = {'0000000000000000', '0x0000000000000000', '0x0', '0'}
+          null_count = sum(1 for l in lines if l.split()[0] in null_addrs)
+          ratio_pct = null_count / len(lines) * 100
+          print(f"Null ratio: {ratio_pct:.2f}% ({null_count}/{len(lines)})")
+
+          if ratio_pct >= ${THRESHOLD}:
+              print(f"WARN: null ratio {ratio_pct:.2f}% >= ${THRESHOLD}% threshold")
+              sys.exit(2)
+          else:
+              print(f"OK: null ratio {ratio_pct:.2f}% is within acceptable range")
+              sys.exit(0)
+          PYEOF
+          }
+
+          check_null_ratio kallsyms_base.txt
+          RATIO_RESULT=$?
+
+          if [ "${RATIO_RESULT}" -eq 2 ]; then
+            echo "Null ratio too high with detected base, retrying without --base-address override"
+            vmlinux-to-elf vmlinux.raw vmlinux_auto.elf 2>&1 || \
+              vmlinux-to-elf vmlinux.strip vmlinux_auto.elf 2>&1
+            cp vmlinux_auto.elf vmlinux.elf
+            check_null_ratio kallsyms_base.txt || true
+          fi
+
+          echo "=== Base kallsyms count ==="
+          wc -l kallsyms_base.txt
+
+      - name: Run droidimg with miasm to enhance symbols
+        run: |
+          source /tmp/venv/bin/activate
+          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || \
+            python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || \
+            echo '{}' > droidimg_kallsyms.json
+
+      - name: Merge kallsyms from both sources
+        run: |
+          source /tmp/venv/bin/activate
+          python3 << 'EOF'
+          import json
+          import re
+
+          base_syms = {}
+          enhanced_syms = {}
+
+          try:
+              with open('kallsyms_base.txt') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or line.startswith('#'):
+                          continue
+                      parts = line.split()
+                      if len(parts) >= 3:
+                          addr, sym_type, name = parts[0], parts[1], parts[2]
+                          try:
+                              addr_int = int(addr, 16)
+                          except ValueError:
+                              continue
+                          base_syms[addr_int] = (sym_type, name)
+          except FileNotFoundError:
+              pass
+
+          try:
+              with open('droidimg_kallsyms.json') as f:
+                  content = f.read().strip()
+
+              if content.startswith('{') and content != '{}':
+                  data = json.loads(content)
+                  if 'sym' in data:
+                      for sym in data['sym']:
+                          if 'addr' not in sym or 'name' not in sym:
+                              continue
+                          try:
+                              addr_int = int(sym['addr'], 16) if isinstance(sym['addr'], str) else int(sym['addr'])
+                          except (ValueError, TypeError):
+                              continue
+                          sym_type = 'T' if 'text' in sym.get('type', '').lower() else 'D'
+                          enhanced_syms[addr_int] = (sym_type, sym['name'])
+              else:
+                  raise ValueError("not JSON object")
+
+          except (json.JSONDecodeError, ValueError):
+              try:
+                  with open('droidimg_kallsyms.json') as f:
+                      for line in f:
+                          m = re.search(r'(0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+(\w)\s+(\S+)', line)
+                          if m:
+                              try:
+                                  addr_int = int(m.group(1), 16)
+                              except ValueError:
+                                  continue
+                              enhanced_syms[addr_int] = (m.group(2), m.group(3))
+              except FileNotFoundError:
+                  pass
+          except FileNotFoundError:
+              pass
+
+          all_syms = dict(base_syms)
+          for addr_int, val in enhanced_syms.items():
+              if addr_int not in all_syms:
+                  all_syms[addr_int] = val
+
+          # Remove null-address symbols (addr == 0)
+          all_syms.pop(0, None)
+
+          with open('kallsyms.txt', 'w') as f:
+              for addr_int in sorted(all_syms.keys()):
+                  sym_type, name = all_syms[addr_int]
+                  f.write(f'{addr_int:016x} {sym_type} {name}\n')
+
+          total = len(all_syms)
+          null_count = sum(1 for a in all_syms if a == 0)
+          print(f'Total symbols: {total}  (null removed: {null_count})')
+          EOF
+
+      - name: Fix KASLR if needed
+        run: |
+          curl -fsSL -o fix_kaslr_arm64.c \
+            "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
+          gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
+          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null || echo "KASLR fix not applicable"
+
+      - name: Verify kallsyms quality
+        run: |
+          echo "=== Final kallsyms summary ==="
+          wc -l kallsyms.txt
+
+          echo ""
+          echo "=== Null address ratio ==="
+          python3 << 'EOF'
+          with open('kallsyms.txt') as f:
+              lines = [l.strip() for l in f if l.strip()]
+          total = len(lines)
+          null_count = sum(1 for l in lines if l.startswith('0000000000000000'))
+          print(f'{null_count}/{total} null ({null_count/total*100:.2f}%)')
+          EOF
+
+          echo ""
+          echo "=== Sample symbols ==="
+          head -20 kallsyms.txt
+
+          echo ""
+          echo "=== Checking for kernel version string ==="
+          grep -i "linux_banner\|linux_proc_banner\|kernel_version" kallsyms.txt \
+            || echo "No kernel version symbol found (may be okay)"
+
+          echo ""
+          echo "=== Detected base ==="
+          cat detected_base.txt
+
+      - name: Upload final kallsyms artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: |
+            kallsyms.txt
+            vmlinux.elf
+            detected_base.txt
+          retention-days: 30
