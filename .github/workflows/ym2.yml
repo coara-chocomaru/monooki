@@ -53,7 +53,7 @@ jobs:
           import textwrap
           import ast
 
-          script = textwrap.dedent("""\
+          script = textwrap.dedent(r"""
           import struct, sys
           from vmlinux_to_elf.core.kallsyms import KallsymsFinder
           from vmlinux_to_elf.core.auto_unpack import VmlinuzDecompressor
@@ -223,7 +223,7 @@ jobs:
 
               with open(out_path, 'w') as f:
                   for addr, name in pairs:
-                      f.write(f'{addr:016x} {name[0]} {name[1:]}\n')
+                      print(f'{addr:016x} {name[0]} {name[1:]}', file=f)
               print(f"Written {len(pairs)} symbols to {out_path}", file=sys.stderr)
 
               if slide is not None:
@@ -231,7 +231,7 @@ jobs:
                   with open(runtime_path, 'w') as f:
                       for addr, name in pairs:
                           runtime_addr = addr + slide
-                          f.write(f'{runtime_addr:016x} {name[0]} {name[1:]}\n')
+                          print(f'{runtime_addr:016x} {name[0]} {name[1:]}', file=f)
                   print(f"Written {len(pairs)} runtime symbols to {runtime_path}", file=sys.stderr)
                   print(f"KASLR slide: {slide:#018x}", file=sys.stderr)
 
@@ -391,7 +391,7 @@ jobs:
           with open('kallsyms.txt', 'w') as f:
               for addr in sorted(all_syms):
                   sym_type, name = all_syms[addr]
-                  f.write(f'{addr:016x} {sym_type} {name}\n')
+                  print(f'{addr:016x} {sym_type} {name}', file=f)
           print(f'Total symbols: {len(all_syms)}')
           PYEOF
 
