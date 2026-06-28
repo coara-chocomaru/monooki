@@ -2,34 +2,29 @@ name: Extract vmlinux and kallsyms
 
 on:
   workflow_dispatch:
-    inputs:
-      fixed_base_addr:
-        description: 'Fixed runtime base address'
-        required: true
-        default: '0xffffffe1c6801000'
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    env:
-      FIXED_BASE_ADDR: ${{ github.event.inputs.fixed_base_addr }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Download extract-vmlinux
         run: |
-          curl -fsSL -o extract-vmlinux             "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
           chmod +x extract-vmlinux
 
       - name: Download kernel.img (zImage)
         run: |
-          curl -fsSL -o kernel.img             "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/2026"
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/2026"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y             binutils-aarch64-linux-gnu             gzip xz-utils bzip2 lzma lzop lz4 zstd             python3-pip python3-venv gcc g++
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip python3-venv gcc g++
 
       - name: Setup Python virtual environment
         run: |
@@ -56,10 +51,10 @@ jobs:
       - name: Convert raw vmlinux to ELF with vmlinux-to-elf
         run: |
           source /tmp/venv/bin/activate
-          vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf || {
+          vmlinux-to-elf --use-absolute --base-address 0xffffffe1c6801000 vmlinux.raw vmlinux.elf || {
             echo "vmlinux-to-elf failed, trying alternative approach..."
             dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
-            vmlinux-to-elf --use-absolute vmlinux.strip vmlinux.elf
+            vmlinux-to-elf --use-absolute --base-address 0xffffffe1c6801000 vmlinux.strip vmlinux.elf
           }
 
       - name: Extract base kallsyms with kallsyms-finder
@@ -72,15 +67,15 @@ jobs:
       - name: Run droidimg with miasm to enhance symbols
         run: |
           source /tmp/venv/bin/activate
-          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || {
+          python3 /tmp/droidimg/vmlinux.py -m -b 0xffffffe1c6801000 --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || {
             echo "Miasm mode failed, falling back to normal mode"
-            python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1
+            python3 /tmp/droidimg/vmlinux.py -b 0xffffffe1c6801000 --json vmlinux.raw > droidimg_kallsyms.json 2>&1
           }
 
       - name: Merge kallsyms from both sources
         run: |
           source /tmp/venv/bin/activate
-          python3 - << 'EOF'
+          python3 << 'EOF'
           import json
           import re
 
@@ -131,102 +126,34 @@ jobs:
           with open('kallsyms.txt', 'w') as f:
               for addr in sorted(all_syms.keys(), key=lambda x: int(x, 16) if x.startswith('0x') else int(x, 16)):
                   sym_type, name = all_syms[addr]
-                  print(f"{addr} {sym_type} {name}", file=f)
+                  f.write(f"{addr} {sym_type} {name}\n")
 
           print(f"Total symbols: {len(all_syms)}")
           EOF
 
-      - name: Normalize kallsyms to fixed base
-        run: |
-          python3 - << 'EOF'
-          import os
-          from pathlib import Path
-
-          fixed_base = int(os.environ["FIXED_BASE_ADDR"], 16)
-
-          def parse_syms(path):
-              items = []
-              with open(path, "r") as f:
-                  for line in f:
-                      parts = line.split()
-                      if len(parts) >= 3:
-                          try:
-                              addr = int(parts[0], 16)
-                          except ValueError:
-                              continue
-                          items.append((addr, parts[1], parts[2]))
-              return items
-
-          syms = parse_syms("kallsyms.txt")
-          if not syms:
-              raise SystemExit("kallsyms.txt is empty")
-
-          anchor_name = None
-          anchor_addr = None
-          for name in ("_stext", "_text"):
-              for addr, sym_type, sym_name in syms:
-                  if sym_name == name:
-                      anchor_name = name
-                      anchor_addr = addr
-                      break
-              if anchor_addr is not None:
-                  break
-
-          if anchor_addr is None:
-              for addr, sym_type, sym_name in syms:
-                  if sym_name == "selinux_state":
-                      anchor_name = "selinux_state"
-                      anchor_addr = addr
-                      break
-
-          if anchor_addr is None:
-              raise SystemExit("No anchor symbol found in kallsyms.txt")
-
-          slide = fixed_base - anchor_addr
-          print(f"anchor      : {anchor_name}")
-          print(f"anchor_addr : {anchor_addr:#018x}")
-          print(f"fixed_base  : {fixed_base:#018x}")
-          print(f"slide       : {slide:#018x}")
-
-          with open("kallsyms_fixed.txt", "w") as f:
-              for addr, sym_type, sym_name in syms:
-                  runtime_addr = addr + slide
-                  print(f"{runtime_addr:016x} {sym_type} {sym_name}", file=f)
-
-          Path("kallsyms_slide.txt").write_text(f"{slide:#018x}\n", encoding="utf-8")
-          EOF
-
       - name: Fix KASLR if needed
         run: |
-          curl -fsSL -o fix_kaslr_arm64.c             "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
+          curl -fsSL -o fix_kaslr_arm64.c \
+            "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
           gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
           ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null || echo "KASLR fix not applicable"
 
       - name: Verify kallsyms quality
         run: |
-          echo "=== Fixed base ==="
-          echo "${FIXED_BASE_ADDR}"
-          echo ""
           echo "=== Final kallsyms summary ==="
-          wc -l kallsyms_fixed.txt
+          wc -l kallsyms.txt
           echo ""
           echo "=== Sample symbols ==="
-          head -20 kallsyms_fixed.txt
+          head -20 kallsyms.txt
           echo ""
           echo "=== Checking for kernel version string ==="
-          grep -i "linux version" kallsyms_fixed.txt || echo "No kernel version symbol found (may be okay)"
-          echo ""
-          echo "=== Slide ==="
-          cat kallsyms_slide.txt
+          grep -i "linux version" kallsyms.txt || echo "No kernel version symbol found (may be okay)"
 
       - name: Upload final kallsyms artifact
         uses: actions/upload-artifact@v4
         with:
           name: kallsyms
           path: |
-            kallsyms_fixed.txt
             kallsyms.txt
-            kallsyms_base.txt
             vmlinux.elf
-            kallsyms_slide.txt
           retention-days: 30
