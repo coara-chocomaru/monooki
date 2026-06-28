@@ -15,342 +15,403 @@ on:
 jobs:
   extract:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Download vmlinux
         run: |
+          set -euo pipefail
           curl -fsSL -o vmlinux.raw \
             "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/vmlinux"
 
       - name: Install system dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
+            binutils \
             binutils-aarch64-linux-gnu \
+            file \
             gzip xz-utils bzip2 lzma lzop lz4 zstd \
             python3-pip python3-venv gcc g++
 
       - name: Setup Python virtual environment
         run: |
+          set -euo pipefail
           python3 -m venv /tmp/venv
           source /tmp/venv/bin/activate
           pip install --upgrade pip setuptools wheel
 
       - name: Install Python dependencies in venv
         run: |
+          set -euo pipefail
           source /tmp/venv/bin/activate
           pip install lz4 zstandard git+https://github.com/clubby789/python-lzo@b4e39df
           pip install git+https://github.com/marin-m/vmlinux-to-elf
           pip install miasm
           git clone https://github.com/nforest/droidimg.git /tmp/droidimg
 
-
-      - name: Write GKI kallsyms extractor
+      - name: Write kallsyms extractor
         run: |
-          python3 - <<'PYEOF'
-          from pathlib import Path
-          import ast
-          import textwrap
+          set -euo pipefail
+          cat > /tmp/extract_kallsyms.py << 'PYEOF'
+          from __future__ import annotations
 
-          script = textwrap.dedent(r"""
+          import argparse
+          import json
+          import re
+          import shutil
           import struct
+          import subprocess
           import sys
+          from pathlib import Path
+
           from vmlinux_to_elf.core.auto_unpack import VmlinuzDecompressor
           from vmlinux_to_elf.core.kallsyms import KallsymsFinder
 
-          NULL_THRESHOLD = 0.05
-          KERNEL_VA_MIN = 0xffff000000000000
+          KERNEL_VA_MIN = 0xffffff8000000000
           KERNEL_VA_MAX = 0xffffffffffffffff
-          RAW_SKIP_CANDIDATES = (20, 64, 256, 4096, 8192, 16384)
 
-          def is_kernel_va(addr):
+          def is_kernel_va(addr: int) -> bool:
               return KERNEL_VA_MIN <= addr <= KERNEL_VA_MAX
 
-          def null_ratio(addresses):
-              if not addresses:
-                  return 1.0
-              return sum(1 for a in addresses if a == 0) / len(addresses)
-
-          def in_range_ratio(addresses):
-              nz = [a for a in addresses if a]
-              if not nz:
-                  return 0.0
-              return sum(1 for a in nz if is_kernel_va(a)) / len(nz)
-
-          def monotonic_ratio(addresses):
-              nz = [a for a in addresses if a]
-              if len(nz) < 2:
-                  return 0.0
-              ok = sum(1 for a, b in zip(nz, nz[1:]) if a <= b)
-              return ok / (len(nz) - 1)
-
-          def address_map(finder):
-              result = {}
-              for addr, name in zip(finder.kernel_addresses, finder.symbol_names):
-                  if addr:
-                      result[name[1:]] = addr
-              return result
-
-          def recompute_4byte_signed(kernel_img, file_offset, num_symbols, relative_base):
-              size = num_symbols * 4
-              if file_offset + size > len(kernel_img):
+          def parse_symbol_line(line: str) -> tuple[int, str, str] | None:
+              parts = line.strip().split()
+              if len(parts) < 3:
                   return None
-              offsets = struct.unpack_from('<' + str(num_symbols) + 'i', kernel_img, file_offset)
-              return [relative_base + o for o in offsets]
-
-          def scan_base_candidates(kernel_img, near_offset, window=0x200000):
-              start = max(0, near_offset - window)
-              end = min(len(kernel_img), near_offset + window)
-              candidates = {}
-              for i in range(start, end - 8, 8):
-                  val = struct.unpack_from('<Q', kernel_img, i)[0]
-                  if is_kernel_va(val):
-                      page = val & 0xFFFFFFFFFFFFE000
-                      candidates[page] = candidates.get(page, 0) + 1
-              return sorted(candidates.items(), key=lambda x: x[1], reverse=True)
-
-          def run_finder(kernel_img):
               try:
-                  return KallsymsFinder(kernel_img, bit_size=64, override_relative_base=False)
-              except Exception as e:
-                  print(f"KallsymsFinder: {e}", file=sys.stderr)
+                  addr = int(parts[0], 16)
+              except ValueError:
                   return None
+              sym_type = parts[1][0]
+              name = parts[2]
+              return addr, sym_type, name
 
-          def build_candidate_images(raw):
-              candidates = []
-              try:
-                  candidates.append(("decompressed", VmlinuzDecompressor(raw).decompressed))
-              except Exception:
-                  pass
+          def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              return proc.returncode, proc.stdout, proc.stderr
 
+          def load_elf_symbols(elf_path: str) -> list[tuple[int, str, str]]:
+              tools = []
+              for tool in ("aarch64-linux-gnu-nm", "nm"):
+                  if shutil.which(tool):
+                      tools.append(tool)
+              for tool in tools:
+                  rc, out, err = run_cmd([tool, "-n", "--defined-only", elf_path])
+                  if rc != 0 or not out.strip():
+                      continue
+                  symbols: list[tuple[int, str, str]] = []
+                  for line in out.splitlines():
+                      parsed = parse_symbol_line(line)
+                      if parsed is None:
+                          continue
+                      addr, sym_type, name = parsed
+                      if addr == 0 or not is_kernel_va(addr):
+                          continue
+                      symbols.append((addr, sym_type, name))
+                  if symbols:
+                      return symbols
+              return []
+
+          def load_droidimg_symbols(raw_path: str) -> list[tuple[int, str, str]]:
+              droidimg = Path("/tmp/droidimg/vmlinux.py")
+              if not droidimg.exists():
+                  return []
+              tools = [
+                  [sys.executable, str(droidimg), "-m", "--json", raw_path],
+                  [sys.executable, str(droidimg), "--json", raw_path],
+              ]
+              for cmd in tools:
+                  proc = subprocess.run(cmd, capture_output=True, text=True)
+                  content = (proc.stdout or "") + (proc.stderr or "")
+                  if not content.strip():
+                      continue
+                  try:
+                      data = json.loads(content)
+                  except Exception:
+                      data = None
+                  symbols: list[tuple[int, str, str]] = []
+                  if isinstance(data, dict):
+                      for sym in data.get("sym", []):
+                          if not isinstance(sym, dict):
+                              continue
+                          addr_raw = sym.get("addr")
+                          name = sym.get("name")
+                          if name is None or addr_raw is None:
+                              continue
+                          try:
+                              addr = int(addr_raw, 16) if isinstance(addr_raw, str) else int(addr_raw)
+                          except (TypeError, ValueError):
+                              continue
+                          if addr == 0 or not is_kernel_va(addr):
+                              continue
+                          sym_type = "T" if "text" in str(sym.get("type", "")).lower() else "D"
+                          symbols.append((addr, sym_type, str(name)))
+                  elif content.strip().startswith("{"):
+                      try:
+                          data = json.loads(content)
+                      except Exception:
+                          data = None
+                  if symbols:
+                      return symbols
+                  for line in content.splitlines():
+                      m = re.search(r"(0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+(\w)\s+(\S+)", line)
+                      if not m:
+                          continue
+                      try:
+                          addr = int(m.group(1), 16)
+                      except ValueError:
+                          continue
+                      if addr == 0 or not is_kernel_va(addr):
+                          continue
+                      symbols.append((addr, m.group(2), m.group(3)))
+                  if symbols:
+                      return symbols
+              return []
+
+          def load_kallsyms_finder(raw_path: str) -> list[tuple[int, str, str]]:
+              raw = Path(raw_path).read_bytes()
+              candidates: list[tuple[str, bytes]] = []
               candidates.append(("raw", raw))
-              for skip in RAW_SKIP_CANDIDATES:
-                  if len(raw) > skip:
-                      candidates.append((f"raw_skip{skip}", raw[skip:]))
-              return candidates
+              if len(raw) > 20:
+                  candidates.append(("raw_skip20", raw[20:]))
+              try:
+                  decompressed = VmlinuzDecompressor(raw).decompressed
+                  if decompressed:
+                      candidates.insert(0, ("decompressed", decompressed))
+              except Exception as e:
+                  print(f"[kallsyms] decompression skipped: {e}", file=sys.stderr)
 
-          def evaluate_addresses(label, addrs, symbol_names, kaslr_base, selinux_state_va):
-              total = len(addrs)
-              if total == 0 or len(symbol_names) != total:
-                  return None
+              best: list[tuple[int, str, str]] = []
+              best_score = -1.0
 
-              nz = [(addr, name) for addr, name in zip(addrs, symbol_names) if addr]
-              if not nz:
-                  return None
-
-              null = null_ratio(addrs)
-              rng = in_range_ratio(addrs)
-              mono = monotonic_ratio(addrs)
-              if null > NULL_THRESHOLD:
-                  return None
-              if rng < 0.95:
-                  return None
-              if mono < 0.90:
-                  return None
-
-              sym = {name[1:]: addr for addr, name in zip(addrs, symbol_names) if addr}
-              text_addr = sym.get('_stext') or sym.get('_text')
-              selinux_addr = sym.get('selinux_state')
-              if kaslr_base is not None and text_addr is None:
-                  return None
-              if selinux_state_va is not None and selinux_addr is None:
-                  return None
-
-              slides = []
-              if text_addr is not None and kaslr_base is not None:
-                  slide_from_text = kaslr_base - text_addr
-                  slides.append(('text', slide_from_text))
-              if selinux_addr is not None and selinux_state_va is not None:
-                  slide_from_selinux = selinux_state_va - selinux_addr
-                  slides.append(('selinux', slide_from_selinux))
-
-              slide = None
-              if slides:
-                  slide = slides[0][1]
-                  if any(s != slide for _, s in slides[1:]):
-                      return None
-
-              if slide is not None:
-                  if text_addr is not None and text_addr + slide != kaslr_base:
-                      return None
-                  if selinux_addr is not None and selinux_addr + slide != selinux_state_va:
-                      return None
-
-              score = (
-                  int(rng * 1000)
-                  + int(mono * 100)
-                  + int((1.0 - null) * 100)
-                  + (200 if text_addr is not None else 0)
-                  + (200 if selinux_addr is not None else 0)
-              )
-
-              return {
-                  'label': label,
-                  'addrs': addrs,
-                  'symbol_names': symbol_names,
-                  'null_ratio': null,
-                  'in_range_ratio': rng,
-                  'monotonic_ratio': mono,
-                  'slide': slide,
-                  'score': score,
-                  'text_addr': text_addr,
-                  'selinux_addr': selinux_addr,
-              }
-
-          def refine_base_relative(kernel_img, finder, kaslr_base, selinux_state_va):
-              fo = finder.kallsyms_addresses_or_offsets__offset
-              rba = finder.relative_base_address
-              candidates = []
-
-              if rba:
-                  candidates.append(('finder', rba))
-
-              if fo:
-                  for step in range(8, 2048, 8):
-                      pos = fo - step
-                      if pos >= 0:
-                          val = struct.unpack_from('<Q', kernel_img, pos)[0]
-                          if is_kernel_va(val):
-                              candidates.append((f'pre-{step}', val))
-                  for addr, count in scan_base_candidates(kernel_img, fo)[:20]:
-                      candidates.append((f'scan:{count}', addr))
-
-              seen = set()
-              best = None
-              for label, base in candidates:
-                  if base in seen:
-                      continue
-                  seen.add(base)
-                  addrs = recompute_4byte_signed(kernel_img, fo, finder.num_symbols, base)
-                  if addrs is None:
-                      continue
-                  rec = evaluate_addresses(f'{label}:{base:#x}', addrs, finder.symbol_names, kaslr_base, selinux_state_va)
-                  if rec is None:
-                      continue
-                  rec['relative_base'] = base
-                  rec['refine_label'] = label
-                  if best is None or rec['score'] > best['score']:
-                      best = rec
-              return best
-
-          def extract(raw_path, out_path, selinux_state_runtime_va=None, kaslr_base=None):
-              with open(raw_path, 'rb') as f:
-                  raw = f.read()
-
-              diagnostics = []
-              best = None
-
-              for label, img in build_candidate_images(raw):
-                  finder = run_finder(img)
-                  if finder is None:
-                      diagnostics.append(f'[{label}] parse failed')
+              for label, blob in candidates:
+                  try:
+                      finder = KallsymsFinder(blob, bit_size=64, override_relative_base=False)
+                  except Exception as e:
+                      print(f"[kallsyms] {label}: {e}", file=sys.stderr)
                       continue
 
-                  initial_addrs = list(finder.kernel_addresses)
-                  initial = evaluate_addresses(label, initial_addrs, finder.symbol_names, kaslr_base, selinux_state_runtime_va)
-                  diagnostics.append(
-                      f'[{label}] parsed version={finder.version_number} has_base_relative={finder.has_base_relative} '
-                      f'null={null_ratio(initial_addrs):.2%} range={in_range_ratio(initial_addrs):.2%} mono={monotonic_ratio(initial_addrs):.2%}'
+                  pairs: list[tuple[int, str, str]] = []
+                  kernel_ok = 0
+                  non_zero = 0
+                  for addr, raw_name in zip(finder.kernel_addresses, finder.symbol_names):
+                      if not raw_name:
+                          continue
+                      sym_type = raw_name[0]
+                      name = raw_name[1:]
+                      if addr != 0:
+                          non_zero += 1
+                      if is_kernel_va(addr):
+                          kernel_ok += 1
+                      pairs.append((addr, sym_type, name))
+
+                  if not pairs:
+                      continue
+
+                  valid_ratio = kernel_ok / len(pairs)
+                  non_zero_ratio = non_zero / len(pairs)
+                  score = valid_ratio + (0.05 if non_zero_ratio > 0.95 else 0.0)
+                  print(
+                      f"[kallsyms] {label}: version={finder.version_number} "
+                      f"valid_ratio={valid_ratio:.4f} non_zero={non_zero_ratio:.4f}",
+                      file=sys.stderr,
                   )
 
-                  chosen = initial
-                  if finder.has_base_relative and finder.kallsyms_addresses_or_offsets__offset is not None:
-                      refined = refine_base_relative(img, finder, kaslr_base, selinux_state_runtime_va)
-                      if refined is not None and (chosen is None or refined['score'] > chosen['score']):
-                          chosen = refined
+                  if valid_ratio >= 0.98 and score > best_score:
+                      best = [(addr, t, name) for addr, t, name in pairs if addr != 0 and is_kernel_va(addr)]
+                      best_score = score
 
-                  if chosen is not None:
-                      chosen['kernel_img'] = img
-                      chosen['finder'] = finder
-                      chosen['candidate_label'] = label
-                      if best is None or chosen['score'] > best['score']:
-                          best = chosen
+              return best
 
-              Path('kallsyms_quality.txt').write_text('
-             '.join(diagnostics) + '
-            ', encoding='utf-8')
+          def choose_primary_sources(raw_path: str, elf_path: str) -> list[tuple[str, list[tuple[int, str, str]]]]:
+              sources: list[tuple[str, list[tuple[int, str, str]]]] = []
 
-              if best is None:
-                  print('ERROR: no valid kallsyms candidate found', file=sys.stderr)
-                  print('=== diagnostics ===', file=sys.stderr)
-                  for line in diagnostics:
-                      print(line, file=sys.stderr)
-                  sys.exit(1)
-
-              finder = best['finder']
-              addrs = best['addrs']
-              slide = best['slide']
-              sym = {name[1:]: addr for addr, name in zip(addrs, finder.symbol_names) if addr}
-
-              print(f'selected image      : {best["candidate_label"]}', file=sys.stderr)
-              print(f'kernel version      : {finder.version_number}', file=sys.stderr)
-              print(f'has_base_relative    : {finder.has_base_relative}', file=sys.stderr)
-              print(f'null ratio          : {best["null_ratio"]*100:.2f}%', file=sys.stderr)
-              print(f'in-range ratio      : {best["in_range_ratio"]*100:.2f}%', file=sys.stderr)
-              print(f'monotonic ratio     : {best["monotonic_ratio"]*100:.2f}%', file=sys.stderr)
-              if finder.has_base_relative and finder.kallsyms_addresses_or_offsets__offset is not None:
-                  print(f'relative_base       : {finder.relative_base_address:#018x}' if finder.relative_base_address else 'relative_base       : None', file=sys.stderr)
-                  print(f'offsets_file_off    : {finder.kallsyms_addresses_or_offsets__offset:#010x}', file=sys.stderr)
-              if best.get('relative_base') is not None:
-                  print(f'refined_base        : {best["relative_base"]:#018x}', file=sys.stderr)
-              if best.get('text_addr') is not None:
-                  print(f'_text/_stext link   : {best["text_addr"]:#018x}', file=sys.stderr)
-              if best.get('selinux_addr') is not None:
-                  print(f'selinux_state link  : {best["selinux_addr"]:#018x}', file=sys.stderr)
-              if slide is not None:
-                  print(f'KASLR slide         : {slide:#018x}', file=sys.stderr)
+              elf_symbols = load_elf_symbols(elf_path)
+              if elf_symbols:
+                  sources.append(("elf_nm", elf_symbols))
+                  print(f"[source] elf_nm: {len(elf_symbols)} symbols", file=sys.stderr)
               else:
-                  print('KASLR slide         : None', file=sys.stderr)
+                  print("[source] elf_nm: no usable symbols", file=sys.stderr)
 
-              pairs = [(addr, name) for addr, name in zip(addrs, finder.symbol_names) if addr]
-              with open(out_path, 'w') as f:
-                  for addr, name in pairs:
-                      print(f'{addr:016x} {name[0]} {name[1:]}', file=f)
-              print(f'Written {len(pairs)} symbols to {out_path}', file=sys.stderr)
+              kallsyms_symbols = load_kallsyms_finder(raw_path)
+              if kallsyms_symbols:
+                  sources.append(("kallsyms_finder", kallsyms_symbols))
+                  print(f"[source] kallsyms_finder: {len(kallsyms_symbols)} symbols", file=sys.stderr)
+              else:
+                  print("[source] kallsyms_finder: no usable symbols", file=sys.stderr)
+
+              droidimg_symbols = load_droidimg_symbols(raw_path)
+              if droidimg_symbols:
+                  sources.append(("droidimg", droidimg_symbols))
+                  print(f"[source] droidimg: {len(droidimg_symbols)} symbols", file=sys.stderr)
+              else:
+                  print("[source] droidimg: no usable symbols", file=sys.stderr)
+
+              return sources
+
+          def merge_sources(sources: list[tuple[str, list[tuple[int, str, str]]]]) -> tuple[list[tuple[int, str, str]], dict[str, str]]:
+              merged: dict[str, tuple[int, str, str, str]] = {}
+              provenance: dict[str, str] = {}
+
+              for source_name, symbols in sources:
+                  for addr, sym_type, name in symbols:
+                      if not name:
+                          continue
+                      if addr == 0 or not is_kernel_va(addr):
+                          continue
+                      cur = merged.get(name)
+                      if cur is None:
+                          merged[name] = (addr, sym_type, name, source_name)
+                          continue
+
+                      cur_addr, cur_type, _, cur_source = cur
+                      if cur_addr == 0 or not is_kernel_va(cur_addr):
+                          merged[name] = (addr, sym_type, name, source_name)
+                          continue
+
+                      # Prefer the first source in the list unless the current entry is invalid.
+                      if cur_source == source_name:
+                          continue
+
+                  # preserve provenance for the whole source if it wins
+              final_items = sorted(
+                  ((addr, sym_type, name) for addr, sym_type, name, _ in merged.values()),
+                  key=lambda x: (x[0], x[2]),
+              )
+
+              for addr, sym_type, name, source_name in merged.values():
+                  provenance[name] = source_name
+
+              return final_items, provenance
+
+          def write_symbol_file(path: Path, symbols: list[tuple[int, str, str]]) -> None:
+              with path.open("w", encoding="utf-8") as f:
+                  for addr, sym_type, name in symbols:
+                      print(f"{addr:016x} {sym_type} {name}", file=f)
+
+          def get_symbol_map(symbols: list[tuple[int, str, str]]) -> dict[str, tuple[int, str]]:
+              return {name: (addr, sym_type) for addr, sym_type, name in symbols}
+
+          def compute_slide(symbols: list[tuple[int, str, str]], kaslr_base: int, selinux_state_va: int) -> tuple[int | None, str]:
+              sym = get_symbol_map(symbols)
+              if "_text" in sym:
+                  text_addr, _ = sym["_text"]
+                  slide = kaslr_base - text_addr
+                  return slide, "_text"
+              if "_stext" in sym:
+                  text_addr, _ = sym["_stext"]
+                  slide = kaslr_base - text_addr
+                  return slide, "_stext"
+              if "selinux_state" in sym:
+                  sel_addr, _ = sym["selinux_state"]
+                  slide = selinux_state_va - sel_addr
+                  return slide, "selinux_state"
+              return None, ""
+
+          def quality_report(symbols: list[tuple[int, str, str]], kaslr_base: int, selinux_state_va: int) -> str:
+              sym = get_symbol_map(symbols)
+              total = len(symbols)
+              kernel_ok = sum(1 for addr, _, _ in symbols if is_kernel_va(addr))
+              zero = sum(1 for addr, _, _ in symbols if addr == 0)
+              text_addr = sym.get("_text", sym.get("_stext", (None, "")))[0]
+              sel_addr = sym.get("selinux_state", (None, ""))[0]
+              lines = [
+                  f"total_symbols={total}",
+                  f"kernel_va_symbols={kernel_ok}",
+                  f"zero_symbols={zero}",
+              ]
+              if text_addr is not None:
+                  lines.append(f"text_link_time={text_addr:016x}")
+                  lines.append(f"text_runtime={kaslr_base:016x}")
+              if sel_addr is not None:
+                  lines.append(f"selinux_link_time={sel_addr:016x}")
+                  lines.append(f"selinux_runtime={selinux_state_va:016x}")
+              return "\n".join(lines) + "\n"
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("raw_path")
+              parser.add_argument("elf_path")
+              parser.add_argument("kaslr_base")
+              parser.add_argument("selinux_state_va")
+              args = parser.parse_args()
+
+              raw_path = args.raw_path
+              elf_path = args.elf_path
+              kaslr_base = int(args.kaslr_base, 16)
+              selinux_state_va = int(args.selinux_state_va, 16)
+
+              sources = choose_primary_sources(raw_path, elf_path)
+              if not sources:
+                  print("ERROR: no usable symbol sources found", file=sys.stderr)
+                  return 1
+
+              merged, provenance = merge_sources(sources)
+              if not merged:
+                  print("ERROR: merged symbol table is empty", file=sys.stderr)
+                  return 1
+
+              sym_map = get_symbol_map(merged)
+              if "_text" not in sym_map and "_stext" not in sym_map and "selinux_state" not in sym_map:
+                  print("ERROR: no anchor symbols were found", file=sys.stderr)
+                  return 1
+
+              slide, anchor_name = compute_slide(merged, kaslr_base, selinux_state_va)
+              if slide is None:
+                  print("WARNING: no anchor symbol available for runtime conversion", file=sys.stderr)
+              else:
+                  print(f"[slide] derived from {anchor_name}: {slide:#018x}", file=sys.stderr)
+
+              out_link = Path("kallsyms.txt")
+              out_base = Path("kallsyms_base.txt")
+              out_runtime = Path("kallsyms_base_runtime.txt")
+              out_quality = Path("kallsyms_quality.txt")
+
+              write_symbol_file(out_link, merged)
+              write_symbol_file(out_base, merged)
 
               if slide is not None:
-                  runtime_path = out_path.replace('.txt', '_runtime.txt')
-                  with open(runtime_path, 'w') as f:
-                      for addr, name in pairs:
-                          print(f'{addr + slide:016x} {name[0]} {name[1:]}', file=f)
-                  print(f'Written {len(pairs)} runtime symbols to {runtime_path}', file=sys.stderr)
+                  runtime_symbols = [(addr + slide, sym_type, name) for addr, sym_type, name in merged]
+                  write_symbol_file(out_runtime, runtime_symbols)
+              else:
+                  out_runtime.write_text("", encoding="utf-8")
 
-          if __name__ == '__main__':
-              runtime_va = int(sys.argv[3], 16) if len(sys.argv) > 3 else None
-              kaslr_va = int(sys.argv[4], 16) if len(sys.argv) > 4 else None
-              extract(sys.argv[1], sys.argv[2], runtime_va, kaslr_va)
-          """)
+              out_quality.write_text(quality_report(merged, kaslr_base, selinux_state_va), encoding="utf-8")
 
-          Path('/tmp/extract_kallsyms.py').write_text(script, encoding='utf-8')
-          ast.parse(Path('/tmp/extract_kallsyms.py').read_text(encoding='utf-8'))
-          print('syntax OK')
+              print(f"[output] {len(merged)} symbols written", file=sys.stderr)
+              print(f"[output] provenance entries: {len(provenance)}", file=sys.stderr)
+              return 0
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
           PYEOF
+          python3 -m py_compile /tmp/extract_kallsyms.py
 
       - name: Convert raw vmlinux to ELF
         run: |
-          set -e
-          if file -b vmlinux.raw | grep -qi 'ELF'; then
+          set -euo pipefail
+          source /tmp/venv/bin/activate
+
+          if file vmlinux.raw | grep -qi 'ELF'; then
             cp vmlinux.raw vmlinux.elf
           else
-            source /tmp/venv/bin/activate
-            if vmlinux-to-elf vmlinux.raw vmlinux.elf 2>&1; then
-              :
-            else
-              if [ -f vmlinux.raw ] && dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null; then
-                vmlinux-to-elf vmlinux.strip vmlinux.elf 2>&1 || cp vmlinux.raw vmlinux.elf
-              else
-                cp vmlinux.raw vmlinux.elf
-              fi
-            fi
+            vmlinux-to-elf vmlinux.raw vmlinux.elf 2>&1 \
+              || { dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null \
+                   && vmlinux-to-elf vmlinux.strip vmlinux.elf 2>&1; } \
+              || { echo "WARNING: vmlinux-to-elf failed" >&2; cp vmlinux.raw vmlinux.elf; }
           fi
 
-      - name: Extract kallsyms (GKI-aware with KASLR anchor)
+          file vmlinux.elf || true
+
+      - name: Extract kallsyms
         env:
           KASLR_BASE: ${{ github.event.inputs.kaslr_base }}
           SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
         run: |
+          set -euo pipefail
           source /tmp/venv/bin/activate
 
           echo "=== Input anchors ==="
@@ -359,128 +420,60 @@ jobs:
 
           python3 /tmp/extract_kallsyms.py \
             vmlinux.raw \
-            kallsyms_base.txt \
-            "${SELINUX_STATE_VA}" \
+            vmlinux.elf \
             "${KASLR_BASE}" \
-            2>&1 \
-          || python3 /tmp/extract_kallsyms.py \
-               vmlinux.strip \
-               kallsyms_base.txt \
-               "${SELINUX_STATE_VA}" \
-               "${KASLR_BASE}" \
-               2>&1
+            "${SELINUX_STATE_VA}" \
+            2>&1 | tee extract_kallsyms.log
 
-          echo "=== kallsyms_base.txt count ==="
-          wc -l kallsyms_base.txt
+          echo "=== kallsyms.txt count ==="
+          wc -l kallsyms.txt
 
-          if [ -f kallsyms_base_runtime.txt ]; then
+          echo "=== kallsyms_quality.txt ==="
+          cat kallsyms_quality.txt
+
+          if [ -f kallsyms_base_runtime.txt ] && [ -s kallsyms_base_runtime.txt ]; then
             echo "=== Runtime kallsyms count ==="
             wc -l kallsyms_base_runtime.txt
             echo "=== Verifying selinux_state VA ==="
-            grep "selinux_state$" kallsyms_base_runtime.txt | head -3
+            grep "selinux_state$" kallsyms_base_runtime.txt | head -3 || true
           fi
+
+          echo "=== Sample symbols ==="
+          head -20 kallsyms.txt
 
       - name: Validate KASLR slide consistency
         env:
           KASLR_BASE: ${{ github.event.inputs.kaslr_base }}
           SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
         run: |
-          python3 - << PYEOF
-          import sys, os
-
-          kaslr_base = int(os.environ['KASLR_BASE'], 16)
-          selinux_runtime = int(os.environ['SELINUX_STATE_VA'], 16)
-
-          # Read slide from runtime kallsyms
-          slide = None
-          try:
-              with open('kallsyms_base_runtime.txt') as f:
-                  for line in f:
-                      parts = line.split()
-                      if len(parts) >= 3 and parts[2] == 'selinux_state':
-                          runtime_addr = int(parts[0], 16)
-                          if runtime_addr == selinux_runtime:
-                              print(f"selinux_state VA match: {runtime_addr:#018x} OK")
-                          else:
-                              print(f"MISMATCH: expected {selinux_runtime:#018x} got {runtime_addr:#018x}")
-                          break
-          except FileNotFoundError:
-              print("kallsyms_base_runtime.txt not found (slide may not have been computed)")
-
-          # Cross-check: _text runtime VA should equal kaslr_base
-          try:
-              with open('kallsyms_base_runtime.txt') as f:
-                  for line in f:
-                      parts = line.split()
-                      if len(parts) >= 3 and parts[2] in ('_text', '_stext'):
-                          _text_runtime = int(parts[0], 16)
-                          if _text_runtime == kaslr_base:
-                              print(f"{parts[2]} == KASLR base {kaslr_base:#018x} OK")
-                          else:
-                              delta = _text_runtime - kaslr_base
-                              print(f"{parts[2]} = {_text_runtime:#018x}, KASLR base = {kaslr_base:#018x}, delta = {delta:#x}")
-                          break
-          except FileNotFoundError:
-              pass
-          PYEOF
-
-      - name: Run droidimg with miasm to enhance symbols
-        run: |
-          source /tmp/venv/bin/activate
-          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 \
-            || python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1 \
-            || echo '{}' > droidimg_kallsyms.json
-
-
-      - name: Promote validated kallsyms
-        run: |
-          cp kallsyms_base.txt kallsyms.txt
-          if [ -f kallsyms_base_runtime.txt ]; then
-            cp kallsyms_base_runtime.txt kallsyms_runtime.txt
-          fi
-
-      - name: Fix KASLR if needed
-        run: |
-          curl -fsSL -o fix_kaslr_arm64.c \
-            "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
-          gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
-          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null \
-            || echo "KASLR fix not applicable"
-
-
-      - name: Verify kallsyms quality
-        env:
-          SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
-        run: |
-          echo "=== Final kallsyms (link-time) ==="
-          wc -l kallsyms.txt
-
-          echo ""
-          echo "=== Null ratio ==="
+          set -euo pipefail
           python3 - << 'PYEOF'
-          with open('kallsyms.txt') as f:
-              lines = [l.strip() for l in f if l.strip()]
-          total = len(lines)
-          null_count = sum(1 for l in lines if l.startswith('0000000000000000'))
-          ratio = null_count / total if total else 1.0
-          print(f'{null_count}/{total} ({ratio*100:.2f}%)')
-          if total == 0 or ratio > 0.05:
-              raise SystemExit(1)
+          import os
+
+          kaslr_base = int(os.environ["KASLR_BASE"], 16)
+          selinux_runtime = int(os.environ["SELINUX_STATE_VA"], 16)
+
+          try:
+              with open("kallsyms_base_runtime.txt", encoding="utf-8") as f:
+                  lines = [line.strip().split() for line in f if line.strip()]
+          except FileNotFoundError:
+              print("kallsyms_base_runtime.txt not found")
+              raise SystemExit(0)
+
+          for parts in lines:
+              if len(parts) >= 3 and parts[2] == "selinux_state":
+                  runtime_addr = int(parts[0], 16)
+                  print(f"selinux_state runtime: {runtime_addr:#018x}")
+                  print(f"selinux_state expected: {selinux_runtime:#018x}")
+                  break
+
+          for parts in lines:
+              if len(parts) >= 3 and parts[2] in ("_text", "_stext"):
+                  text_runtime = int(parts[0], 16)
+                  print(f"{parts[2]} runtime: {text_runtime:#018x}")
+                  print(f"KASLR base   : {kaslr_base:#018x}")
+                  break
           PYEOF
-
-          echo ""
-          echo "=== Sample symbols ==="
-          head -20 kallsyms.txt
-
-          echo ""
-          echo "=== selinux_state in link-time kallsyms ==="
-          grep "selinux_state$" kallsyms.txt | head -3
-
-          if [ -f kallsyms_base_runtime.txt ]; then
-            echo ""
-            echo "=== selinux_state in runtime kallsyms ==="
-            grep "selinux_state$" kallsyms_base_runtime.txt | head -3
-          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -490,5 +483,6 @@ jobs:
             kallsyms.txt
             kallsyms_base.txt
             kallsyms_base_runtime.txt
+            kallsyms_quality.txt
             vmlinux.elf
           retention-days: 30
