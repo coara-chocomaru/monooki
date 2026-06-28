@@ -1,0 +1,251 @@
+name: Extract vmlinux and kallsyms
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    env:
+      FIXED_BASE_ADDR: 0xffffffe1c6801000
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download extract-vmlinux
+        run: |
+          curl -fsSL -o extract-vmlinux \
+            "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux"
+          chmod +x extract-vmlinux
+
+      - name: Download kernel.img (zImage)
+        run: |
+          curl -fsSL -o kernel.img \
+            "https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A7%E3%83%BC%E3%81%9F2/2026"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip python3-venv gcc g++
+
+      - name: Setup Python virtual environment
+        run: |
+          python3 -m venv /tmp/venv
+          source /tmp/venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+
+      - name: Install Python dependencies in venv
+        run: |
+          source /tmp/venv/bin/activate
+          pip install lz4 zstandard git+https://github.com/clubby789/python-lzo@b4e39df
+          pip install git+https://github.com/marin-m/vmlinux-to-elf
+          pip install miasm
+          git clone https://github.com/nforest/droidimg.git /tmp/droidimg
+
+      - name: Decompress zImage to raw vmlinux
+        run: |
+          ./extract-vmlinux kernel.img 2>/dev/null > vmlinux.raw
+          if [ ! -s vmlinux.raw ]; then
+            echo "ERROR: extract-vmlinux failed or produced empty output"
+            exit 1
+          fi
+
+      - name: Convert raw vmlinux to ELF with vmlinux-to-elf
+        run: |
+          source /tmp/venv/bin/activate
+          vmlinux-to-elf --use-absolute vmlinux.raw vmlinux.elf || {
+            echo "vmlinux-to-elf failed, trying alternative approach..."
+            dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
+            vmlinux-to-elf --use-absolute vmlinux.strip vmlinux.elf
+          }
+
+      - name: Extract base kallsyms with kallsyms-finder
+        run: |
+          source /tmp/venv/bin/activate
+          kallsyms-finder vmlinux.elf > kallsyms_base.txt
+          echo "=== Base kallsyms count ==="
+          wc -l kallsyms_base.txt
+
+      - name: Run droidimg with miasm to enhance symbols
+        run: |
+          source /tmp/venv/bin/activate
+          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || {
+            echo "Miasm mode failed, falling back to normal mode"
+            python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1
+          }
+
+      - name: Merge kallsyms from both sources with fixed base
+        run: |
+          source /tmp/venv/bin/activate
+          python3 - << 'EOF'
+          import json
+          import os
+          import re
+          import sys
+
+          FIXED_BASE = int(os.environ["FIXED_BASE_ADDR"], 16)
+
+          def parse_addr(value):
+              if isinstance(value, int):
+                  return value
+              if not isinstance(value, str):
+                  return None
+              value = value.strip()
+              if not value:
+                  return None
+              try:
+                  return int(value, 16)
+              except ValueError:
+                  try:
+                      return int(value)
+                  except ValueError:
+                      return None
+
+          def read_base_symbols(path):
+              symbols = []
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 3:
+                          continue
+                      addr = parse_addr(parts[0])
+                      if addr is None:
+                          continue
+                      sym_type = parts[1]
+                      name = parts[2]
+                      symbols.append((addr, sym_type, name))
+              return symbols
+
+          def pick_anchor(symbols):
+              for preferred in ("_stext", "_text"):
+                  for addr, sym_type, name in symbols:
+                      if name == preferred:
+                          return addr, name
+              for addr, sym_type, name in symbols:
+                  if sym_type and sym_type[0].upper() == "T":
+                      return addr, name
+              for addr, sym_type, name in symbols:
+                  return addr, name
+              return None, None
+
+          def add_symbol(store, addr, sym_type, name):
+              if addr is None:
+                  return
+              if addr <= 0:
+                  return
+              store[addr] = (sym_type, name)
+
+          base_syms = []
+          try:
+              base_syms = read_base_symbols("kallsyms_base.txt")
+          except FileNotFoundError:
+              pass
+
+          if not base_syms:
+              print("ERROR: kallsyms_base.txt is missing or empty", file=sys.stderr)
+              sys.exit(1)
+
+          anchor_addr, anchor_name = pick_anchor(base_syms)
+          if anchor_addr is None:
+              print("ERROR: could not find anchor symbol in kallsyms_base.txt", file=sys.stderr)
+              sys.exit(1)
+
+          delta = FIXED_BASE - anchor_addr
+          print(f"Anchor symbol       : {anchor_name}")
+          print(f"Anchor addr (input) : {anchor_addr:#018x}")
+          print(f"Fixed base          : {FIXED_BASE:#018x}")
+          print(f"Applied delta       : {delta:+#x}")
+
+          all_syms = {}
+
+          for addr, sym_type, name in base_syms:
+              add_symbol(all_syms, addr + delta, sym_type, name)
+
+          try:
+              with open("droidimg_kallsyms.json", "r", encoding="utf-8", errors="ignore") as f:
+                  content = f.read().strip()
+
+              if content and content.startswith("{"):
+                  data = json.loads(content)
+                  for sym in data.get("sym", []):
+                      if not isinstance(sym, dict):
+                          continue
+                      if "addr" not in sym or "name" not in sym:
+                          continue
+                      addr = parse_addr(sym["addr"])
+                      if addr is None:
+                          continue
+                      sym_type = "T" if "text" in str(sym.get("type", "")).lower() else "D"
+                      name = str(sym["name"])
+                      add_symbol(all_syms, addr + delta, sym_type, name)
+              else:
+                  for line in content.splitlines():
+                      m = re.search(r'(?P<addr>0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+(?P<type>\w)\s+(?P<name>\S+)', line)
+                      if not m:
+                          continue
+                      addr = parse_addr(m.group("addr"))
+                      if addr is None:
+                          continue
+                      sym_type = m.group("type")
+                      name = m.group("name")
+                      add_symbol(all_syms, addr + delta, sym_type, name)
+          except FileNotFoundError:
+              pass
+          except json.JSONDecodeError:
+              try:
+                  with open("droidimg_kallsyms.json", "r", encoding="utf-8", errors="ignore") as f:
+                      for line in f:
+                          m = re.search(r'(?P<addr>0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+(?P<type>\w)\s+(?P<name>\S+)', line)
+                          if not m:
+                              continue
+                          addr = parse_addr(m.group("addr"))
+                          if addr is None:
+                              continue
+                          sym_type = m.group("type")
+                          name = m.group("name")
+                          add_symbol(all_syms, addr + delta, sym_type, name)
+              except FileNotFoundError:
+                  pass
+
+          with open("kallsyms.txt", "w", encoding="utf-8") as f:
+              for addr in sorted(all_syms.keys()):
+                  sym_type, name = all_syms[addr]
+                  print(f"{addr:016x} {sym_type} {name}", file=f)
+
+          with open("kallsyms_fixed_base.txt", "w", encoding="utf-8") as f:
+              for addr, sym_type, name in sorted(((a, t, n) for a, (t, n) in all_syms.items()), key=lambda x: x[0]):
+                  print(f"{addr:016x} {sym_type} {name}", file=f)
+
+          print(f"Total symbols: {len(all_syms)}")
+          EOF
+
+      - name: Fix KASLR if needed
+        run: |
+          curl -fsSL -o fix_kaslr_arm64.c \
+            "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
+          gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
+          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null || echo "KASLR fix not applicable"
+
+      - name: Verify kallsyms quality
+        run: |
+          echo "=== Final kallsyms summary ==="
+          wc -l kallsyms.txt
+          echo ""
+          echo "=== Sample symbols ==="
+          head -20 kallsyms.txt
+          echo ""
+          echo "=== Checking for kernel version string ==="
+          grep -i "linux version" kallsyms.txt || echo "No kernel version symbol found (may be okay)"
+
+      - name: Upload final kallsyms artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kallsyms
+          path: |
+            kallsyms.txt
+            kallsyms_fixed_base.txt
+            vmlinux.elf
+          retention-days: 30
