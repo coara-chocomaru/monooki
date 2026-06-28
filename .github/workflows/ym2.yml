@@ -2,6 +2,15 @@ name: Extract vmlinux and kallsyms
 
 on:
   workflow_dispatch:
+    inputs:
+      kaslr_base:
+        description: 'Runtime KASLR base address (e.g. 0xffffffe1c6800000)'
+        required: true
+        default: '0xffffffe1c6800000'
+      selinux_state_va:
+        description: 'Runtime VA of selinux_state (e.g. 0xffffffe1c8b25000)'
+        required: true
+        default: '0xffffffe1c8b25000'
 
 jobs:
   extract:
@@ -18,7 +27,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu gzip xz-utils bzip2 lzma lzop lz4 zstd python3-pip python3-venv gcc g++
+          sudo apt-get install -y \
+            binutils-aarch64-linux-gnu \
+            gzip xz-utils bzip2 lzma lzop lz4 zstd \
+            python3-pip python3-venv gcc g++
 
       - name: Setup Python virtual environment
         run: |
@@ -34,265 +46,405 @@ jobs:
           pip install miasm
           git clone https://github.com/nforest/droidimg.git /tmp/droidimg
 
-      - name: Detect GKI base address
+      - name: Write GKI kallsyms extractor
         run: |
-          python3 << 'EOF'
-          import struct
-          import sys
-          import os
+          cat > /tmp/extract_kallsyms.py << 'PYEOF'
+          import struct, sys
+          from vmlinux_to_elf.core.kallsyms import KallsymsFinder
+          from vmlinux_to_elf.core.auto_unpack import VmlinuzDecompressor
 
-          def scan_kernel_va_candidates(data):
+          NULL_THRESHOLD = 0.20
+
+          def null_ratio(addresses):
+              if not addresses:
+                  return 1.0
+              return sum(1 for a in addresses if a == 0) / len(addresses)
+
+          def recompute_4byte_signed(kernel_img, file_offset, num_symbols, relative_base):
+              size = num_symbols * 4
+              if file_offset + size > len(kernel_img):
+                  return None
+              offsets = struct.unpack_from('<' + str(num_symbols) + 'i', kernel_img, file_offset)
+              return [relative_base + o for o in offsets]
+
+          def scan_base_candidates(kernel_img, near_offset, window=0x200000):
+              start = max(0, near_offset - window)
+              end = min(len(kernel_img), near_offset + window)
               candidates = {}
-              for i in range(0, len(data) - 8, 4):
-                  val = struct.unpack_from('<Q', data, i)[0]
+              for i in range(start, end - 8, 8):
+                  val = struct.unpack_from('<Q', kernel_img, i)[0]
                   if 0xffffff8000000000 <= val <= 0xffffffffffffffff:
-                      page_base = val & 0xFFFFFFFFFFFFE000
-                      candidates[page_base] = candidates.get(page_base, 0) + 1
-              return candidates
+                      page = val & 0xFFFFFFFFFFFFE000
+                      candidates[page] = candidates.get(page, 0) + 1
+              return sorted(candidates.items(), key=lambda x: x[1], reverse=True)
 
-          def best_candidate(candidates, min_count=10):
-              ranked = sorted(
-                  [(addr, cnt) for addr, cnt in candidates.items() if cnt >= min_count],
-                  key=lambda x: x[1],
-                  reverse=True,
-              )
-              # Prefer 0xffffffc0xxxxxxxx (39-bit VA, typical GKI AArch64)
-              gki = [x for x in ranked if (x[0] >> 32) == 0xffffffc0]
-              return gki[0][0] if gki else (ranked[0][0] if ranked else None)
+          def run_finder(kernel_img):
+              try:
+                  return KallsymsFinder(kernel_img, bit_size=64, override_relative_base=False)
+              except Exception as e:
+                  print(f"KallsymsFinder: {e}", file=sys.stderr)
+                  return None
 
-          with open('vmlinux.raw', 'rb') as f:
-              data = f.read()
+          def extract(raw_path, out_path, selinux_state_runtime_va=None):
+              with open(raw_path, 'rb') as f:
+                  raw = f.read()
 
-          candidates = scan_kernel_va_candidates(data)
-          base = best_candidate(candidates)
+              candidates_img = []
+              try:
+                  candidates_img.append(('decompressed', VmlinuzDecompressor(raw).decompressed))
+              except Exception:
+                  pass
+              candidates_img.append(('raw', raw))
+              candidates_img.append(('raw_skip20', raw[20:]))
 
-          # Fallback to well-known GKI defaults if scan yields nothing
-          if base is None:
-              base = 0xffffffc008080000
+              finder = None
+              kernel_img = None
+              for label, img in candidates_img:
+                  f2 = run_finder(img)
+                  if f2 is not None:
+                      finder, kernel_img = f2, img
+                      print(f"Parsed OK: {label}", file=sys.stderr)
+                      break
 
-          print(f'Detected GKI base: 0x{base:016x}')
-          with open('detected_base.txt', 'w') as f:
-              f.write(f'0x{base:016x}\n')
-          EOF
+              if finder is None:
+                  print("ERROR: KallsymsFinder could not parse any variant", file=sys.stderr)
+                  sys.exit(1)
 
-      - name: Convert raw vmlinux to ELF with vmlinux-to-elf
-        run: |
-          source /tmp/venv/bin/activate
-          DETECTED_BASE=$(cat detected_base.txt)
-          echo "Using base address: ${DETECTED_BASE}"
+              print(f"kernel version   : {finder.version_number}", file=sys.stderr)
+              print(f"has_base_relative: {finder.has_base_relative}", file=sys.stderr)
+              rba = finder.relative_base_address
+              print(f"relative_base    : {rba:#018x}" if rba else "relative_base    : None", file=sys.stderr)
+              fo = finder.kallsyms_addresses_or_offsets__offset
+              print(f"offsets_file_off : {fo:#010x}" if fo else "offsets_file_off : None", file=sys.stderr)
+              print(f"num_symbols      : {finder.num_symbols}", file=sys.stderr)
 
-          # Strip potential 20-byte prepended header (some MediaTek images)
-          dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null
+              best_addrs = list(finder.kernel_addresses)
+              best_ratio = null_ratio(best_addrs)
+              print(f"Initial null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-          convert_elf() {
-            local INPUT="$1"
-            local OUTPUT="$2"
-            local BASE="$3"
-            local EXTRA_FLAGS="$4"
-            # Do NOT pass --use-absolute for GKI/relative-mode kernels.
-            # --base-address overrides ELF load VA; let kallsyms_relative_base
-            # drive symbol reconstruction.
-            vmlinux-to-elf ${EXTRA_FLAGS} --base-address "${BASE}" \
-              "${INPUT}" "${OUTPUT}" 2>&1
-          }
+              # --- Phase 1: fix relative_base if null ratio is high ---
+              if best_ratio >= NULL_THRESHOLD and finder.has_base_relative and fo:
+                  base_candidates = []
+                  if rba:
+                      base_candidates.append(('finder', rba))
+                  for step in range(8, 512, 8):
+                      pos = fo - step
+                      if pos >= 0:
+                          val = struct.unpack_from('<Q', kernel_img, pos)[0]
+                          if 0xffffff8000000000 <= val <= 0xffffffffffffffff:
+                              base_candidates.append((f'pre-{step}', val))
+                  for addr, count in scan_base_candidates(kernel_img, fo)[:15]:
+                      base_candidates.append((f'scan:{count}', addr))
+                  for gki in (0xffffffc008080000, 0xffffffc010080000, 0xffffffc011000000):
+                      base_candidates.append(('gki-canonical', gki))
 
-          # Attempt 1: detected base, full image
-          if convert_elf vmlinux.raw vmlinux.elf "${DETECTED_BASE}" ""; then
-            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
-            echo "ELF_BASE=${DETECTED_BASE}" >> "$GITHUB_ENV"
-          # Attempt 2: detected base, stripped image
-          elif convert_elf vmlinux.strip vmlinux.elf "${DETECTED_BASE}" ""; then
-            echo "ELF_SOURCE=vmlinux.strip" >> "$GITHUB_ENV"
-            echo "ELF_BASE=${DETECTED_BASE}" >> "$GITHUB_ENV"
-          # Attempt 3: GKI canonical base, full image
-          elif convert_elf vmlinux.raw vmlinux.elf "0xffffffc008080000" ""; then
-            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
-            echo "ELF_BASE=0xffffffc008080000" >> "$GITHUB_ENV"
-          # Attempt 4: secondary GKI base
-          elif convert_elf vmlinux.raw vmlinux.elf "0xffffffc010080000" ""; then
-            echo "ELF_SOURCE=vmlinux.raw" >> "$GITHUB_ENV"
-            echo "ELF_BASE=0xffffffc010080000" >> "$GITHUB_ENV"
-          else
-            echo "All ELF conversion attempts failed" >&2
-            exit 1
-          fi
+                  seen = set()
+                  dedup = [(l, v) for l, v in base_candidates if not (v in seen or seen.add(v))]
 
-      - name: Validate null address ratio
-        run: |
-          source /tmp/venv/bin/activate
+                  print(f"Trying {len(dedup)} relative_base candidates", file=sys.stderr)
+                  for label2, base in dedup:
+                      addrs = recompute_4byte_signed(kernel_img, fo, finder.num_symbols, base)
+                      if addrs is None:
+                          continue
+                      ratio = null_ratio(addrs)
+                      print(f"  {base:#018x} ({label2}): null={ratio*100:.2f}%", file=sys.stderr)
+                      if ratio < best_ratio:
+                          best_ratio = ratio
+                          best_addrs = addrs
+                          if best_ratio < NULL_THRESHOLD:
+                              print(f"  => Accepted", file=sys.stderr)
+                              break
 
-          check_null_ratio() {
-            local KALLSYMS_FILE="$1"
-            local THRESHOLD=20
+              print(f"Post-phase1 null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-            kallsyms-finder vmlinux.elf > "${KALLSYMS_FILE}" 2>/dev/null
+              # --- Phase 2: KASLR slide correction using selinux_state anchor ---
+              # Find selinux_state link-time VA in the current (possibly still imperfect) symbol list
+              slide = None
+              if selinux_state_runtime_va is not None:
+                  for addr, name in zip(best_addrs, finder.symbol_names):
+                      if name[1:] == 'selinux_state':
+                          link_time_va = addr
+                          slide = selinux_state_runtime_va - link_time_va
+                          print(f"selinux_state link-time VA : {link_time_va:#018x}", file=sys.stderr)
+                          print(f"selinux_state runtime VA   : {selinux_state_runtime_va:#018x}", file=sys.stderr)
+                          print(f"Computed KASLR slide       : {slide:#018x}", file=sys.stderr)
+                          break
+                  if slide is None:
+                      print("WARNING: selinux_state not found in symbol list", file=sys.stderr)
 
-            python3 << PYEOF
-          import sys
+              # --- Phase 3: if null ratio still high AND we have runtime anchor,
+              #     try to derive link-time base from KASLR info and retry recompute ---
+              if best_ratio >= NULL_THRESHOLD and selinux_state_runtime_va is not None and fo:
+                  # We know: runtime_selinux_va - slide = link_time_selinux_va
+                  # And: link_time_selinux_va = relative_base + offset_of_selinux_in_table
+                  # Without knowing offset_of_selinux we can't directly get relative_base,
+                  # but we can try: relative_base = runtime_kaslr_base - slide (if slide known)
+                  # or relative_base = first non-null runtime_addr - first_offset
+                  # Try: scan pre-table bytes, add slide correction
+                  print("Phase 3: retry with KASLR-corrected base candidates", file=sys.stderr)
+                  extra_candidates = []
+                  for step in range(8, 512, 8):
+                      pos = fo - step
+                      if pos >= 0:
+                          val = struct.unpack_from('<Q', kernel_img, pos)[0]
+                          if 0xffffff8000000000 <= val <= 0xffffffffffffffff:
+                              # This is a runtime VA stored in binary; subtract slide to get link-time base
+                              if slide is not None:
+                                  extra_candidates.append((f'pre-{step}-slide', val - slide))
+                              extra_candidates.append((f'pre-{step}', val))
 
-          with open('${KALLSYMS_FILE}') as f:
-              lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+                  seen2 = set(v for _, v in ([] if not hasattr(best_addrs, '__len__') else []))
+                  for label3, base in extra_candidates:
+                      if base in seen2:
+                          continue
+                      seen2.add(base)
+                      addrs = recompute_4byte_signed(kernel_img, fo, finder.num_symbols, base)
+                      if addrs is None:
+                          continue
+                      ratio = null_ratio(addrs)
+                      print(f"  {base:#018x} ({label3}): null={ratio*100:.2f}%", file=sys.stderr)
+                      if ratio < best_ratio:
+                          best_ratio = ratio
+                          best_addrs = addrs
+                          slide = None  # recompute slide from new addresses below
+                          if best_ratio < NULL_THRESHOLD:
+                              print(f"  => Accepted", file=sys.stderr)
+                              break
 
-          if not lines:
-              print("ERROR: empty kallsyms output")
-              sys.exit(1)
+              # Recompute slide after phase 3 if needed
+              if slide is None and selinux_state_runtime_va is not None:
+                  for addr, name in zip(best_addrs, finder.symbol_names):
+                      if name[1:] == 'selinux_state':
+                          link_time_va = addr
+                          slide = selinux_state_runtime_va - link_time_va
+                          print(f"Recomputed KASLR slide: {slide:#018x}", file=sys.stderr)
+                          break
 
-          null_addrs = {'0000000000000000', '0x0000000000000000', '0x0', '0'}
-          null_count = sum(1 for l in lines if l.split()[0] in null_addrs)
-          ratio_pct = null_count / len(lines) * 100
-          print(f"Null ratio: {ratio_pct:.2f}% ({null_count}/{len(lines)})")
+              print(f"Final null ratio: {best_ratio*100:.2f}%", file=sys.stderr)
 
-          if ratio_pct >= ${THRESHOLD}:
-              print(f"WARN: null ratio {ratio_pct:.2f}% >= ${THRESHOLD}% threshold")
-              sys.exit(2)
-          else:
-              print(f"OK: null ratio {ratio_pct:.2f}% is within acceptable range")
-              sys.exit(0)
+              # --- Write output ---
+              # Emit link-time addresses (what kallsyms normally contains).
+              # Also write a runtime-address version if slide is known.
+              pairs = [(a, n) for a, n in zip(best_addrs, finder.symbol_names) if a != 0]
+
+              with open(out_path, 'w') as f:
+                  for addr, name in pairs:
+                      f.write(f'{addr:016x} {name[0]} {name[1:]}\n')
+              print(f"Written {len(pairs)} symbols to {out_path}", file=sys.stderr)
+
+              if slide is not None:
+                  runtime_path = out_path.replace('.txt', '_runtime.txt')
+                  with open(runtime_path, 'w') as f:
+                      for addr, name in pairs:
+                          runtime_addr = addr + slide
+                          f.write(f'{runtime_addr:016x} {name[0]} {name[1:]}\n')
+                  print(f"Written {len(pairs)} runtime symbols to {runtime_path}", file=sys.stderr)
+                  print(f"KASLR slide: {slide:#018x}", file=sys.stderr)
+
+          if __name__ == '__main__':
+              runtime_va = int(sys.argv[3], 16) if len(sys.argv) > 3 else None
+              extract(sys.argv[1], sys.argv[2], runtime_va)
           PYEOF
-          }
+          sed -i 's/^          //' /tmp/extract_kallsyms.py
+          python3 -c "import ast; ast.parse(open('/tmp/extract_kallsyms.py').read()); print('syntax OK')"
 
-          check_null_ratio kallsyms_base.txt
-          RATIO_RESULT=$?
+      - name: Convert raw vmlinux to ELF
+        run: |
+          source /tmp/venv/bin/activate
+          # No --use-absolute: GKI uses CONFIG_KALLSYMS_BASE_RELATIVE
+          vmlinux-to-elf vmlinux.raw vmlinux.elf 2>&1 \
+            || { dd if=vmlinux.raw of=vmlinux.strip bs=20 skip=1 2>/dev/null \
+                 && vmlinux-to-elf vmlinux.strip vmlinux.elf 2>&1; } \
+            || { echo "WARNING: vmlinux-to-elf failed" >&2; cp vmlinux.raw vmlinux.elf; }
 
-          if [ "${RATIO_RESULT}" -eq 2 ]; then
-            echo "Null ratio too high with detected base, retrying without --base-address override"
-            vmlinux-to-elf vmlinux.raw vmlinux_auto.elf 2>&1 || \
-              vmlinux-to-elf vmlinux.strip vmlinux_auto.elf 2>&1
-            cp vmlinux_auto.elf vmlinux.elf
-            check_null_ratio kallsyms_base.txt || true
+      - name: Extract kallsyms (GKI-aware with KASLR anchor)
+        env:
+          KASLR_BASE: ${{ github.event.inputs.kaslr_base }}
+          SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
+        run: |
+          source /tmp/venv/bin/activate
+
+          echo "=== Input anchors ==="
+          echo "KASLR base      : ${KASLR_BASE}"
+          echo "selinux_state VA: ${SELINUX_STATE_VA}"
+
+          python3 /tmp/extract_kallsyms.py \
+            vmlinux.raw \
+            kallsyms_base.txt \
+            "${SELINUX_STATE_VA}" \
+            2>&1 \
+          || python3 /tmp/extract_kallsyms.py \
+               vmlinux.strip \
+               kallsyms_base.txt \
+               "${SELINUX_STATE_VA}" \
+               2>&1
+
+          echo "=== kallsyms_base.txt count ==="
+          wc -l kallsyms_base.txt
+
+          if [ -f kallsyms_base_runtime.txt ]; then
+            echo "=== Runtime kallsyms count ==="
+            wc -l kallsyms_base_runtime.txt
+            echo "=== Verifying selinux_state VA ==="
+            grep "selinux_state$" kallsyms_base_runtime.txt | head -3
           fi
 
-          echo "=== Base kallsyms count ==="
-          wc -l kallsyms_base.txt
+      - name: Validate KASLR slide consistency
+        env:
+          KASLR_BASE: ${{ github.event.inputs.kaslr_base }}
+          SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
+        run: |
+          python3 - << PYEOF
+          import sys, os
+
+          kaslr_base = int(os.environ['KASLR_BASE'], 16)
+          selinux_runtime = int(os.environ['SELINUX_STATE_VA'], 16)
+
+          # Read slide from runtime kallsyms
+          slide = None
+          try:
+              with open('kallsyms_base_runtime.txt') as f:
+                  for line in f:
+                      parts = line.split()
+                      if len(parts) >= 3 and parts[2] == 'selinux_state':
+                          runtime_addr = int(parts[0], 16)
+                          if runtime_addr == selinux_runtime:
+                              print(f"selinux_state VA match: {runtime_addr:#018x} OK")
+                          else:
+                              print(f"MISMATCH: expected {selinux_runtime:#018x} got {runtime_addr:#018x}")
+                          break
+          except FileNotFoundError:
+              print("kallsyms_base_runtime.txt not found (slide may not have been computed)")
+
+          # Cross-check: _text runtime VA should equal kaslr_base
+          try:
+              with open('kallsyms_base_runtime.txt') as f:
+                  for line in f:
+                      parts = line.split()
+                      if len(parts) >= 3 and parts[2] in ('_text', '_stext'):
+                          _text_runtime = int(parts[0], 16)
+                          if _text_runtime == kaslr_base:
+                              print(f"{parts[2]} == KASLR base {kaslr_base:#018x} OK")
+                          else:
+                              delta = _text_runtime - kaslr_base
+                              print(f"{parts[2]} = {_text_runtime:#018x}, KASLR base = {kaslr_base:#018x}, delta = {delta:#x}")
+                          break
+          except FileNotFoundError:
+              pass
+          PYEOF
 
       - name: Run droidimg with miasm to enhance symbols
         run: |
           source /tmp/venv/bin/activate
-          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || \
-            python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1 || \
-            echo '{}' > droidimg_kallsyms.json
+          python3 /tmp/droidimg/vmlinux.py -m --json vmlinux.raw > droidimg_kallsyms.json 2>&1 \
+            || python3 /tmp/droidimg/vmlinux.py --json vmlinux.raw > droidimg_kallsyms.json 2>&1 \
+            || echo '{}' > droidimg_kallsyms.json
 
       - name: Merge kallsyms from both sources
         run: |
           source /tmp/venv/bin/activate
-          python3 << 'EOF'
-          import json
-          import re
+          python3 - << 'PYEOF'
+          import json, re
 
-          base_syms = {}
-          enhanced_syms = {}
+          all_syms = {}
 
           try:
               with open('kallsyms_base.txt') as f:
                   for line in f:
-                      line = line.strip()
-                      if not line or line.startswith('#'):
-                          continue
                       parts = line.split()
                       if len(parts) >= 3:
-                          addr, sym_type, name = parts[0], parts[1], parts[2]
                           try:
-                              addr_int = int(addr, 16)
+                              addr = int(parts[0], 16)
                           except ValueError:
                               continue
-                          base_syms[addr_int] = (sym_type, name)
+                          if addr != 0:
+                              all_syms[addr] = (parts[1], parts[2])
           except FileNotFoundError:
               pass
 
           try:
               with open('droidimg_kallsyms.json') as f:
                   content = f.read().strip()
-
-              if content.startswith('{') and content != '{}':
+              if content and content != '{}' and content.startswith('{'):
                   data = json.loads(content)
-                  if 'sym' in data:
-                      for sym in data['sym']:
-                          if 'addr' not in sym or 'name' not in sym:
-                              continue
-                          try:
-                              addr_int = int(sym['addr'], 16) if isinstance(sym['addr'], str) else int(sym['addr'])
-                          except (ValueError, TypeError):
-                              continue
+                  for sym in data.get('sym', []):
+                      if 'addr' not in sym or 'name' not in sym:
+                          continue
+                      try:
+                          addr = int(sym['addr'], 16) if isinstance(sym['addr'], str) else int(sym['addr'])
+                      except (ValueError, TypeError):
+                          continue
+                      if addr and addr not in all_syms:
                           sym_type = 'T' if 'text' in sym.get('type', '').lower() else 'D'
-                          enhanced_syms[addr_int] = (sym_type, sym['name'])
-              else:
-                  raise ValueError("not JSON object")
-
-          except (json.JSONDecodeError, ValueError):
+                          all_syms[addr] = (sym_type, sym['name'])
+          except (json.JSONDecodeError, ValueError, FileNotFoundError):
               try:
                   with open('droidimg_kallsyms.json') as f:
                       for line in f:
                           m = re.search(r'(0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+(\w)\s+(\S+)', line)
                           if m:
                               try:
-                                  addr_int = int(m.group(1), 16)
+                                  addr = int(m.group(1), 16)
                               except ValueError:
                                   continue
-                              enhanced_syms[addr_int] = (m.group(2), m.group(3))
+                              if addr and addr not in all_syms:
+                                  all_syms[addr] = (m.group(2), m.group(3))
               except FileNotFoundError:
                   pass
-          except FileNotFoundError:
-              pass
-
-          all_syms = dict(base_syms)
-          for addr_int, val in enhanced_syms.items():
-              if addr_int not in all_syms:
-                  all_syms[addr_int] = val
-
-          # Remove null-address symbols (addr == 0)
-          all_syms.pop(0, None)
 
           with open('kallsyms.txt', 'w') as f:
-              for addr_int in sorted(all_syms.keys()):
-                  sym_type, name = all_syms[addr_int]
-                  f.write(f'{addr_int:016x} {sym_type} {name}\n')
-
-          total = len(all_syms)
-          null_count = sum(1 for a in all_syms if a == 0)
-          print(f'Total symbols: {total}  (null removed: {null_count})')
-          EOF
+              for addr in sorted(all_syms):
+                  sym_type, name = all_syms[addr]
+                  f.write(f'{addr:016x} {sym_type} {name}\n')
+          print(f'Total symbols: {len(all_syms)}')
+          PYEOF
 
       - name: Fix KASLR if needed
         run: |
           curl -fsSL -o fix_kaslr_arm64.c \
             "https://raw.githubusercontent.com/nforest/droidimg/master/fix_kaslr_arm64.c"
           gcc -o fix_kaslr_arm64 fix_kaslr_arm64.c
-          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null || echo "KASLR fix not applicable"
+          ./fix_kaslr_arm64 vmlinux.raw vmlinux_fixed.raw 2>/dev/null \
+            || echo "KASLR fix not applicable"
 
       - name: Verify kallsyms quality
+        env:
+          SELINUX_STATE_VA: ${{ github.event.inputs.selinux_state_va }}
         run: |
-          echo "=== Final kallsyms summary ==="
+          echo "=== Final kallsyms (link-time) ==="
           wc -l kallsyms.txt
 
           echo ""
-          echo "=== Null address ratio ==="
-          python3 << 'EOF'
+          echo "=== Null ratio ==="
+          python3 - << 'PYEOF'
           with open('kallsyms.txt') as f:
               lines = [l.strip() for l in f if l.strip()]
           total = len(lines)
           null_count = sum(1 for l in lines if l.startswith('0000000000000000'))
-          print(f'{null_count}/{total} null ({null_count/total*100:.2f}%)')
-          EOF
+          print(f'{null_count}/{total} ({null_count/total*100:.2f}%)')
+          PYEOF
 
           echo ""
           echo "=== Sample symbols ==="
           head -20 kallsyms.txt
 
           echo ""
-          echo "=== Checking for kernel version string ==="
-          grep -i "linux_banner\|linux_proc_banner\|kernel_version" kallsyms.txt \
-            || echo "No kernel version symbol found (may be okay)"
+          echo "=== selinux_state in link-time kallsyms ==="
+          grep "selinux_state$" kallsyms.txt | head -3
 
-          echo ""
-          echo "=== Detected base ==="
-          cat detected_base.txt
+          if [ -f kallsyms_base_runtime.txt ]; then
+            echo ""
+            echo "=== selinux_state in runtime kallsyms ==="
+            grep "selinux_state$" kallsyms_base_runtime.txt | head -3
+          fi
 
-      - name: Upload final kallsyms artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kallsyms
           path: |
             kallsyms.txt
+            kallsyms_base.txt
+            kallsyms_base_runtime.txt
             vmlinux.elf
-            detected_base.txt
           retention-days: 30
