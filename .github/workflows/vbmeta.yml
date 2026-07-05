@@ -1,0 +1,51 @@
+name: Check AVB Public Key
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: '対象ファイルのURL (vbmeta.img など)'
+        required: true
+        type: string
+      private_key_path:
+        description: ''
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  check-avb-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout test_avb_key
+        uses: actions/checkout@v4
+        with:
+          repository: nccgroup/test_avb_key
+          path: test_avb_key
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Download target file
+        run: |
+          curl -L -o target_file "${{ inputs.file_url }}"
+          echo "Download completed: $(ls -lh target_file)"
+
+      - name: Run test_avb_key
+        id: test
+        run: |
+          cd test_avb_key
+          if [ -n "${{ inputs.private_key_path }}" ]; then
+            python3 test_avb_key.py ../target_file "${{ inputs.private_key_path }}" 2>&1 | tee ../result.txt
+          else
+            python3 test_avb_key.py ../target_file 2>&1 | tee ../result.txt
+          fi
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: avb-key-check-result
+          path: result.txt
+          retention-days: 7
