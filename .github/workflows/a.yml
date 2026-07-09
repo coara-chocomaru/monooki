@@ -1,0 +1,59 @@
+name: Patch Audio HAL (MT8167)
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: 'audio.primary.mt8167.so のダウンロードURL'
+        required: true
+        type: string
+        default: 'https://example.com/path/to/audio.primary.mt8167.so'
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 依存パッケージの確認 (readelf)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils
+
+      - name: ファイルをダウンロード
+        run: |
+          echo ">>> ${{ inputs.download_url }} からダウンロード中..."
+          curl -L -o audio.primary.mt8167.so "${{ inputs.download_url }}"
+          if [ ! -f audio.primary.mt8167.so ]; then
+            echo "エラー: ダウンロードに失敗しました"
+            exit 1
+          fi
+          file audio.primary.mt8167.so
+
+      - name: シンボルオフセットを動的に抽出
+        id: find_sym
+        run: |
+          SYM="_ZN7android26AudioALSACaptureDataClient21ConfigBesRecordParamsEv"
+          echo ">>> シンボル '$SYM' を検索中..."
+          SYM_LINE=$(readelf -s audio.primary.mt8167.so | grep "$SYM" || true)
+          if [ -z "$SYM_LINE" ]; then
+            echo "エラー: シンボルが見つかりませんでした"
+            exit 1
+          fi
+          OFFSET_HEX=$(echo "$SYM_LINE" | awk '{print $2}')
+          echo ">>> オフセット (16進): $OFFSET_HEX"
+          echo "offset_hex=$OFFSET_HEX" >> $GITHUB_OUTPUT
+          echo "offset_dec=$((0x$OFFSET_HEX))" >> $GITHUB_OUTPUT
+
+      - name: バイナリパッチを適用 (BX LR)
+        run: |
+          OFFSET=${{ steps.find_sym.outputs.offset_dec }}
+          echo ">>> オフセット $OFFSET (0x${{ steps.find_sym.outputs.offset_hex }}) にパッチを適用"
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek="$OFFSET" count=4 conv=notrunc
+          echo ">>> パッチ完了"
+
+      - name: パッチ済みファイルをアーティファクトとしてアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio.primary.mt8167_patched
+          path: audio.primary.mt8167.so
+          retention-days: 7
