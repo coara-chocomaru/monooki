@@ -1,80 +1,51 @@
-name: Patch Audio HAL (MT8167) - Dynamic Offset
+name: Patch Audio HAL (MT8167)
 
 on:
   workflow_dispatch:
     inputs:
       download_url:
-        description: 'audio.primary.mt8167.so のダウンロードURL'
+        description: 'audio.primary.mt8167.so URL'
         required: true
         type: string
-        default: 'https://example.com/path/to/audio.primary.mt8167.so'
 
 jobs:
   patch:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 依存パッケージのインストール
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils file
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y binutils file
 
-      - name: ファイルをダウンロード
+      - name: Download file
         run: |
-          echo ">>> ${{ inputs.download_url }} からダウンロード中..."
           curl -L -o audio.primary.mt8167.so "${{ inputs.download_url }}"
-          if [ ! -f audio.primary.mt8167.so ]; then
-            echo "エラー: ダウンロードに失敗しました"
-            exit 1
-          fi
           file audio.primary.mt8167.so
 
-      - name: 関数先頭を自動検出（objdump を使用）
-        id: find_func_start
+      - name: Find symbol offset
+        id: find
         run: |
-          # デマングル名で検索（念のため）
           SYM="_ZN7android26AudioALSACaptureDataClient21ConfigBesRecordParamsEv"
-          # objdump で逆アセンブルし、シンボルが含まれるセクションを探す
-          # もしシンボルがなければ、関数の先頭を特定するために
-          # "push {r4, r5, r6, r7, lr}" のバイトパターン (2d e9 40 40) を検索する
-          OFFSET=$(objdump -d audio.primary.mt8167.so | grep -A1 "$SYM" | head -1 | awk '{print $1}' | sed 's/:$//' | head -1)
+          OFFSET=$(readelf -s audio.primary.mt8167.so | grep "$SYM" | awk '{print $2}' | head -1)
           if [ -n "$OFFSET" ]; then
             echo "offset_hex=$OFFSET" >> $GITHUB_OUTPUT
             echo "offset_dec=$((0x$OFFSET))" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
-            echo ">>> シンボルからオフセット検出: 0x$OFFSET"
           else
-            # シンボルがない場合、文字列 ConfigBesRecord の位置を探す（フォールバック）
-            STR_OFFSET=$(strings -t x audio.primary.mt8167.so | grep ConfigBesRecord | awk '{print $1}' | head -1)
-            if [ -n "$STR_OFFSET" ]; then
-              # 文字列の直前の関数開始を推測（おおよそ）
-              OFFSET=$(printf "0x%x" $(($STR_OFFSET - 0x100)))
-              echo "offset_hex=$OFFSET" >> $GITHUB_OUTPUT
-              echo "offset_dec=$((0x$OFFSET))" >> $GITHUB_OUTPUT
-              echo "found=true" >> $GITHUB_OUTPUT
-              echo ">>> 文字列位置からの推定オフセット: $OFFSET"
-            else
-              echo "found=false" >> $GITHUB_OUTPUT
-            fi
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: フォールバック（固定オフセットを使用）
-        if: steps.find_func_start.outputs.found != 'true'
+      - name: Patch both offsets
         run: |
-          echo ">>> 自動検出失敗。固定オフセット 0x987e4 を使用します"
-          echo "offset_hex=987e4" >> $GITHUB_OUTPUT
-          echo "offset_dec=624612" >> $GITHUB_OUTPUT
-
-      - name: バイナリパッチを適用
-        run: |
-          OFFSET=${{ steps.find_func_start.outputs.offset_dec }}
-          echo ">>> オフセット $OFFSET にパッチを適用"
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$OFFSET count=4 conv=notrunc
+          if [ "${{ steps.find.outputs.found }}" = "true" ]; then
+            OFFSET=${{ steps.find.outputs.offset_dec }}
+            printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$OFFSET count=4 conv=notrunc
+          fi
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=624612 count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=622868 count=4 conv=notrunc
           sync
-          echo ">>> パッチ後のバイト:"
-          dd if=audio.primary.mt8167.so bs=1 skip=$OFFSET count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167.so bs=1 skip=624612 count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167.so bs=1 skip=622868 count=4 2>/dev/null | od -An -tx1
 
-      - name: 📦 パッチ済みファイルをアーティファクトとしてアップロード
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: audio.primary.mt8167_patched
