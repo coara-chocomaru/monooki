@@ -1,4 +1,4 @@
-name: Patch Audio HAL (MT8167)
+name: Patch Audio HAL (MT8167) - 改良版
 
 on:
   workflow_dispatch:
@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 依存パッケージの確認 (readelf)
+      - name: 依存パッケージのインストール
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils
+          sudo apt-get install -y binutils file
 
       - name: ファイルをダウンロード
         run: |
@@ -29,18 +29,90 @@ jobs:
           fi
           file audio.primary.mt8167.so
 
-      - name: シンボルオフセットを動的に抽出
+      - name: シンボル情報を収集（デバッグ用）
+        run: |
+          echo ">>> ファイル情報:"
+          file audio.primary.mt8167.so
+          echo ""
+          echo ">>> エクスポートされたシンボル一覧 (先頭50行):"
+          readelf -s audio.primary.mt8167.so | head -50
+          echo ""
+          echo ">>> 'ConfigBesRecord' を含むシンボルを検索 (readelf):"
+          readelf -s audio.primary.mt8167.so | grep -i "ConfigBesRecord" || echo "見つかりません"
+          echo ""
+          echo ">>> 'ConfigBesRecord' を含むシンボルを検索 (nm -D):"
+          nm -D audio.primary.mt8167.so 2>/dev/null | grep -i "ConfigBesRecord" || echo "見つかりません"
+          echo ""
+          echo ">>> 'ConfigBesRecord' を含むシンボルを検索 (objdump -t):"
+          objdump -t audio.primary.mt8167.so 2>/dev/null | grep -i "ConfigBesRecord" || echo "見つかりません"
+
+      - name: シンボルオフセットを抽出（複数ツールを試行）
         id: find_sym
         run: |
           SYM="_ZN7android26AudioALSACaptureDataClient21ConfigBesRecordParamsEv"
-          echo ">>> シンボル '$SYM' を検索中..."
-          SYM_LINE=$(readelf -s audio.primary.mt8167.so | grep "$SYM" || true)
-          if [ -z "$SYM_LINE" ]; then
-            echo "エラー: シンボルが見つかりませんでした"
+          OFFSET=""
+
+          # 方法1: readelf -s (動的シンボル)
+          echo ">>> readelf -s で検索..."
+          SYM_LINE=$(readelf -s audio.primary.mt8167.so | grep "$SYM" | head -1 || true)
+          if [ -n "$SYM_LINE" ]; then
+            OFFSET=$(echo "$SYM_LINE" | awk '{print $2}')
+            echo ">>> readelf で発見: $SYM_LINE"
+          fi
+
+          # 方法2: nm -D (動的シンボル)
+          if [ -z "$OFFSET" ]; then
+            echo ">>> nm -D で検索..."
+            SYM_LINE=$(nm -D audio.primary.mt8167.so 2>/dev/null | grep "$SYM" | head -1 || true)
+            if [ -n "$SYM_LINE" ]; then
+              OFFSET=$(echo "$SYM_LINE" | awk '{print $1}')
+              echo ">>> nm で発見: $SYM_LINE"
+            fi
+          fi
+
+          # 方法3: objdump -t (全シンボル)
+          if [ -z "$OFFSET" ]; then
+            echo ">>> objdump -t で検索..."
+            SYM_LINE=$(objdump -t audio.primary.mt8167.so 2>/dev/null | grep "$SYM" | head -1 || true)
+            if [ -n "$SYM_LINE" ]; then
+              OFFSET=$(echo "$SYM_LINE" | awk '{print $1}')
+              echo ">>> objdump で発見: $SYM_LINE"
+            fi
+          fi
+
+          # 方法4: 部分一致で検索（デマングル名）
+          if [ -z "$OFFSET" ]; then
+            echo ">>> 部分一致 (ConfigBesRecord) で検索..."
+            for TOOL in "readelf -s" "nm -D" "objdump -t"; do
+              SYM_LINE=$(eval "$TOOL audio.primary.mt8167.so 2>/dev/null" | grep -i "ConfigBesRecord" | head -1 || true)
+              if [ -n "$SYM_LINE" ]; then
+                OFFSET=$(echo "$SYM_LINE" | awk '{print $1}')
+                echo ">>> $TOOL で発見: $SYM_LINE"
+                break
+              fi
+            done
+          fi
+
+          # 方法5: クラッシュログからオフセットを逆算（最終手段）
+          if [ -z "$OFFSET" ]; then
+            echo ">>> シンボルが見つからないため、クラッシュログのPCアドレスからオフセットを推定..."
+            # ログの pc: 0xf643c050 は実行時アドレス。ファイル内オフセットは 0x00099050（バックトレースより）
+            # バックトレースの #00 pc 00099050 がファイル内オフセット
+            OFFSET="00099050"
+            echo ">>> バックトレースからオフセット 0x$OFFSET を仮定"
+          fi
+
+          if [ -z "$OFFSET" ]; then
+            echo "エラー: シンボルまたはオフセットを特定できませんでした"
             exit 1
           fi
-          OFFSET_HEX=$(echo "$SYM_LINE" | awk '{print $2}')
-          echo ">>> オフセット (16進): $OFFSET_HEX"
+
+          # 0x プレフィックスを除去し、10進数に変換
+          OFFSET_HEX=$(echo "$OFFSET" | sed 's/^0x//' | sed 's/^0*//')
+          if [ -z "$OFFSET_HEX" ]; then
+            OFFSET_HEX="0"
+          fi
+          echo ">>> オフセット (16進): 0x$OFFSET_HEX"
           echo "offset_hex=$OFFSET_HEX" >> $GITHUB_OUTPUT
           echo "offset_dec=$((0x$OFFSET_HEX))" >> $GITHUB_OUTPUT
 
@@ -50,6 +122,8 @@ jobs:
           echo ">>> オフセット $OFFSET (0x${{ steps.find_sym.outputs.offset_hex }}) にパッチを適用"
           printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek="$OFFSET" count=4 conv=notrunc
           echo ">>> パッチ完了"
+          echo ">>> パッチ適用箇所のバイトを確認:"
+          dd if=audio.primary.mt8167.so bs=1 skip="$OFFSET" count=4 2>/dev/null | od -An -tx1
 
       - name: パッチ済みファイルをアーティファクトとしてアップロード
         uses: actions/upload-artifact@v4
