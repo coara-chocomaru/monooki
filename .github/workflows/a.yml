@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       download_url:
-        description: 'audio.primary.mt8167.so URL'
+        description: 'audio.primary.mt8167.so URL (32bit)'
         required: true
         type: string
+      download_url64:
+        description: 'audio.primary.mt8167.so URL (64bit)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   patch:
@@ -15,39 +20,43 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y binutils file
 
-      - name: Download file
+      - name: Download 32bit
         run: |
           curl -L -o audio.primary.mt8167.so "${{ inputs.download_url }}"
           file audio.primary.mt8167.so
 
-      - name: Find symbol offset
-        id: find
+      - name: Download 64bit
+        if: inputs.download_url64 != ''
         run: |
-          SYM="_ZN7android26AudioALSACaptureDataClient21ConfigBesRecordParamsEv"
-          OFFSET=$(readelf -s audio.primary.mt8167.so | grep "$SYM" | awk '{print $2}' | head -1)
-          if [ -n "$OFFSET" ]; then
-            echo "offset_hex=$OFFSET" >> $GITHUB_OUTPUT
-            echo "offset_dec=$((0x$OFFSET))" >> $GITHUB_OUTPUT
-            echo "found=true" >> $GITHUB_OUTPUT
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-          fi
+          curl -L -o audio.primary.mt8167_64.so "${{ inputs.download_url64 }}"
+          file audio.primary.mt8167_64.so
 
-      - name: Patch both offsets
+      - name: Patch 32bit
         run: |
-          if [ "${{ steps.find.outputs.found }}" = "true" ]; then
-            OFFSET=${{ steps.find.outputs.offset_dec }}
-            printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$OFFSET count=4 conv=notrunc
-          fi
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=624612 count=4 conv=notrunc
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=622868 count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x987e4)) count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x99050)) count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x97f14)) count=4 conv=notrunc
           sync
-          dd if=audio.primary.mt8167.so bs=1 skip=624612 count=4 2>/dev/null | od -An -tx1
-          dd if=audio.primary.mt8167.so bs=1 skip=622868 count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167.so bs=1 skip=$((0x987e4)) count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167.so bs=1 skip=$((0x99050)) count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167.so bs=1 skip=$((0x97f14)) count=4 2>/dev/null | od -An -tx1
 
-      - name: Upload artifact
+      - name: Patch 64bit
+        if: inputs.download_url64 != ''
+        run: |
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x987e4)) count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x99050)) count=4 conv=notrunc
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x97f14)) count=4 conv=notrunc
+          sync
+          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x987e4)) count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x99050)) count=4 2>/dev/null | od -An -tx1
+          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x97f14)) count=4 2>/dev/null | od -An -tx1
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: audio.primary.mt8167_patched
-          path: audio.primary.mt8167.so
+          name: audio_hal_patched
+          path: |
+            audio.primary.mt8167.so
+            audio.primary.mt8167_64.so
           retention-days: 7
