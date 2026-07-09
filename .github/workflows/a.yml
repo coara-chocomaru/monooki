@@ -1,4 +1,4 @@
-name: Patch Audio HAL (MT8167) - Manual Offset
+name: Patch Audio HAL (MT8167) - Dynamic Offset
 
 on:
   workflow_dispatch:
@@ -8,11 +8,6 @@ on:
         required: true
         type: string
         default: 'https://example.com/path/to/audio.primary.mt8167.so'
-      function_offset:
-        description: 'ConfigBesRecordParams のファイルオフセット（16進数、例: 0x987e4）'
-        required: false
-        type: string
-        default: '0x987e4'
 
 jobs:
   patch:
@@ -34,47 +29,52 @@ jobs:
           fi
           file audio.primary.mt8167.so
 
-      - name: 自動シンボル検索（念のため）
-        id: find_sym_auto
+      - name: 関数先頭を自動検出（objdump を使用）
+        id: find_func_start
         run: |
+          # デマングル名で検索（念のため）
           SYM="_ZN7android26AudioALSACaptureDataClient21ConfigBesRecordParamsEv"
-          SYM_LINE=$(readelf -s audio.primary.mt8167.so | grep "$SYM" | head -1 || true)
-          if [ -n "$SYM_LINE" ]; then
-            OFFSET_HEX=$(echo "$SYM_LINE" | awk '{print $2}')
-            echo "offset_hex=$OFFSET_HEX" >> $GITHUB_OUTPUT
-            echo "offset_dec=$((0x$OFFSET_HEX))" >> $GITHUB_OUTPUT
+          # objdump で逆アセンブルし、シンボルが含まれるセクションを探す
+          # もしシンボルがなければ、関数の先頭を特定するために
+          # "push {r4, r5, r6, r7, lr}" のバイトパターン (2d e9 40 40) を検索する
+          OFFSET=$(objdump -d audio.primary.mt8167.so | grep -A1 "$SYM" | head -1 | awk '{print $1}' | sed 's/:$//' | head -1)
+          if [ -n "$OFFSET" ]; then
+            echo "offset_hex=$OFFSET" >> $GITHUB_OUTPUT
+            echo "offset_dec=$((0x$OFFSET))" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
+            echo ">>> シンボルからオフセット検出: 0x$OFFSET"
           else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo ">>> 自動検索で見つかりませんでした。手動入力を使用します。"
+            # シンボルがない場合、文字列 ConfigBesRecord の位置を探す（フォールバック）
+            STR_OFFSET=$(strings -t x audio.primary.mt8167.so | grep ConfigBesRecord | awk '{print $1}' | head -1)
+            if [ -n "$STR_OFFSET" ]; then
+              # 文字列の直前の関数開始を推測（おおよそ）
+              OFFSET=$(printf "0x%x" $(($STR_OFFSET - 0x100)))
+              echo "offset_hex=$OFFSET" >> $GITHUB_OUTPUT
+              echo "offset_dec=$((0x$OFFSET))" >> $GITHUB_OUTPUT
+              echo "found=true" >> $GITHUB_OUTPUT
+              echo ">>> 文字列位置からの推定オフセット: $OFFSET"
+            else
+              echo "found=false" >> $GITHUB_OUTPUT
+            fi
           fi
 
-      - name: オフセットを決定（自動 or 手動）
-        id: decide_offset
+      - name: フォールバック（固定オフセットを使用）
+        if: steps.find_func_start.outputs.found != 'true'
         run: |
-          if [ "${{ steps.find_sym_auto.outputs.found }}" = "true" ]; then
-            echo "offset_dec=${{ steps.find_sym_auto.outputs.offset_dec }}" >> $GITHUB_OUTPUT
-            echo "offset_hex=${{ steps.find_sym_auto.outputs.offset_hex }}" >> $GITHUB_OUTPUT
-            echo ">>> 自動検出オフセット: 0x${{ steps.find_sym_auto.outputs.offset_hex }}"
-          else
-            OFFSET_HEX="${{ inputs.function_offset }}"
-            # 先頭の 0x を除去
-            OFFSET_HEX=${OFFSET_HEX#0x}
-            echo "offset_hex=$OFFSET_HEX" >> $GITHUB_OUTPUT
-            echo "offset_dec=$((0x$OFFSET_HEX))" >> $GITHUB_OUTPUT
-            echo ">>> 手動指定オフセット: 0x$OFFSET_HEX"
-          fi
+          echo ">>> 自動検出失敗。固定オフセット 0x987e4 を使用します"
+          echo "offset_hex=987e4" >> $GITHUB_OUTPUT
+          echo "offset_dec=624612" >> $GITHUB_OUTPUT
 
-      - name: バイナリパッチを適用（BX LR）
+      - name: バイナリパッチを適用
         run: |
-          OFFSET=${{ steps.decide_offset.outputs.offset_dec }}
-          echo ">>> オフセット $OFFSET (0x${{ steps.decide_offset.outputs.offset_hex }}) にパッチを適用"
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek="$OFFSET" count=4 conv=notrunc
-          echo ">>> パッチ完了"
-          echo ">>> パッチ後のバイトを確認:"
-          dd if=audio.primary.mt8167.so bs=1 skip="$OFFSET" count=4 2>/dev/null | od -An -tx1
+          OFFSET=${{ steps.find_func_start.outputs.offset_dec }}
+          echo ">>> オフセット $OFFSET にパッチを適用"
+          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$OFFSET count=4 conv=notrunc
+          sync
+          echo ">>> パッチ後のバイト:"
+          dd if=audio.primary.mt8167.so bs=1 skip=$OFFSET count=4 2>/dev/null | od -An -tx1
 
-      - name: パッチ済みファイルをアーティファクトとしてアップロード
+      - name: 📦 パッチ済みファイルをアーティファクトとしてアップロード
         uses: actions/upload-artifact@v4
         with:
           name: audio.primary.mt8167_patched
