@@ -1,51 +1,113 @@
-name: Check AVB Public Key
+name: VBMeta Analyze Only
 
 on:
   workflow_dispatch:
     inputs:
-      file_url:
-        description: '対象ファイルのURL (vbmeta.img など)'
+      vbmeta_url:
+        description: 'vbmeta.img の直接ダウンロードURL'
         required: true
         type: string
-      private_key_path:
-        description: ''
-        required: false
+      vbmeta_system_url:
+        description: 'vbmeta_system.img の直接ダウンロードURL'
+        required: true
         type: string
-        default: ''
+
+env:
+  AVBTOOL_BRANCH: 'android12-release'
 
 jobs:
-  check-avb-key:
-    runs-on: ubuntu-latest
+  analyze:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
     steps:
-      - name: Checkout test_avb_key
-        uses: actions/checkout@v4
-        with:
-          repository: nccgroup/test_avb_key
-          path: test_avb_key
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Download target file
+      - name: Display Run Parameters
         run: |
-          curl -L -o target_file "${{ inputs.file_url }}"
-          echo "Download completed: $(ls -lh target_file)"
+          echo "::group::Inputs"
+          echo "vbmeta URL: ${{ inputs.vbmeta_url }}"
+          echo "vbmeta_system URL: ${{ inputs.vbmeta_system_url }}"
+          echo "avbtool branch: ${{ env.AVBTOOL_BRANCH }}"
+          echo "::endgroup::"
 
-      - name: Run test_avb_key
-        id: test
+      - name: Prepare environment
         run: |
-          cd test_avb_key
-          if [ -n "${{ inputs.private_key_path }}" ]; then
-            python3 test_avb_key.py ../target_file "${{ inputs.private_key_path }}" 2>&1 | tee ../result.txt
-          else
-            python3 test_avb_key.py ../target_file 2>&1 | tee ../result.txt
-          fi
+          sudo apt update
+          sudo apt -y install python3 python3-pip xxd curl unzip
+          mkdir -p work/images work/logs
 
-      - name: Upload result
+      - name: Clone avbtool (AVB 1.2.0 / android12-release)
+        run: |
+          git clone --depth 1 --branch ${{ env.AVBTOOL_BRANCH }} \
+            https://android.googlesource.com/platform/external/avb avb
+
+      - name: Download vbmeta.img
+        working-directory: work/images
+        run: |
+          curl -L -o vbmeta.img "${{ inputs.vbmeta_url }}"
+          ls -la
+
+      - name: Download vbmeta_system.img
+        working-directory: work/images
+        run: |
+          curl -L -o vbmeta_system.img "${{ inputs.vbmeta_system_url }}"
+          ls -la
+
+      - name: Analyze vbmeta.img (info_image)
+        run: |
+          python3 avb/avbtool.py info_image \
+            --image work/images/vbmeta.img \
+            > work/logs/vbmeta_info.log 2>&1 || true
+          cat work/logs/vbmeta_info.log
+
+      - name: Analyze vbmeta_system.img (info_image)
+        run: |
+          python3 avb/avbtool.py info_image \
+            --image work/images/vbmeta_system.img \
+            > work/logs/vbmeta_system_info.log 2>&1 || true
+          cat work/logs/vbmeta_system_info.log
+
+      - name: Hexdump vbmeta.img header
+        run: |
+          xxd work/images/vbmeta.img | head -60 \
+            > work/logs/vbmeta_hexdump.log
+          cat work/logs/vbmeta_hexdump.log
+
+      - name: Hexdump vbmeta_system.img header
+        run: |
+          xxd work/images/vbmeta_system.img | head -60 \
+            > work/logs/vbmeta_system_hexdump.log
+          cat work/logs/vbmeta_system_hexdump.log
+
+      - name: Extract public key blobs from info_image (署名鍵情報)
+        run: |
+          {
+            echo "=== vbmeta.img public key section ==="
+            grep -A 20 "Public key" work/logs/vbmeta_info.log || echo "no public key section found"
+            echo ""
+            echo "=== vbmeta_system.img public key section ==="
+            grep -A 20 "Public key" work/logs/vbmeta_system_info.log || echo "no public key section found"
+          } > work/logs/pubkey_summary.log
+          cat work/logs/pubkey_summary.log
+
+      - name: Extract descriptor / chain partition summary
+        run: |
+          {
+            echo "=== vbmeta.img descriptors ==="
+            grep -E "Algorithm|Descriptor|Partition Name|Rollback|Flags" work/logs/vbmeta_info.log || true
+            echo ""
+            echo "=== vbmeta_system.img descriptors ==="
+            grep -E "Algorithm|Descriptor|Partition Name|Rollback|Flags" work/logs/vbmeta_system_info.log || true
+          } > work/logs/descriptor_summary.log
+          cat work/logs/descriptor_summary.log
+
+      - name: Zip logs
+        run: |
+          cd work
+          zip -r vbmeta_analysis_logs.zip logs/
+
+      - name: Upload logs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: avb-key-check-result
-          path: result.txt
-          retention-days: 7
+          name: vbmeta-analysis-logs
+          path: work/vbmeta_analysis_logs.zip
