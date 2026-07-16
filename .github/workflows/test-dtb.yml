@@ -1,0 +1,473 @@
+name: DTB Deep Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      dtb_url:
+        description: "DTB file URL (direct download URL)"
+        required: true
+        type: string
+      output_name:
+        description: "Output ZIP base name"
+        required: false
+        default: "dtb_analysis"
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler python3 curl file zip
+
+      - name: Prepare workspace
+        run: |
+          set -eux
+          rm -rf work
+          mkdir -p work/in work/out
+
+      - name: Download DTB
+        run: |
+          set -eux
+          curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.dtb_url }}" -o work/in/input.dtb
+          file work/in/input.dtb
+
+      - name: Analyze and decompile
+        shell: bash
+        run: |
+          set -eux
+
+          cat > work/analyze_dtb.py << 'PY'
+          #!/usr/bin/env python3
+          import json
+          import struct
+          from pathlib import Path
+
+          FDT_MAGIC = 0xD00DFEED
+          FDT_BEGIN_NODE = 0x1
+          FDT_END_NODE = 0x2
+          FDT_PROP = 0x3
+          FDT_NOP = 0x4
+          FDT_END = 0x9
+
+          def be32(b, off):
+              return struct.unpack_from(">I", b, off)[0]
+
+          def align4(n):
+              return (n + 3) & ~3
+
+          def escape_dts_string(s):
+              out = []
+              for ch in s:
+                  o = ord(ch)
+                  if ch == "\\":
+                      out.append("\\\\")
+                  elif ch == '"':
+                      out.append('\\"')
+                  elif ch == "\n":
+                      out.append("\\n")
+                  elif ch == "\r":
+                      out.append("\\r")
+                  elif ch == "\t":
+                      out.append("\\t")
+                  elif 32 <= o <= 126:
+                      out.append(ch)
+                  else:
+                      out.append(f"\\x{o:02x}")
+              return "".join(out)
+
+          def is_printable_ascii(byte):
+              return 32 <= byte <= 126
+
+          def split_c_strings(data):
+              parts = data.split(b"\x00")
+              if parts and parts[-1] == b"":
+                  parts = parts[:-1]
+              return parts
+
+          class Node:
+              def __init__(self, name, parent=None):
+                  self.name = name
+                  self.parent = parent
+                  self.props = []
+                  self.children = []
+                  self.path = None
+
+              def prop_map(self):
+                  return {k: v for k, v in self.props}
+
+          def parse_dtb(blob):
+              if len(blob) < 40:
+                  raise ValueError("DTB is too small")
+
+              magic = be32(blob, 0)
+              if magic != FDT_MAGIC:
+                  raise ValueError(f"Bad DTB magic: 0x{magic:08x}")
+
+              totalsize = be32(blob, 4)
+              off_dt_struct = be32(blob, 8)
+              off_dt_strings = be32(blob, 12)
+              off_mem_rsvmap = be32(blob, 16)
+              version = be32(blob, 20)
+              last_comp_version = be32(blob, 24)
+              boot_cpuid_phys = be32(blob, 28)
+              size_dt_strings = be32(blob, 32)
+              size_dt_struct = be32(blob, 36)
+
+              strings = blob[off_dt_strings:off_dt_strings + size_dt_strings]
+              struct_block = blob[off_dt_struct:off_dt_struct + size_dt_struct]
+
+              root = Node("/")
+              stack = [root]
+
+              p = 0
+              while p < len(struct_block):
+                  token = be32(struct_block, p)
+                  p += 4
+
+                  if token == FDT_BEGIN_NODE:
+                      end = struct_block.find(b"\x00", p)
+                      if end < 0:
+                          raise ValueError("Unterminated node name")
+                      name = struct_block[p:end].decode("ascii", errors="replace")
+                      p = align4(end + 1)
+
+                      node = Node(name if name else "/", stack[-1])
+                      stack[-1].children.append(node)
+                      stack.append(node)
+
+                  elif token == FDT_END_NODE:
+                      if len(stack) <= 1:
+                          raise ValueError("Unexpected END_NODE")
+                      stack.pop()
+
+                  elif token == FDT_PROP:
+                      if p + 8 > len(struct_block):
+                          raise ValueError("Truncated property header")
+                      plen = be32(struct_block, p)
+                      nameoff = be32(struct_block, p + 4)
+                      p += 8
+
+                      if p + plen > len(struct_block):
+                          raise ValueError("Truncated property data")
+                      value = struct_block[p:p + plen]
+                      p = align4(p + plen)
+
+                      end = strings.find(b"\x00", nameoff)
+                      if end < 0:
+                          prop_name = f"unknown_{nameoff}"
+                      else:
+                          prop_name = strings[nameoff:end].decode("ascii", errors="replace")
+
+                      stack[-1].props.append((prop_name, value))
+
+                  elif token == FDT_NOP:
+                      pass
+
+                  elif token == FDT_END:
+                      break
+
+                  else:
+                      raise ValueError(f"Unknown token: 0x{token:08x}")
+
+              # Build full paths
+              def walk(node, base_path):
+                  if node.parent is None:
+                      node.path = "/"
+                  else:
+                      if base_path == "/":
+                          node.path = "/" + node.name
+                      else:
+                          node.path = base_path.rstrip("/") + "/" + node.name
+                  for child in node.children:
+                      walk(child, node.path)
+
+              walk(root, "/")
+
+              meta = {
+                  "totalsize": totalsize,
+                  "off_dt_struct": off_dt_struct,
+                  "off_dt_strings": off_dt_strings,
+                  "off_mem_rsvmap": off_mem_rsvmap,
+                  "version": version,
+                  "last_comp_version": last_comp_version,
+                  "boot_cpuid_phys": boot_cpuid_phys,
+                  "size_dt_strings": size_dt_strings,
+                  "size_dt_struct": size_dt_struct,
+              }
+              return root, meta
+
+          def collect_phandles(root):
+              phandle_to_node = {}
+              all_nodes = []
+
+              def walk(node):
+                  all_nodes.append(node)
+                  props = node.prop_map()
+                  for key in ("phandle", "linux,phandle"):
+                      if key in props and len(props[key]) == 4:
+                          phandle_to_node[be32(props[key], 0)] = node
+                  for child in node.children:
+                      walk(child)
+
+              walk(root)
+              return phandle_to_node, all_nodes
+
+          def node_label_for(node):
+              props = node.prop_map()
+              for key in ("phandle", "linux,phandle"):
+                  if key in props and len(props[key]) == 4:
+                      return f"phandle_{be32(props[key], 0):08x}"
+              return None
+
+          def decode_ascii_strings(data):
+              if not data.endswith(b"\x00"):
+                  return None
+              if not all((b == 0 or is_printable_ascii(b)) for b in data):
+                  return None
+              try:
+                  parts = split_c_strings(data)
+                  return [p.decode("ascii") for p in parts]
+              except UnicodeDecodeError:
+                  return None
+
+          def cells_from_bytes(data):
+              if len(data) % 4 != 0:
+                  return None
+              return [be32(data, i) for i in range(0, len(data), 4)]
+
+          def cell_words_to_text(cells, phandle_map=None, prop_name=None):
+              if not cells:
+                  return ""
+
+              # Basic scalar properties
+              if prop_name in ("#address-cells", "#size-cells", "phandle", "linux,phandle"):
+                  if len(cells) == 1:
+                      return f"<{cells[0]}>"
+
+              # Best-effort phandle reference formatting for common single-reference properties
+              single_ref_props = {
+                  "interrupt-parent",
+                  "dmas",
+                  "clocks",
+                  "resets",
+                  "power-domains",
+                  "memory-region",
+                  "iommus",
+                  "mboxes",
+                  "nvmem-cells",
+                  "phys",
+                  "phy-handle",
+                  "sound-dai",
+                  "supply",
+                  "cpu",
+                  "next-level-cache",
+              }
+              if prop_name in single_ref_props and phandle_map is not None and len(cells) >= 1:
+                  first = cells[0]
+                  if first in phandle_map:
+                      label = node_label_for(phandle_map[first])
+                      if label:
+                          rest = " ".join(f"0x{x:08x}" for x in cells[1:])
+                          if rest:
+                              return f"<&{label} {rest}>"
+                          return f"<&{label}>"
+
+              # interrupts: best-effort GIC decoding
+              if prop_name == "interrupts":
+                  # Common ARM GIC encodings:
+                  # first cell 0 = SPI, 1 = PPI
+                  # third cell is flags
+                  if len(cells) >= 3:
+                      kind = cells[0]
+                      irq_num = cells[1]
+                      flags = cells[2]
+                      kind_text = None
+                      if kind == 0:
+                          kind_text = "GIC_SPI"
+                      elif kind == 1:
+                          kind_text = "GIC_PPI"
+
+                      flag_text = {
+                          1: "IRQ_TYPE_EDGE_RISING",
+                          2: "IRQ_TYPE_EDGE_FALLING",
+                          4: "IRQ_TYPE_LEVEL_HIGH",
+                          8: "IRQ_TYPE_LEVEL_LOW",
+                      }.get(flags)
+
+                      if kind_text and flag_text:
+                          rest = [kind_text, str(irq_num), flag_text]
+                          if len(cells) > 3:
+                              rest.extend(f"0x{x:08x}" for x in cells[3:])
+                          return "<" + " ".join(rest) + ">"
+                  # fallback to numeric cells
+                  return "<" + " ".join(f"0x{x:08x}" for x in cells) + ">"
+
+              # Common scalar cell properties
+              if len(cells) == 1:
+                  return f"<{cells[0]}>"
+
+              return "<" + " ".join(f"0x{x:08x}" for x in cells) + ">"
+
+          def format_value(node, prop_name, data, phandle_map):
+              if len(data) == 0:
+                  return ""
+
+              # Boolean flag
+              if len(data) == 0:
+                  return ""
+
+              # String or string-list
+              strs = decode_ascii_strings(data)
+              if strs is not None:
+                  if len(strs) == 1:
+                      return f"\"{escape_dts_string(strs[0])}\""
+                  return ", ".join(f"\"{escape_dts_string(s)}\"" for s in strs)
+
+              # Special textual properties
+              if prop_name in ("compatible", "model", "bootargs", "stdout-path", "status"):
+                  if strs is not None:
+                      if len(strs) == 1:
+                          return f"\"{escape_dts_string(strs[0])}\""
+                      return ", ".join(f"\"{escape_dts_string(s)}\"" for s in strs)
+
+              cells = cells_from_bytes(data)
+              if cells is not None:
+                  return cell_words_to_text(cells, phandle_map=phandle_map, prop_name=prop_name)
+
+              # Raw bytes
+              return "[" + " ".join(f"{b:02x}" for b in data) + "]"
+
+          def render_node(node, phandle_map, indent=0):
+              sp = "    " * indent
+              out = []
+
+              if indent == 0:
+                  out.append("/dts-v1/;\n")
+                  out.append("// Reconstructed from DTB on Linux with dtc + Python\n")
+                  out.append("// Original labels/comments/includes cannot be recovered from DTB\n\n")
+                  out.append("/ {\n")
+              else:
+                  label = node_label_for(node)
+                  if label:
+                      out.append(f"{sp}{label}: {node.name} {{\n")
+                  else:
+                      out.append(f"{sp}{node.name} {{\n")
+
+              for prop_name, data in node.props:
+                  value = format_value(node, prop_name, data, phandle_map)
+                  if value == "":
+                      out.append(f"{sp}    {prop_name};\n")
+                  else:
+                      out.append(f"{sp}    {prop_name} = {value};\n")
+
+              for child in node.children:
+                  out.append(render_node(child, phandle_map, indent + 1))
+
+              out.append(f"{sp}}};\n")
+              return "".join(out)
+
+          def build_report(root, meta, phandle_map, all_nodes):
+              lines = []
+              lines.append("DTB Deep Analysis Report")
+              lines.append("========================")
+              lines.append("")
+              for k, v in meta.items():
+                  lines.append(f"{k}: {v}")
+              lines.append("")
+              lines.append(f"nodes: {len(all_nodes)}")
+              lines.append(f"phandles: {len(phandle_map)}")
+              lines.append("")
+              lines.append("Notes:")
+              lines.append("- DTB stores a flattened structure, not the original authored DTS source.")
+              lines.append("- Labels/comments/preprocessor includes are not preserved in DTB.")
+              lines.append("- phandle references can be reconstructed and labeled heuristically.")
+              lines.append("- interrupts are decoded best-effort when the encoding is recognized.")
+              lines.append("")
+              lines.append("Phandle map:")
+              for ph, node in sorted(phandle_map.items()):
+                  lines.append(f"  0x{ph:08x} -> {node.path}")
+              return "\n".join(lines) + "\n"
+
+          def main():
+              in_path = Path("work/in/input.dtb")
+              out_dir = Path("work/out")
+              out_dir.mkdir(parents=True, exist_ok=True)
+
+              blob = in_path.read_bytes()
+              root, meta = parse_dtb(blob)
+              phandle_map, all_nodes = collect_phandles(root)
+
+              raw_dts = render_node(root, phandle_map)
+              (out_dir / "pretty.dts").write_text(raw_dts, encoding="utf-8", newline="\n")
+
+              # include-friendly copy
+              dtsi_text = raw_dts
+              (out_dir / "pretty.dtsi").write_text(dtsi_text, encoding="utf-8", newline="\n")
+
+              report = build_report(root, meta, phandle_map, all_nodes)
+              (out_dir / "report.txt").write_text(report, encoding="utf-8", newline="\n")
+
+              # JSON tree dump for inspection
+              def node_to_obj(node):
+                  return {
+                      "name": node.name,
+                      "path": node.path,
+                      "props": [
+                          {
+                              "name": k,
+                              "len": len(v),
+                              "hex": v.hex(),
+                          }
+                          for k, v in node.props
+                      ],
+                      "children": [node_to_obj(c) for c in node.children],
+                  }
+
+              tree = {
+                  "meta": meta,
+                  "tree": node_to_obj(root),
+              }
+              (out_dir / "tree.json").write_text(json.dumps(tree, indent=2), encoding="utf-8", newline="\n")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python3 work/analyze_dtb.py
+
+          dtc -I dtb -O dts -o work/out/dtc.dts work/in/input.dtb || true
+          dtc -I dtb -O dts -s -o work/out/dtc_sorted.dts work/in/input.dtb || true
+
+          cat > work/out/README.txt << EOF
+          Input URL:
+          ${{ inputs.dtb_url }}
+
+          Generated files:
+          - dtc.dts          : dtc direct decompile
+          - dtc_sorted.dts   : dtc decompile with sorting when available
+          - pretty.dts       : Python reconstructed DTS with phandle labels
+          - pretty.dtsi      : include-friendly copy of pretty.dts
+          - report.txt       : metadata and phandle report
+          - tree.json        : full parsed tree dump
+          EOF
+
+      - name: Package ZIP
+        run: |
+          set -eux
+          cd work/out
+          zip -9 -r "../../${{ inputs.output_name }}.zip" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: ${{ inputs.output_name }}.zip
+          if-no-files-found: error
