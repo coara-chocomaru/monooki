@@ -32,94 +32,94 @@ jobs:
       - name: Locate and extract boot.img and kernel precisely
         run: |
           python3 - "work/input/${TARGET_FILE}" "work/found" <<'PYEOF'
-import sys
-import lzma
-import os
+          import sys
+          import lzma
+          import os
 
-src_path = sys.argv[1]
-out_dir = sys.argv[2]
-os.makedirs(out_dir, exist_ok=True)
+          src_path = sys.argv[1]
+          out_dir = sys.argv[2]
+          os.makedirs(out_dir, exist_ok=True)
 
-with open(src_path, "rb") as f:
-    data = f.read()
+          with open(src_path, "rb") as f:
+              data = f.read()
 
-header_pattern = b"\x5d\x00\x00\x20\x00"
+          header_pattern = b"\x5d\x00\x00\x20\x00"
 
-offsets = []
-idx = 0
-while True:
-    idx = data.find(header_pattern, idx)
-    if idx == -1:
-        break
-    offsets.append(idx)
-    idx += 1
+          offsets = []
+          idx = 0
+          while True:
+              idx = data.find(header_pattern, idx)
+              if idx == -1:
+                  break
+              offsets.append(idx)
+              idx += 1
 
-print(f"lzma header candidates found: {len(offsets)}")
+          print(f"lzma header candidates found: {len(offsets)}")
 
-found_boot = 0
-found_kernel = 0
+          found_boot = 0
+          found_kernel = 0
 
-for off in offsets:
-    decomp = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-    out = bytearray()
-    pos = off
-    total_len = len(data)
-    try:
-        while not decomp.eof and pos < total_len:
-            chunk = data[pos:pos + 65536]
-            if not chunk:
-                break
-            out += decomp.decompress(chunk)
-            pos += len(chunk)
-            if len(out) > 300 * 1024 * 1024:
-                break
-    except lzma.LZMAError:
-        continue
+          for off in offsets:
+              decomp = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
+              out = bytearray()
+              pos = off
+              total_len = len(data)
+              try:
+                  while not decomp.eof and pos < total_len:
+                      chunk = data[pos:pos + 65536]
+                      if not chunk:
+                          break
+                      out += decomp.decompress(chunk)
+                      pos += len(chunk)
+                      if len(out) > 300 * 1024 * 1024:
+                          break
+              except lzma.LZMAError:
+                  continue
 
-    if not decomp.eof:
-        continue
+              if not decomp.eof:
+                  continue
 
-    if len(out) < 40:
-        continue
+              if len(out) < 40:
+                  continue
 
-    magic = bytes(out[0:8])
+              magic = bytes(out[0:8])
 
-    if magic == b"ANDROID!":
-        found_boot += 1
-        boot_path = os.path.join(out_dir, f"boot_0x{off:x}.img")
-        with open(boot_path, "wb") as bf:
-            bf.write(out)
-        print(f"boot.img found at source offset 0x{off:x} size={len(out)} -> {boot_path}")
+              if magic == b"ANDROID!":
+                  found_boot += 1
+                  boot_path = os.path.join(out_dir, f"boot_0x{off:x}.img")
+                  with open(boot_path, "wb") as bf:
+                      bf.write(out)
+                  print(f"boot.img found at source offset 0x{off:x} size={len(out)} -> {boot_path}")
 
-        kernel_size = int.from_bytes(out[8:12], "little")
-        page_size = int.from_bytes(out[36:40], "little")
-        if 0 < kernel_size < len(out) and 0 < page_size <= 65536:
-            kernel_start = page_size
-            kernel_end = kernel_start + kernel_size
-            if kernel_end <= len(out):
-                found_kernel += 1
-                kernel_path = os.path.join(out_dir, f"kernel_0x{off:x}.img")
-                with open(kernel_path, "wb") as kf:
-                    kf.write(out[kernel_start:kernel_end])
-                print(f"kernel extracted from boot at 0x{off:x} size={kernel_size} -> {kernel_path}")
+                  kernel_size = int.from_bytes(out[8:12], "little")
+                  page_size = int.from_bytes(out[36:40], "little")
+                  if 0 < kernel_size < len(out) and 0 < page_size <= 65536:
+                      kernel_start = page_size
+                      kernel_end = kernel_start + kernel_size
+                      if kernel_end <= len(out):
+                          found_kernel += 1
+                          kernel_path = os.path.join(out_dir, f"kernel_0x{off:x}.img")
+                          with open(kernel_path, "wb") as kf:
+                              kf.write(out[kernel_start:kernel_end])
+                          print(f"kernel extracted from boot at 0x{off:x} size={kernel_size} -> {kernel_path}")
 
-    elif magic == b"VNDRBOOT":
-        found_boot += 1
-        vboot_path = os.path.join(out_dir, f"vendor_boot_0x{off:x}.img")
-        with open(vboot_path, "wb") as vf:
-            vf.write(out)
-        print(f"vendor_boot.img found at source offset 0x{off:x} size={len(out)} -> {vboot_path}")
+              elif magic == b"VNDRBOOT":
+                  found_boot += 1
+                  vboot_path = os.path.join(out_dir, f"vendor_boot_0x{off:x}.img")
+                  with open(vboot_path, "wb") as vf:
+                      vf.write(out)
+                  print(f"vendor_boot.img found at source offset 0x{off:x} size={len(out)} -> {vboot_path}")
 
-    elif out[:2] == b"\x1f\x8b" or out[:4] == b"\x02\x21\x4c\x18" or b"Linux version" in out[:2048]:
-        found_kernel += 1
-        kernel_path = os.path.join(out_dir, f"kernel_raw_0x{off:x}.img")
-        with open(kernel_path, "wb") as kf:
-            kf.write(out)
-        print(f"standalone kernel candidate at source offset 0x{off:x} size={len(out)} -> {kernel_path}")
+              elif out[:2] == b"\x1f\x8b" or out[:4] == b"\x02\x21\x4c\x18" or b"Linux version" in out[:2048]:
+                  found_kernel += 1
+                  kernel_path = os.path.join(out_dir, f"kernel_raw_0x{off:x}.img")
+                  with open(kernel_path, "wb") as kf:
+                      kf.write(out)
+                  print(f"standalone kernel candidate at source offset 0x{off:x} size={len(out)} -> {kernel_path}")
 
-print(f"total boot images found: {found_boot}")
-print(f"total kernel images found: {found_kernel}")
-PYEOF
+          print(f"total boot images found: {found_boot}")
+          print(f"total kernel images found: {found_kernel}")
+          PYEOF
 
       - name: List results
         run: |
