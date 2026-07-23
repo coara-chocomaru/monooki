@@ -1,0 +1,60 @@
+name: Fetch libcameraservice Android.mk
+
+on:
+  workflow_dispatch:
+
+env:
+  MANIFEST_URL: 'https://github.com/LineageOS/android'
+  MANIFEST_BRANCH: 'cm-12.1'
+  TARGET_FILE: 'frameworks/av/services/camera/libcameraservice/Android.mk'
+
+jobs:
+  fetch-mk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Install repo
+        run: |
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/bin/repo
+
+      - name: Initialize repo
+        id: pwd
+        run: |
+          mkdir workspace
+          cd workspace
+          echo "workspace-folder=$(pwd)" >> "$GITHUB_OUTPUT"
+          git config --global user.name "azwhikaru"
+          git config --global user.email "azwhikaru+37921907@github.com"
+          repo init --depth=1 -u ${{ env.MANIFEST_URL }} -b ${{ env.MANIFEST_BRANCH }}
+
+      - name: Sync only frameworks/av
+        working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        run: |
+          repo sync -j$(nproc --all) --force-sync --no-clone-bundle --no-tags frameworks/av
+
+      - name: Archive libcameraservice Android.mk
+        working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        run: |
+          if [ ! -f "${{ env.TARGET_FILE }}" ]; then
+            echo "ERROR: ${{ env.TARGET_FILE }} not found after repo sync"
+            find frameworks/av -maxdepth 3 -iname "Android.mk" || true
+            exit 1
+          fi
+          mkdir -p /tmp/libcameraservice-mk
+          cp "${{ env.TARGET_FILE }}" /tmp/libcameraservice-mk/Android.mk
+          cd /tmp/libcameraservice-mk
+          zip -r libcameraservice-android-mk.zip Android.mk
+          ls -la
+
+      - name: Upload libcameraservice Android.mk
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcameraservice-android-mk
+          path: /tmp/libcameraservice-mk/libcameraservice-android-mk.zip
+          retention-days: 14
+          if-no-files-found: error
