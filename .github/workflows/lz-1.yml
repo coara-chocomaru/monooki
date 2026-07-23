@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'Download target URL'
+        description: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/150.1.3020_user-154.0.3420_user_ZEMI_delta.bin'
         required: true
         type: string
       filename:
