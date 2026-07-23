@@ -1,20 +1,20 @@
-name: Extract DTB from boot.img and convert to DTS
+name: Extract DTB from boot.img and Convert to DTS
 
 on:
   workflow_dispatch:
     inputs:
       img_url:
-        description: "URL of boot.img (or Android image) file"
+        description: "boot.img file URL"
         required: true
         type: string
       output_name:
         description: "Output ZIP base name"
         required: false
-        default: "extracted_dtb_dts"
+        default: "dtb_analysis"
         type: string
 
 jobs:
-  extract:
+  extract-dtb:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,115 +23,506 @@ jobs:
 
       - name: Install dependencies
         run: |
-          set -eux
           sudo apt-get update
-          # device-tree-compiler で dtc を、abootimg で boot.img を扱う
-          sudo apt-get install -y device-tree-compiler abootimg python3 curl file zip
+          sudo apt-get install -y \
+            device-tree-compiler \
+            abootimg \
+            python3 \
+            python3-pip \
+            curl \
+            file \
+            zip \
+            unzip \
+            xxd
+
+      - name: Install extract-dtb
+        run: |
+          pip3 install extract-dtb
 
       - name: Prepare workspace
         run: |
-          set -eux
           rm -rf work
-          mkdir -p work/in work/out
+          mkdir -p work/in work/out work/out/dts
 
       - name: Download boot image
         run: |
-          set -eux
           curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.img_url }}" -o work/in/boot.img
           file work/in/boot.img
 
-      - name: Extract boot image using abootimg
+      - name: Extract with abootimg
         run: |
-          set -eux
           cd work/in
-          # abootimg -x で bootimg.cfg, zImage, initrd.img, および second (DTB の可能性) を抽出
           abootimg -x boot.img
           ls -la
 
-      - name: Identify DTB (from 'second' or extract from zImage)
-        id: identify
+      - name: Extract DTB from second or zImage
         run: |
-          set -eux
           cd work/in
-
-          # 1) 'second' ファイルが存在し、かつそれが Device Tree Blob ならばそれを採用
+          
+          # Try to extract from 'second' file first
           if [ -f second ]; then
             file_type=$(file -b second)
             if echo "$file_type" | grep -qi "Device Tree Blob"; then
-              echo "DTB found as 'second' file"
+              echo "Found DTB in second file"
               cp second ../out/dtb_from_second.dtb
               exit 0
             fi
           fi
-
-          # 2) 'second' がない、または DTB ではない場合、extract-dtb で zImage から抽出
-          echo "No valid DTB in second, extracting from zImage using extract-dtb"
-
-          # extract-dtb スクリプトをダウンロード (https://github.com/xiaolu/mkbootimg_tools)
-          curl -L -o extract-dtb https://raw.githubusercontent.com/xiaolu/mkbootimg_tools/master/extract-dtb
-          chmod +x extract-dtb
-
-          # 出力先ディレクトリを作成し、zImage から DTB を抽出
+          
+          # Extract from zImage using extract-dtb
+          echo "Extracting DTB from zImage..."
           mkdir -p ../out/dtb_extracted
-          ./extract-dtb zImage -o ../out/dtb_extracted/
-
-          # 抽出に成功したか確認
-          if [ -d ../out/dtb_extracted ] && [ "$(ls -A ../out/dtb_extracted)" ]; then
-            echo "DTB extracted from zImage"
+          extract-dtb zImage -o ../out/dtb_extracted/
+          
+          # Verify extraction
+          if [ -d ../out/dtb_extracted ] && [ "$(ls -A ../out/dtb_extracted 2>/dev/null)" ]; then
+            echo "DTB extracted successfully from zImage"
+            # Copy all extracted dtb files to main out directory
+            cp ../out/dtb_extracted/*.dtb ../out/ 2>/dev/null || true
           else
             echo "No DTB found in zImage" >&2
             exit 1
           fi
 
-      - name: Convert DTB(s) to DTS
+      - name: Convert DTB to DTS
         run: |
-          set -eux
-          mkdir -p work/out/dts
-
-          # すべての .dtb ファイルを再帰的に探し、dtc で .dts に変換
+          # Find all .dtb files and convert to .dts
           find work/out -name "*.dtb" -type f | while read dtb; do
             base=$(basename "$dtb" .dtb)
             dts_file="work/out/dts/${base}.dts"
+            echo "Converting $dtb to $dts_file"
             dtc -I dtb -O dts -o "$dts_file" "$dtb"
-            echo "Converted $dtb to $dts_file"
+          done
+          
+          # Also try with sorting if dtc supports it
+          find work/out -name "*.dtb" -type f | while read dtb; do
+            base=$(basename "$dtb" .dtb)
+            dts_sorted="work/out/dts/${base}_sorted.dts"
+            dtc -I dtb -O dts -s -o "$dts_sorted" "$dtb" 2>/dev/null || true
           done
 
-          # 念のため dtb_extracted 以下も明示的に処理 (find で既にカバー済みだが)
-          if [ -d work/out/dtb_extracted ]; then
-            find work/out/dtb_extracted -name "*.dtb" -type f | while read dtb; do
-              base=$(basename "$dtb" .dtb)
-              dts_file="work/out/dts/${base}.dts"
-              dtc -I dtb -O dts -o "$dts_file" "$dtb"
-              echo "Converted $dtb to $dts_file"
-            done
-          fi
-
-      - name: Generate summary report
+      - name: Analyze DTB with Python
         run: |
-          set -eux
+          cat > work/analyze_dtb.py << 'PY'
+          #!/usr/bin/env python3
+          import json
+          import struct
+          from pathlib import Path
+
+          FDT_MAGIC = 0xD00DFEED
+          FDT_BEGIN_NODE = 0x1
+          FDT_END_NODE = 0x2
+          FDT_PROP = 0x3
+          FDT_NOP = 0x4
+          FDT_END = 0x9
+
+          def be32(b, off):
+              return struct.unpack_from(">I", b, off)[0]
+
+          def align4(n):
+              return (n + 3) & ~3
+
+          def escape_dts_string(s):
+              out = []
+              for ch in s:
+                  o = ord(ch)
+                  if ch == "\\":
+                      out.append("\\\\")
+                  elif ch == '"':
+                      out.append('\\"')
+                  elif ch == "\n":
+                      out.append("\\n")
+                  elif ch == "\r":
+                      out.append("\\r")
+                  elif ch == "\t":
+                      out.append("\\t")
+                  elif 32 <= o <= 126:
+                      out.append(ch)
+                  else:
+                      out.append(f"\\x{o:02x}")
+              return "".join(out)
+
+          def is_printable_ascii(byte):
+              return 32 <= byte <= 126
+
+          def split_c_strings(data):
+              parts = data.split(b"\x00")
+              if parts and parts[-1] == b"":
+                  parts = parts[:-1]
+              return parts
+
+          class Node:
+              def __init__(self, name, parent=None):
+                  self.name = name
+                  self.parent = parent
+                  self.props = []
+                  self.children = []
+                  self.path = None
+
+              def prop_map(self):
+                  return {k: v for k, v in self.props}
+
+          def parse_dtb(blob):
+              if len(blob) < 40:
+                  raise ValueError("DTB is too small")
+
+              magic = be32(blob, 0)
+              if magic != FDT_MAGIC:
+                  raise ValueError(f"Bad DTB magic: 0x{magic:08x}")
+
+              totalsize = be32(blob, 4)
+              off_dt_struct = be32(blob, 8)
+              off_dt_strings = be32(blob, 12)
+              off_mem_rsvmap = be32(blob, 16)
+              version = be32(blob, 20)
+              last_comp_version = be32(blob, 24)
+              boot_cpuid_phys = be32(blob, 28)
+              size_dt_strings = be32(blob, 32)
+              size_dt_struct = be32(blob, 36)
+
+              strings = blob[off_dt_strings:off_dt_strings + size_dt_strings]
+              struct_block = blob[off_dt_struct:off_dt_struct + size_dt_struct]
+
+              root = Node("/")
+              stack = [root]
+
+              p = 0
+              while p < len(struct_block):
+                  token = be32(struct_block, p)
+                  p += 4
+
+                  if token == FDT_BEGIN_NODE:
+                      end = struct_block.find(b"\x00", p)
+                      if end < 0:
+                          raise ValueError("Unterminated node name")
+                      name = struct_block[p:end].decode("ascii", errors="replace")
+                      p = align4(end + 1)
+
+                      node = Node(name if name else "/", stack[-1])
+                      stack[-1].children.append(node)
+                      stack.append(node)
+
+                  elif token == FDT_END_NODE:
+                      if len(stack) <= 1:
+                          raise ValueError("Unexpected END_NODE")
+                      stack.pop()
+
+                  elif token == FDT_PROP:
+                      if p + 8 > len(struct_block):
+                          raise ValueError("Truncated property header")
+                      plen = be32(struct_block, p)
+                      nameoff = be32(struct_block, p + 4)
+                      p += 8
+
+                      if p + plen > len(struct_block):
+                          raise ValueError("Truncated property data")
+                      value = struct_block[p:p + plen]
+                      p = align4(p + plen)
+
+                      end = strings.find(b"\x00", nameoff)
+                      if end < 0:
+                          prop_name = f"unknown_{nameoff}"
+                      else:
+                          prop_name = strings[nameoff:end].decode("ascii", errors="replace")
+
+                      stack[-1].props.append((prop_name, value))
+
+                  elif token == FDT_NOP:
+                      pass
+
+                  elif token == FDT_END:
+                      break
+
+                  else:
+                      raise ValueError(f"Unknown token: 0x{token:08x}")
+
+              def walk(node, base_path):
+                  if node.parent is None:
+                      node.path = "/"
+                  else:
+                      if base_path == "/":
+                          node.path = "/" + node.name
+                      else:
+                          node.path = base_path.rstrip("/") + "/" + node.name
+                  for child in node.children:
+                      walk(child, node.path)
+
+              walk(root, "/")
+
+              meta = {
+                  "totalsize": totalsize,
+                  "off_dt_struct": off_dt_struct,
+                  "off_dt_strings": off_dt_strings,
+                  "off_mem_rsvmap": off_mem_rsvmap,
+                  "version": version,
+                  "last_comp_version": last_comp_version,
+                  "boot_cpuid_phys": boot_cpuid_phys,
+                  "size_dt_strings": size_dt_strings,
+                  "size_dt_struct": size_dt_struct,
+              }
+              return root, meta
+
+          def collect_phandles(root):
+              phandle_to_node = {}
+              all_nodes = []
+
+              def walk(node):
+                  all_nodes.append(node)
+                  props = node.prop_map()
+                  for key in ("phandle", "linux,phandle"):
+                      if key in props and len(props[key]) == 4:
+                          phandle_to_node[be32(props[key], 0)] = node
+                  for child in node.children:
+                      walk(child)
+
+              walk(root)
+              return phandle_to_node, all_nodes
+
+          def node_label_for(node):
+              props = node.prop_map()
+              for key in ("phandle", "linux,phandle"):
+                  if key in props and len(props[key]) == 4:
+                      return f"phandle_{be32(props[key], 0):08x}"
+              return None
+
+          def decode_ascii_strings(data):
+              if not data.endswith(b"\x00"):
+                  return None
+              if not all((b == 0 or is_printable_ascii(b)) for b in data):
+                  return None
+              try:
+                  parts = split_c_strings(data)
+                  return [p.decode("ascii") for p in parts]
+              except UnicodeDecodeError:
+                  return None
+
+          def cells_from_bytes(data):
+              if len(data) % 4 != 0:
+                  return None
+              return [be32(data, i) for i in range(0, len(data), 4)]
+
+          def cell_words_to_text(cells, phandle_map=None, prop_name=None):
+              if not cells:
+                  return ""
+
+              if prop_name in ("#address-cells", "#size-cells", "phandle", "linux,phandle"):
+                  if len(cells) == 1:
+                      return f"<{cells[0]}>"
+
+              single_ref_props = {
+                  "interrupt-parent", "dmas", "clocks", "resets",
+                  "power-domains", "memory-region", "iommus", "mboxes",
+                  "nvmem-cells", "phys", "phy-handle", "sound-dai",
+                  "supply", "cpu", "next-level-cache",
+              }
+              if prop_name in single_ref_props and phandle_map is not None and len(cells) >= 1:
+                  first = cells[0]
+                  if first in phandle_map:
+                      label = node_label_for(phandle_map[first])
+                      if label:
+                          rest = " ".join(f"0x{x:08x}" for x in cells[1:])
+                          if rest:
+                              return f"<&{label} {rest}>"
+                          return f"<&{label}>"
+
+              if prop_name == "interrupts":
+                  if len(cells) >= 3:
+                      kind = cells[0]
+                      irq_num = cells[1]
+                      flags = cells[2]
+                      kind_text = None
+                      if kind == 0:
+                          kind_text = "GIC_SPI"
+                      elif kind == 1:
+                          kind_text = "GIC_PPI"
+
+                      flag_text = {
+                          1: "IRQ_TYPE_EDGE_RISING",
+                          2: "IRQ_TYPE_EDGE_FALLING",
+                          4: "IRQ_TYPE_LEVEL_HIGH",
+                          8: "IRQ_TYPE_LEVEL_LOW",
+                      }.get(flags)
+
+                      if kind_text and flag_text:
+                          rest = [kind_text, str(irq_num), flag_text]
+                          if len(cells) > 3:
+                              rest.extend(f"0x{x:08x}" for x in cells[3:])
+                          return "<" + " ".join(rest) + ">"
+                  return "<" + " ".join(f"0x{x:08x}" for x in cells) + ">"
+
+              if len(cells) == 1:
+                  return f"<{cells[0]}>"
+
+              return "<" + " ".join(f"0x{x:08x}" for x in cells) + ">"
+
+          def format_value(node, prop_name, data, phandle_map):
+              if len(data) == 0:
+                  return ""
+
+              strs = decode_ascii_strings(data)
+              if strs is not None:
+                  if len(strs) == 1:
+                      return f"\"{escape_dts_string(strs[0])}\""
+                  return ", ".join(f"\"{escape_dts_string(s)}\"" for s in strs)
+
+              if prop_name in ("compatible", "model", "bootargs", "stdout-path", "status"):
+                  if strs is not None:
+                      if len(strs) == 1:
+                          return f"\"{escape_dts_string(strs[0])}\""
+                      return ", ".join(f"\"{escape_dts_string(s)}\"" for s in strs)
+
+              cells = cells_from_bytes(data)
+              if cells is not None:
+                  return cell_words_to_text(cells, phandle_map=phandle_map, prop_name=prop_name)
+
+              return "[" + " ".join(f"{b:02x}" for b in data) + "]"
+
+          def render_node(node, phandle_map, indent=0):
+              sp = "    " * indent
+              out = []
+
+              if indent == 0:
+                  out.append("/dts-v1/;\n")
+                  out.append("// Reconstructed from DTB\n\n")
+                  out.append("/ {\n")
+              else:
+                  label = node_label_for(node)
+                  if label:
+                      out.append(f"{sp}{label}: {node.name} {{\n")
+                  else:
+                      out.append(f"{sp}{node.name} {{\n")
+
+              for prop_name, data in node.props:
+                  value = format_value(node, prop_name, data, phandle_map)
+                  if value == "":
+                      out.append(f"{sp}    {prop_name};\n")
+                  else:
+                      out.append(f"{sp}    {prop_name} = {value};\n")
+
+              for child in node.children:
+                  out.append(render_node(child, phandle_map, indent + 1))
+
+              out.append(f"{sp}}};\n")
+              return "".join(out)
+
+          def build_report(root, meta, phandle_map, all_nodes):
+              lines = []
+              lines.append("DTB Deep Analysis Report")
+              lines.append("========================")
+              lines.append("")
+              for k, v in meta.items():
+                  lines.append(f"{k}: {v}")
+              lines.append("")
+              lines.append(f"Total nodes: {len(all_nodes)}")
+              lines.append(f"Total phandles: {len(phandle_map)}")
+              lines.append("")
+              lines.append("Phandle map:")
+              for ph, node in sorted(phandle_map.items()):
+                  lines.append(f"  0x{ph:08x} -> {node.path}")
+              return "\n".join(lines) + "\n"
+
+          def main():
+              out_dir = Path("work/out")
+              out_dir.mkdir(parents=True, exist_ok=True)
+
+              # Process all dtb files
+              dtb_files = list(Path("work/out").glob("**/*.dtb"))
+              
+              for dtb_path in dtb_files:
+                  if dtb_path.parent.name == "dtb_extracted":
+                      continue
+                  
+                  try:
+                      blob = dtb_path.read_bytes()
+                      root, meta = parse_dtb(blob)
+                      phandle_map, all_nodes = collect_phandles(root)
+                      
+                      # Generate pretty DTS
+                      raw_dts = render_node(root, phandle_map)
+                      dts_out = out_dir / f"{dtb_path.stem}_pretty.dts"
+                      dts_out.write_text(raw_dts, encoding="utf-8", newline="\n")
+                      
+                      # Generate report
+                      report = build_report(root, meta, phandle_map, all_nodes)
+                      report_out = out_dir / f"{dtb_path.stem}_report.txt"
+                      report_out.write_text(report, encoding="utf-8", newline="\n")
+                      
+                      # Generate JSON
+                      def node_to_obj(node):
+                          return {
+                              "name": node.name,
+                              "path": node.path,
+                              "props": [
+                                  {
+                                      "name": k,
+                                      "len": len(v),
+                                      "hex": v.hex(),
+                                  }
+                                  for k, v in node.props
+                              ],
+                              "children": [node_to_obj(c) for c in node.children],
+                          }
+                      
+                      tree = {
+                          "meta": meta,
+                          "tree": node_to_obj(root),
+                      }
+                      json_out = out_dir / f"{dtb_path.stem}_tree.json"
+                      json_out.write_text(json.dumps(tree, indent=2), encoding="utf-8", newline="\n")
+                      
+                      print(f"Analyzed {dtb_path.name}")
+                  except Exception as e:
+                      print(f"Failed to analyze {dtb_path.name}: {e}")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python3 work/analyze_dtb.py
+
+      - name: Generate README
+        run: |
           cat > work/out/README.txt << EOF
+          DTB Analysis Report
+          ===================
+          
           Input URL: ${{ inputs.img_url }}
-          Extraction date: $(date -u)
-
-          Steps performed:
-          1. Downloaded boot.img
-          2. Used abootimg to extract components (bootimg.cfg, zImage, initrd.img, possibly second)
-          3. Identified DTB from 'second' (if it was a valid DTB) or extracted from zImage using extract-dtb
-          4. Converted all .dtb files to .dts using dtc
-
-          Files in this archive:
-          - boot.img (original)
-          - bootimg.cfg, zImage, initrd.img (extracted by abootimg)
-          - Any .dtb files found (either from second or extracted from zImage) are placed under dtb_extracted/
-          - All .dts files are placed under dts/
+          Generated: $(date -u)
+          
+          Files Included:
+          ----------------
+          - boot.img                 : Original boot image
+          - bootimg.cfg              : abootimg configuration
+          - zImage                   : Extracted kernel
+          - initrd.img               : Extracted initramfs (if present)
+          - second                   : Second stage bootloader (may contain DTB)
+          - dtb_from_second.dtb      : DTB extracted from 'second' (if present)
+          
+          Extracted DTB Files:
+          ---------------------
+          All DTB files extracted from zImage are in dtb_extracted/
+          
+          DTS Files (Device Tree Source):
+          -------------------------------
+          All converted DTS files are in dts/
+          - .dts                     : Standard dtc decompile
+          - _sorted.dts              : Sorted output from dtc
+          - _pretty.dts              : Python-reconstructed with phandle labels
+          
+          Analysis Files:
+          ----------------
+          - _report.txt              : Metadata and phandle summary
+          - _tree.json               : Full parsed tree as JSON
+          
+          Notes:
+          -------
+          - DTB stores flattened structure, original comments/labels not preserved
+          - Phandle references are reconstructed heuristically
+          - Interrupts decoded best-effort for common ARM GIC format
           EOF
-
-          echo "Output files:" >> work/out/README.txt
-          find work/out -type f | sort >> work/out/README.txt
 
       - name: Package ZIP
         run: |
-          set -eux
           cd work/out
           zip -9 -r "../../${{ inputs.output_name }}.zip" .
 
