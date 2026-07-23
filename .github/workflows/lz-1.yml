@@ -1,0 +1,413 @@
+name: binary-analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Download target URL'
+        required: true
+        type: string
+      filename:
+        description: 'Output filename'
+        required: false
+        type: string
+        default: 'target.bin'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup workspace
+        run: |
+          mkdir -p work/input work/extracted work/report
+          echo "TARGET_URL=${{ inputs.target_url }}" >> $GITHUB_ENV
+          echo "TARGET_FILE=${{ inputs.filename }}" >> $GITHUB_ENV
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binwalk \
+            file \
+            xz-utils \
+            lzma \
+            p7zip-full \
+            unrar \
+            zip \
+            unzip \
+            bzip2 \
+            gzip \
+            lz4 \
+            zstd \
+            squashfs-tools \
+            cpio \
+            android-sdk-libsparse-utils \
+            e2fsprogs \
+            xxd \
+            hexdump \
+            radare2 \
+            python3-pip \
+            git \
+            build-essential \
+            liblzma-dev \
+            liblzo2-dev \
+            libssl-dev \
+            fdisk \
+            gdisk \
+            mtools \
+            dosfstools
+          pip3 install --break-system-packages \
+            lz4 \
+            zstandard \
+            python-lzo \
+            pycryptodome \
+            capstone \
+            pyelftools
+
+      - name: Build sdat2img and payload tools
+        run: |
+          git clone --depth 1 https://github.com/xpirt/sdat2img.git work/tools_sdat2img
+          git clone --depth 1 https://github.com/vm03/imgtool.git work/tools_imgtool || true
+          git clone --depth 1 https://github.com/anestisb/android-simg2img.git work/tools_simg2img
+          cd work/tools_simg2img
+          make || true
+          cd -
+
+      - name: Build erofs-utils
+        run: |
+          git clone --depth 1 https://github.com/erofs/erofs-utils.git work/tools_erofs
+          cd work/tools_erofs
+          ./autogen.sh || true
+          ./configure || true
+          make || true
+          cd -
+
+      - name: Download target file
+        run: |
+          cd work/input
+          curl -L --fail --retry 5 --retry-delay 3 -o "${TARGET_FILE}" "${TARGET_URL}"
+          ls -la
+
+      - name: Basic file identification
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== file command ==="
+            file "${FILE}"
+            echo ""
+            echo "=== file magic (mime) ==="
+            file -i "${FILE}"
+            echo ""
+            echo "=== size ==="
+            stat --format="%s bytes" "${FILE}"
+            echo ""
+            echo "=== sha256 ==="
+            sha256sum "${FILE}"
+            echo ""
+            echo "=== md5 ==="
+            md5sum "${FILE}"
+            echo ""
+            echo "=== crc32 ==="
+            cksum "${FILE}"
+          } | tee work/report/00_identify.txt
+
+      - name: Hex dump preview
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== first 4096 bytes ==="
+            xxd -l 4096 "${FILE}"
+            echo ""
+            echo "=== last 1024 bytes ==="
+            SIZE=$(stat --format="%s" "${FILE}")
+            if [ "${SIZE}" -gt 1024 ]; then
+              SKIP=$((SIZE - 1024))
+              xxd -s "${SKIP}" "${FILE}"
+            fi
+          } | tee work/report/01_hexdump.txt
+
+      - name: Strings extraction
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== strings (ascii, min length 8) ==="
+            strings -n 8 -t x "${FILE}"
+          } > work/report/02_strings.txt
+          wc -l work/report/02_strings.txt
+
+      - name: Entropy analysis
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          binwalk -E "${FILE}" | tee work/report/03_entropy.txt
+
+      - name: Binwalk signature scan
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== binwalk signature scan ==="
+            binwalk "${FILE}"
+            echo ""
+            echo "=== binwalk verbose scan ==="
+            binwalk -B -v "${FILE}"
+          } | tee work/report/04_binwalk_scan.txt
+
+      - name: Binwalk extraction
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          cd work/extracted
+          binwalk --extract --matryoshka --directory=. "../input/${TARGET_FILE}" || true
+          find . -maxdepth 6 | tee ../report/05_binwalk_extracted_tree.txt
+
+      - name: Detect and decompress known containers
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/manual"
+          mkdir -p "${OUT}"
+          {
+            echo "=== gzip attempt ==="
+            gunzip -k -c "${FILE}" > "${OUT}/decompressed.gz.out" 2>&1 && echo "gzip: success" || echo "gzip: failed"
+
+            echo "=== xz attempt ==="
+            xz -dc "${FILE}" > "${OUT}/decompressed.xz.out" 2>&1 && echo "xz: success" || echo "xz: failed"
+
+            echo "=== lzma attempt ==="
+            xz -dc --format=lzma "${FILE}" > "${OUT}/decompressed.lzma.out" 2>&1 && echo "lzma: success" || echo "lzma: failed"
+
+            echo "=== bzip2 attempt ==="
+            bzip2 -dc "${FILE}" > "${OUT}/decompressed.bz2.out" 2>&1 && echo "bzip2: success" || echo "bzip2: failed"
+
+            echo "=== lz4 attempt ==="
+            lz4 -dc "${FILE}" > "${OUT}/decompressed.lz4.out" 2>&1 && echo "lz4: success" || echo "lz4: failed"
+
+            echo "=== zstd attempt ==="
+            zstd -dc "${FILE}" > "${OUT}/decompressed.zst.out" 2>&1 && echo "zstd: success" || echo "zstd: failed"
+
+            echo "=== 7z attempt ==="
+            7z x -o"${OUT}/7z_out" "${FILE}" 2>&1 && echo "7z: success" || echo "7z: failed"
+
+            echo "=== unzip attempt ==="
+            mkdir -p "${OUT}/zip_out"
+            unzip -o "${FILE}" -d "${OUT}/zip_out" 2>&1 && echo "unzip: success" || echo "unzip: failed"
+
+            echo "=== cpio attempt ==="
+            mkdir -p "${OUT}/cpio_out"
+            (cd "${OUT}/cpio_out" && cpio -idv < "../../../input/${TARGET_FILE}") 2>&1 && echo "cpio: success" || echo "cpio: failed"
+
+            find "${OUT}" -maxdepth 1 -name "decompressed.*.out" -exec du -h {} \;
+          } | tee work/report/06_manual_decompress.txt
+
+      - name: Scan for embedded LZMA raw streams
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/lzma_chunks"
+          mkdir -p "${OUT}"
+          python3 - "${FILE}" "${OUT}" <<'PYEOF'
+import sys
+import struct
+
+path = sys.argv[1]
+outdir = sys.argv[2]
+
+with open(path, "rb") as f:
+    data = f.read()
+
+candidates = []
+i = 0
+while True:
+    idx = data.find(b"\x5d\x00\x00", i)
+    if idx == -1:
+        break
+    if idx + 13 <= len(data):
+        dict_size = struct.unpack("<I", data[idx+1:idx+5])[0]
+        uncompressed_size = struct.unpack("<Q", data[idx+5:idx+13])[0]
+        if dict_size <= (1 << 27) and 0 < uncompressed_size < (1 << 32):
+            candidates.append((idx, dict_size, uncompressed_size))
+    i = idx + 1
+
+report_path = outdir.rsplit("/", 1)[0] + "/report/07_lzma_chunk_candidates.txt"
+with open(report_path, "w") as rep:
+    rep.write(f"total candidates: {len(candidates)}\n")
+    for n, (off, ds, us) in enumerate(candidates):
+        rep.write(f"[{n}] offset=0x{off:x} dict_size={ds} uncompressed_size={us}\n")
+        chunk_path = f"{outdir}/chunk_{n}_off{off:x}.lzma"
+        with open(chunk_path, "wb") as cf:
+            cf.write(data[off:off+13])
+            remaining = data[off+13:]
+            cf.write(remaining)
+
+print(f"found {len(candidates)} lzma header candidates")
+PYEOF
+          ls -la "${OUT}" | tee -a work/report/07_lzma_chunk_candidates.txt
+
+      - name: Attempt decode of each LZMA chunk candidate
+        run: |
+          OUT="work/extracted/lzma_chunks"
+          DECOUT="work/extracted/lzma_decoded"
+          mkdir -p "${DECOUT}"
+          {
+            for f in "${OUT}"/chunk_*.lzma; do
+              [ -e "${f}" ] || continue
+              base=$(basename "${f}" .lzma)
+              echo "=== attempting ${base} ==="
+              xz -dc --format=lzma "${f}" > "${DECOUT}/${base}.out" 2>"${DECOUT}/${base}.err"
+              if [ -s "${DECOUT}/${base}.out" ]; then
+                echo "success: $(stat --format=%s "${DECOUT}/${base}.out") bytes decoded"
+              else
+                echo "failed: $(cat "${DECOUT}/${base}.err")"
+              fi
+            done
+          } | tee work/report/08_lzma_chunk_decode.txt
+
+      - name: Android specific format checks
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== android sparse image check ==="
+            python3 -c "
+import struct
+with open('${FILE}', 'rb') as f:
+    magic = f.read(4)
+    if magic == b'\x3a\xff\x26\xed':
+        print('detected: android sparse image')
+    else:
+        print('not android sparse image, magic=' + magic.hex())
+"
+            echo "=== AVB footer check (last 64 bytes) ==="
+            SIZE=$(stat --format="%s" "${FILE}")
+            if [ "${SIZE}" -gt 64 ]; then
+              SKIP=$((SIZE - 64))
+              xxd -s "${SKIP}" "${FILE}"
+            fi
+            echo "=== boot image magic check ==="
+            head -c 8 "${FILE}" | xxd
+            echo "=== ext4 superblock magic scan (0xEF53 at offset 1080+56) ==="
+            python3 -c "
+with open('${FILE}', 'rb') as f:
+    data = f.read()
+    idx = 0
+    while True:
+        idx = data.find(b'\x53\xef', idx)
+        if idx == -1:
+            break
+        print(f'0x53ef magic candidate at offset 0x{idx:x}')
+        idx += 1
+"
+          } | tee work/report/09_android_checks.txt
+
+      - name: Try sparse to raw image conversion
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/sparse_out"
+          mkdir -p "${OUT}"
+          if [ -x work/tools_simg2img/simg2img ]; then
+            work/tools_simg2img/simg2img "${FILE}" "${OUT}/raw.img" 2>&1 | tee work/report/10_simg2img.txt || true
+          else
+            echo "simg2img binary not built" | tee work/report/10_simg2img.txt
+          fi
+
+      - name: ERO/EROFS filesystem probe
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/erofs_out"
+          mkdir -p "${OUT}"
+          if [ -x work/tools_erofs/fsck/fsck.erofs ]; then
+            work/tools_erofs/fsck/fsck.erofs "${FILE}" 2>&1 | tee work/report/11_erofs_check.txt || true
+          else
+            echo "fsck.erofs not built" | tee work/report/11_erofs_check.txt
+          fi
+
+      - name: Mount attempt for filesystem images
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/mount_out"
+          mkdir -p "${OUT}"
+          {
+            echo "=== ext4 mount attempt ==="
+            sudo mount -o loop,ro "${FILE}" "${OUT}" 2>&1 && echo "mount: success" || echo "mount: failed"
+            if mountpoint -q "${OUT}"; then
+              find "${OUT}" -maxdepth 3
+              sudo umount "${OUT}"
+            fi
+          } | tee work/report/12_mount_attempt.txt
+
+      - name: Diff and patch format heuristics
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== bsdiff magic check (BSDIFF40) ==="
+            head -c 8 "${FILE}"
+            echo ""
+            python3 -c "
+with open('${FILE}', 'rb') as f:
+    head = f.read(8)
+    print('magic bytes:', head)
+    print('is bsdiff40:', head == b'BSDIFF40')
+"
+            echo "=== imgdiff magic check (IMGDIFF) ==="
+            python3 -c "
+with open('${FILE}', 'rb') as f:
+    head = f.read(8)
+    print('is imgdiff1/2:', head[:7] == b'IMGDIFF')
+"
+            echo "=== xdelta magic check (VCDIFF/0xD6C3C4) ==="
+            python3 -c "
+with open('${FILE}', 'rb') as f:
+    head = f.read(4)
+    print('bytes:', head.hex())
+    print('is vcdiff:', head[:3] == bytes([0xd6, 0xc3, 0xc4]))
+"
+          } | tee work/report/13_patch_format_checks.txt
+
+      - name: Radare2 structural analysis
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          r2 -q -c "i;e asm.bits;pd 64@entry0" "${FILE}" > work/report/14_radare2_info.txt 2>&1 || echo "radare2 analysis inconclusive" >> work/report/14_radare2_info.txt
+
+      - name: Recursive binwalk on all extracted artifacts
+        run: |
+          {
+            find work/extracted -type f | while read -r f; do
+              echo "=== ${f} ==="
+              file "${f}"
+              binwalk "${f}" 2>&1 | head -30
+              echo ""
+            done
+          } | tee work/report/15_recursive_extracted_scan.txt
+
+      - name: Generate summary report
+        run: |
+          {
+            echo "Binary Analysis Report"
+            echo "Target URL: ${TARGET_URL}"
+            echo "Target File: ${TARGET_FILE}"
+            echo "Generated: $(date -u)"
+            echo ""
+            echo "----- File Tree of Extracted Artifacts -----"
+            find work/extracted -type f -exec ls -la {} \;
+            echo ""
+            echo "----- Report Files -----"
+            ls -la work/report
+          } | tee work/report/99_summary.txt
+
+      - name: Package all outputs
+        run: |
+          cd work
+          tar -czf ../analysis_result.tar.gz report extracted input
+          cd ..
+          ls -la analysis_result.tar.gz
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-analysis-result
+          path: |
+            analysis_result.tar.gz
+            work/report/*
+          retention-days: 14
+
+      - name: Print final summary to log
+        run: |
+          cat work/report/99_summary.txt
