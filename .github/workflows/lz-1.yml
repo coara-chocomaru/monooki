@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/150.1.3020_user-154.0.3420_user_ZEMI_delta.bin'
+        description: 'Download target URL'
         required: true
         type: string
       filename:
@@ -205,41 +205,41 @@ jobs:
           OUT="work/extracted/lzma_chunks"
           mkdir -p "${OUT}"
           python3 - "${FILE}" "${OUT}" <<'PYEOF'
-import sys
-import struct
+          import sys
+          import struct
 
-path = sys.argv[1]
-outdir = sys.argv[2]
+          path = sys.argv[1]
+          outdir = sys.argv[2]
 
-with open(path, "rb") as f:
-    data = f.read()
+          with open(path, "rb") as f:
+              data = f.read()
 
-candidates = []
-i = 0
-while True:
-    idx = data.find(b"\x5d\x00\x00", i)
-    if idx == -1:
-        break
-    if idx + 13 <= len(data):
-        dict_size = struct.unpack("<I", data[idx+1:idx+5])[0]
-        uncompressed_size = struct.unpack("<Q", data[idx+5:idx+13])[0]
-        if dict_size <= (1 << 27) and 0 < uncompressed_size < (1 << 32):
-            candidates.append((idx, dict_size, uncompressed_size))
-    i = idx + 1
+          candidates = []
+          i = 0
+          while True:
+              idx = data.find(b"\x5d\x00\x00", i)
+              if idx == -1:
+                  break
+              if idx + 13 <= len(data):
+                  dict_size = struct.unpack("<I", data[idx+1:idx+5])[0]
+                  uncompressed_size = struct.unpack("<Q", data[idx+5:idx+13])[0]
+                  if dict_size <= (1 << 27) and 0 < uncompressed_size < (1 << 32):
+                      candidates.append((idx, dict_size, uncompressed_size))
+              i = idx + 1
 
-report_path = outdir.rsplit("/", 1)[0] + "/report/07_lzma_chunk_candidates.txt"
-with open(report_path, "w") as rep:
-    rep.write(f"total candidates: {len(candidates)}\n")
-    for n, (off, ds, us) in enumerate(candidates):
-        rep.write(f"[{n}] offset=0x{off:x} dict_size={ds} uncompressed_size={us}\n")
-        chunk_path = f"{outdir}/chunk_{n}_off{off:x}.lzma"
-        with open(chunk_path, "wb") as cf:
-            cf.write(data[off:off+13])
-            remaining = data[off+13:]
-            cf.write(remaining)
+          report_path = outdir.rsplit("/", 1)[0] + "/report/07_lzma_chunk_candidates.txt"
+          with open(report_path, "w") as rep:
+              rep.write(f"total candidates: {len(candidates)}\n")
+              for n, (off, ds, us) in enumerate(candidates):
+                  rep.write(f"[{n}] offset=0x{off:x} dict_size={ds} uncompressed_size={us}\n")
+                  chunk_path = f"{outdir}/chunk_{n}_off{off:x}.lzma"
+                  with open(chunk_path, "wb") as cf:
+                      cf.write(data[off:off+13])
+                      remaining = data[off+13:]
+                      cf.write(remaining)
 
-print(f"found {len(candidates)} lzma header candidates")
-PYEOF
+          print(f"found {len(candidates)} lzma header candidates")
+          PYEOF
           ls -la "${OUT}" | tee -a work/report/07_lzma_chunk_candidates.txt
 
       - name: Attempt decode of each LZMA chunk candidate
@@ -267,14 +267,14 @@ PYEOF
           {
             echo "=== android sparse image check ==="
             python3 -c "
-import struct
-with open('${FILE}', 'rb') as f:
-    magic = f.read(4)
-    if magic == b'\x3a\xff\x26\xed':
-        print('detected: android sparse image')
-    else:
-        print('not android sparse image, magic=' + magic.hex())
-"
+          import struct
+          with open('${FILE}', 'rb') as f:
+              magic = f.read(4)
+              if magic == b'\x3a\xff\x26\xed':
+                  print('detected: android sparse image')
+              else:
+                  print('not android sparse image, magic=' + magic.hex())
+          "
             echo "=== AVB footer check (last 64 bytes) ==="
             SIZE=$(stat --format="%s" "${FILE}")
             if [ "${SIZE}" -gt 64 ]; then
@@ -285,16 +285,16 @@ with open('${FILE}', 'rb') as f:
             head -c 8 "${FILE}" | xxd
             echo "=== ext4 superblock magic scan (0xEF53 at offset 1080+56) ==="
             python3 -c "
-with open('${FILE}', 'rb') as f:
-    data = f.read()
-    idx = 0
-    while True:
-        idx = data.find(b'\x53\xef', idx)
-        if idx == -1:
-            break
-        print(f'0x53ef magic candidate at offset 0x{idx:x}')
-        idx += 1
-"
+          with open('${FILE}', 'rb') as f:
+              data = f.read()
+              idx = 0
+              while True:
+                  idx = data.find(b'\x53\xef', idx)
+                  if idx == -1:
+                      break
+                  print(f'0x53ef magic candidate at offset 0x{idx:x}')
+                  idx += 1
+          "
           } | tee work/report/09_android_checks.txt
 
       - name: Try sparse to raw image conversion
@@ -341,24 +341,24 @@ with open('${FILE}', 'rb') as f:
             head -c 8 "${FILE}"
             echo ""
             python3 -c "
-with open('${FILE}', 'rb') as f:
-    head = f.read(8)
-    print('magic bytes:', head)
-    print('is bsdiff40:', head == b'BSDIFF40')
-"
+          with open('${FILE}', 'rb') as f:
+              head = f.read(8)
+              print('magic bytes:', head)
+              print('is bsdiff40:', head == b'BSDIFF40')
+          "
             echo "=== imgdiff magic check (IMGDIFF) ==="
             python3 -c "
-with open('${FILE}', 'rb') as f:
-    head = f.read(8)
-    print('is imgdiff1/2:', head[:7] == b'IMGDIFF')
-"
+          with open('${FILE}', 'rb') as f:
+              head = f.read(8)
+              print('is imgdiff1/2:', head[:7] == b'IMGDIFF')
+          "
             echo "=== xdelta magic check (VCDIFF/0xD6C3C4) ==="
             python3 -c "
-with open('${FILE}', 'rb') as f:
-    head = f.read(4)
-    print('bytes:', head.hex())
-    print('is vcdiff:', head[:3] == bytes([0xd6, 0xc3, 0xc4]))
-"
+          with open('${FILE}', 'rb') as f:
+              head = f.read(4)
+              print('bytes:', head.hex())
+              print('is vcdiff:', head[:3] == bytes([0xd6, 0xc3, 0xc4]))
+          "
           } | tee work/report/13_patch_format_checks.txt
 
       - name: Radare2 structural analysis
