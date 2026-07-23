@@ -1,0 +1,143 @@
+name: Extract DTB from boot.img and convert to DTS
+
+on:
+  workflow_dispatch:
+    inputs:
+      img_url:
+        description: "URL of boot.img (or Android image) file"
+        required: true
+        type: string
+      output_name:
+        description: "Output ZIP base name"
+        required: false
+        default: "extracted_dtb_dts"
+        type: string
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          # device-tree-compiler で dtc を、abootimg で boot.img を扱う
+          sudo apt-get install -y device-tree-compiler abootimg python3 curl file zip
+
+      - name: Prepare workspace
+        run: |
+          set -eux
+          rm -rf work
+          mkdir -p work/in work/out
+
+      - name: Download boot image
+        run: |
+          set -eux
+          curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.img_url }}" -o work/in/boot.img
+          file work/in/boot.img
+
+      - name: Extract boot image using abootimg
+        run: |
+          set -eux
+          cd work/in
+          # abootimg -x で bootimg.cfg, zImage, initrd.img, および second (DTB の可能性) を抽出
+          abootimg -x boot.img
+          ls -la
+
+      - name: Identify DTB (from 'second' or extract from zImage)
+        id: identify
+        run: |
+          set -eux
+          cd work/in
+
+          # 1) 'second' ファイルが存在し、かつそれが Device Tree Blob ならばそれを採用
+          if [ -f second ]; then
+            file_type=$(file -b second)
+            if echo "$file_type" | grep -qi "Device Tree Blob"; then
+              echo "DTB found as 'second' file"
+              cp second ../out/dtb_from_second.dtb
+              exit 0
+            fi
+          fi
+
+          # 2) 'second' がない、または DTB ではない場合、extract-dtb で zImage から抽出
+          echo "No valid DTB in second, extracting from zImage using extract-dtb"
+
+          # extract-dtb スクリプトをダウンロード (https://github.com/xiaolu/mkbootimg_tools)
+          curl -L -o extract-dtb https://raw.githubusercontent.com/xiaolu/mkbootimg_tools/master/extract-dtb
+          chmod +x extract-dtb
+
+          # 出力先ディレクトリを作成し、zImage から DTB を抽出
+          mkdir -p ../out/dtb_extracted
+          ./extract-dtb zImage -o ../out/dtb_extracted/
+
+          # 抽出に成功したか確認
+          if [ -d ../out/dtb_extracted ] && [ "$(ls -A ../out/dtb_extracted)" ]; then
+            echo "DTB extracted from zImage"
+          else
+            echo "No DTB found in zImage" >&2
+            exit 1
+          fi
+
+      - name: Convert DTB(s) to DTS
+        run: |
+          set -eux
+          mkdir -p work/out/dts
+
+          # すべての .dtb ファイルを再帰的に探し、dtc で .dts に変換
+          find work/out -name "*.dtb" -type f | while read dtb; do
+            base=$(basename "$dtb" .dtb)
+            dts_file="work/out/dts/${base}.dts"
+            dtc -I dtb -O dts -o "$dts_file" "$dtb"
+            echo "Converted $dtb to $dts_file"
+          done
+
+          # 念のため dtb_extracted 以下も明示的に処理 (find で既にカバー済みだが)
+          if [ -d work/out/dtb_extracted ]; then
+            find work/out/dtb_extracted -name "*.dtb" -type f | while read dtb; do
+              base=$(basename "$dtb" .dtb)
+              dts_file="work/out/dts/${base}.dts"
+              dtc -I dtb -O dts -o "$dts_file" "$dtb"
+              echo "Converted $dtb to $dts_file"
+            done
+          fi
+
+      - name: Generate summary report
+        run: |
+          set -eux
+          cat > work/out/README.txt << EOF
+          Input URL: ${{ inputs.img_url }}
+          Extraction date: $(date -u)
+
+          Steps performed:
+          1. Downloaded boot.img
+          2. Used abootimg to extract components (bootimg.cfg, zImage, initrd.img, possibly second)
+          3. Identified DTB from 'second' (if it was a valid DTB) or extracted from zImage using extract-dtb
+          4. Converted all .dtb files to .dts using dtc
+
+          Files in this archive:
+          - boot.img (original)
+          - bootimg.cfg, zImage, initrd.img (extracted by abootimg)
+          - Any .dtb files found (either from second or extracted from zImage) are placed under dtb_extracted/
+          - All .dts files are placed under dts/
+          EOF
+
+          echo "Output files:" >> work/out/README.txt
+          find work/out -type f | sort >> work/out/README.txt
+
+      - name: Package ZIP
+        run: |
+          set -eux
+          cd work/out
+          zip -9 -r "../../${{ inputs.output_name }}.zip" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: ${{ inputs.output_name }}.zip
+          if-no-files-found: error
