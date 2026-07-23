@@ -143,6 +143,63 @@ jobs:
           binwalk -E "${FILE}" | tee work/report/03_entropy.txt
 
 
+      - name: Binwalk signature scan
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          {
+            echo "=== binwalk signature scan ==="
+            binwalk "${FILE}"
+            echo ""
+            echo "=== binwalk verbose scan ==="
+            binwalk -B -v "${FILE}"
+          } | tee work/report/04_binwalk_scan.txt
+
+      - name: Binwalk extraction
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          cd work/extracted
+          binwalk --extract --matryoshka --directory=. "../input/${TARGET_FILE}" || true
+          find . -maxdepth 6 | tee ../report/05_binwalk_extracted_tree.txt
+
+      - name: Detect and decompress known containers
+        run: |
+          FILE="work/input/${TARGET_FILE}"
+          OUT="work/extracted/manual"
+          mkdir -p "${OUT}"
+          {
+            echo "=== gzip attempt ==="
+            gunzip -k -c "${FILE}" > "${OUT}/decompressed.gz.out" 2>&1 && echo "gzip: success" || echo "gzip: failed"
+
+            echo "=== xz attempt ==="
+            xz -dc "${FILE}" > "${OUT}/decompressed.xz.out" 2>&1 && echo "xz: success" || echo "xz: failed"
+
+            echo "=== lzma attempt ==="
+            xz -dc --format=lzma "${FILE}" > "${OUT}/decompressed.lzma.out" 2>&1 && echo "lzma: success" || echo "lzma: failed"
+
+            echo "=== bzip2 attempt ==="
+            bzip2 -dc "${FILE}" > "${OUT}/decompressed.bz2.out" 2>&1 && echo "bzip2: success" || echo "bzip2: failed"
+
+            echo "=== lz4 attempt ==="
+            lz4 -dc "${FILE}" > "${OUT}/decompressed.lz4.out" 2>&1 && echo "lz4: success" || echo "lz4: failed"
+
+            echo "=== zstd attempt ==="
+            zstd -dc "${FILE}" > "${OUT}/decompressed.zst.out" 2>&1 && echo "zstd: success" || echo "zstd: failed"
+
+            echo "=== 7z attempt ==="
+            7z x -o"${OUT}/7z_out" "${FILE}" 2>&1 && echo "7z: success" || echo "7z: failed"
+
+            echo "=== unzip attempt ==="
+            mkdir -p "${OUT}/zip_out"
+            unzip -o "${FILE}" -d "${OUT}/zip_out" 2>&1 && echo "unzip: success" || echo "unzip: failed"
+
+            echo "=== cpio attempt ==="
+            mkdir -p "${OUT}/cpio_out"
+            (cd "${OUT}/cpio_out" && cpio -idv < "../../../input/${TARGET_FILE}") 2>&1 && echo "cpio: success" || echo "cpio: failed"
+
+            find "${OUT}" -maxdepth 1 -name "decompressed.*.out" -exec du -h {} \;
+          } | tee work/report/06_manual_decompress.txt
+
+
       - name: Android specific format checks
         run: |
           FILE="work/input/${TARGET_FILE}"
