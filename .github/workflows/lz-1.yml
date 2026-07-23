@@ -47,7 +47,6 @@ jobs:
             android-sdk-libsparse-utils \
             e2fsprogs \
             xxd \
-            hexdump \
             radare2 \
             python3-pip \
             git \
