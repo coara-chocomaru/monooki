@@ -65,30 +65,30 @@ jobs:
       - name: Grep magic bytes directly in raw file as fallback
         run: |
           python3 - "work/input/${TARGET_FILE}" <<'PYEOF'
-import sys
+          import sys
 
-path = sys.argv[1]
-with open(path, "rb") as f:
-    data = f.read()
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              data = f.read()
 
-markers = {
-    b"ANDROID!": "boot_img",
-    b"\x1f\x8b\x08": "gzip_kernel",
-    b"\x02\x21\x4c\x18": "lz4_kernel",
-}
+          markers = {
+              b"ANDROID!": "boot_img",
+              b"\x1f\x8b\x08": "gzip_kernel",
+              b"\x02\x21\x4c\x18": "lz4_kernel",
+          }
 
-for magic, label in markers.items():
-    idx = 0
-    while True:
-        idx = data.find(magic, idx)
-        if idx == -1:
-            break
-        outname = f"work/found/raw_offset_{idx:x}_{label}.bin"
-        with open(outname, "wb") as out:
-            out.write(data[idx:idx+67108864])
-        print(f"found {label} at offset 0x{idx:x} -> {outname}")
-        idx += 1
-PYEOF
+          for magic, label in markers.items():
+              idx = 0
+              while True:
+                  idx = data.find(magic, idx)
+                  if idx == -1:
+                      break
+                  outname = f"work/found/raw_offset_{idx:x}_{label}.bin"
+                  with open(outname, "wb") as out:
+                      out.write(data[idx:idx+67108864])
+                  print(f"found {label} at offset 0x{idx:x} -> {outname}")
+                  idx += 1
+          PYEOF
 
       - name: List found candidates
         run: |
