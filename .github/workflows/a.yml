@@ -1,62 +1,83 @@
-name: Patch Audio HAL (MT8167)
+name: Generate SEPolicy UNION list from ZIP
 
 on:
   workflow_dispatch:
     inputs:
-      download_url:
-        description: 'audio.primary.mt8167.so URL (32bit)'
+      zip_url:
+        description: 'Download URL of the ZIP file containing .te files'
         required: true
         type: string
-      download_url64:
-        description: 'audio.primary.mt8167.so URL (64bit)'
+      base_path:
+        description: 'Base path inside ZIP to search .te files (optional)'
         required: false
+        default: '.'
         type: string
-        default: ''
 
 jobs:
-  patch:
+  generate-union-list:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y binutils file
+      - name: Checkout this repository
+        uses: actions/checkout@v4
 
-      - name: Download 32bit
+      - name: Download and extract ZIP
         run: |
-          curl -L -o audio.primary.mt8167.so "${{ inputs.download_url }}"
-          file audio.primary.mt8167.so
+          echo "Downloading ZIP from: ${{ inputs.zip_url }}"
+          wget -q -O sepolicy.zip "${{ inputs.zip_url }}"
+          
+          echo "Extracting ZIP..."
+          unzip -q sepolicy.zip -d extracted_zip
+          
+          echo "ZIP contents:"
+          ls -R extracted_zip | head -n 50
 
-      - name: Download 64bit
-        if: inputs.download_url64 != ''
+      - name: Generate BOARD_SEPOLICY_UNION list
         run: |
-          curl -L -o audio.primary.mt8167_64.so "${{ inputs.download_url64 }}"
-          file audio.primary.mt8167_64.so
+          BASE_PATH="${{ inputs.base_path }}"
+          SEARCH_DIR="extracted_zip/${BASE_PATH}"
+          
+          echo "Searching .te files in: $SEARCH_DIR"
+          
+          # .teファイルを再帰的に取得し、パスを相対化してソート
+          mapfile -t te_files < <(find "$SEARCH_DIR" -type f -name "*.te" | \
+            sed "s|^$SEARCH_DIR/||" | sort)
+          
+          if [ ${#te_files[@]} -eq 0 ]; then
+            echo "Error: No .te files found!"
+            exit 1
+          fi
+          
+          echo "Found ${#te_files[@]} .te files"
+          
+          # 出力ファイル作成
+          {
+            echo "BOARD_SEPOLICY_UNION += \\"
+            
+            count=${#te_files[@]}
+            for i in "${!te_files[@]}"; do
+              if [ $i -eq $((count - 1)) ]; then
+                # 最後の行は \ なし
+                echo "    ${te_files[i]}"
+              else
+                echo "    ${te_files[i]} \\"
+              fi
+            done
+          } > sepolicy_union_list.txt
+          
+          # 確認表示
+          echo "=== Generated BOARD_SEPOLICY_UNION ==="
+          cat sepolicy_union_list.txt
+          echo "===================================="
 
-      - name: Patch 32bit
-        run: |
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x987e4)) count=4 conv=notrunc
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x99050)) count=4 conv=notrunc
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167.so bs=1 seek=$((0x97f14)) count=4 conv=notrunc
-          sync
-          dd if=audio.primary.mt8167.so bs=1 skip=$((0x987e4)) count=4 2>/dev/null | od -An -tx1
-          dd if=audio.primary.mt8167.so bs=1 skip=$((0x99050)) count=4 2>/dev/null | od -An -tx1
-          dd if=audio.primary.mt8167.so bs=1 skip=$((0x97f14)) count=4 2>/dev/null | od -An -tx1
-
-      - name: Patch 64bit
-        if: inputs.download_url64 != ''
-        run: |
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x987e4)) count=4 conv=notrunc
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x99050)) count=4 conv=notrunc
-          printf "\x1e\xff\x2f\xe1" | dd of=audio.primary.mt8167_64.so bs=1 seek=$((0x97f14)) count=4 conv=notrunc
-          sync
-          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x987e4)) count=4 2>/dev/null | od -An -tx1
-          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x99050)) count=4 2>/dev/null | od -An -tx1
-          dd if=audio.primary.mt8167_64.so bs=1 skip=$((0x97f14)) count=4 2>/dev/null | od -An -tx1
-
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: audio_hal_patched
-          path: |
-            audio.primary.mt8167.so
-            audio.primary.mt8167_64.so
+          name: sepolicy_union_list
+          path: sepolicy_union_list.txt
           retention-days: 7
+
+      - name: Show final result
+        run: |
+          echo "✅ Generation completed successfully!"
+          echo "Total .te files: $(wc -l < sepolicy_union_list.txt | awk '{print $1-1}')"
