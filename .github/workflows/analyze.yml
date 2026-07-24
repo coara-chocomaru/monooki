@@ -1,4 +1,4 @@
-name: AOSP 5.1.1_r28 Sepolicy Deduplicator (with checkpolicy)
+name: AOSP 5.1.1_r28 Sepolicy Deduplicator (with debug)
 
 on:
   workflow_dispatch:
@@ -12,42 +12,53 @@ jobs:
   sepolicy-clean:
     runs-on: ubuntu-latest
     steps:
-      # 1. checkpolicy のインストール（Ubuntu パッケージ）
+      # 1. checkpolicy のインストール
       - name: Install checkpolicy
         run: |
           sudo apt-get update
           sudo apt-get install -y checkpolicy
 
-      # 2. ユーザー指定の ZIP をダウンロードして展開
+      # 2. ZIP ダウンロード＆展開
       - name: Download and extract sepolicy ZIP
         run: |
           mkdir -p workspace
           cd workspace
-          echo "Downloading ZIP from input URL..."
+          echo "Downloading ZIP..."
           wget --quiet "${{ github.event.inputs.zip_url }}" -O sepolicy.zip
           unzip -q sepolicy.zip
           echo "Extracted files:"
           find . -type f | head -30
 
-      # 3. sepolicy バイナリを探して policy.conf に変換
+      # 3. sepolicy バイナリを policy.conf に変換（-b -o のみ使用）
       - name: Convert sepolicy binary to policy.conf
         id: convert
         run: |
           cd workspace
-          # sepolicy バイナリを再帰的に探す（ファイル名は 'sepolicy' と仮定）
           SEPOLICY_BIN=$(find . -type f -name "sepolicy" ! -name "*.te" ! -name "*.conf" | head -n 1)
           if [ -z "$SEPOLICY_BIN" ]; then
-            echo "ERROR: sepolicy binary not found in the ZIP!"
+            echo "ERROR: sepolicy binary not found!"
             exit 1
           fi
-          echo "Found sepolicy binary at: $SEPOLICY_BIN"
-          # checkpolicy で policy.conf を生成
-          checkpolicy -b -F -M -o policy.conf "$SEPOLICY_BIN"
+          echo "Found sepolicy at: $SEPOLICY_BIN"
+          # 変換（-F は file_contexts 出力のため除外）
+          checkpolicy -b -o policy.conf "$SEPOLICY_BIN"
           echo "Generated policy.conf"
           echo "POLICY_CONF=$(pwd)/policy.conf" >> $GITHUB_ENV
 
-      # 4. policy.conf から AOSP の type/attribute 名を抽出
-      - name: Extract AOSP type/attribute names from policy.conf
+      # 4. policy.conf の内容をデバッグ表示（行数・先頭10行）
+      - name: Debug policy.conf
+        run: |
+          cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
+          echo "=== policy.conf line count ==="
+          wc -l "$POLICY_CONF"
+          echo "=== First 10 lines of policy.conf ==="
+          head -n 10 "$POLICY_CONF"
+          echo "=== Sample type/attribute declarations ==="
+          grep -E '^(type|attribute) ' "$POLICY_CONF" | head -n 5
+
+      # 5. AOSP の type/attribute 名を抽出
+      - name: Extract AOSP type/attribute names
         run: |
           cd workspace
           POLICY_CONF="${{ env.POLICY_CONF }}"
@@ -55,10 +66,10 @@ jobs:
             | awk '{print $2}' \
             | sed 's/[,;].*//' \
             | sort -u > aosp_names.txt
-          echo "Extracted $(wc -l < aosp_names.txt) unique type/attribute names from AOSP."
+          echo "Extracted $(wc -l < aosp_names.txt) unique names."
 
-      # 5. .te ファイルの重複クリーニング（policy.conf をベース）
-      - name: Remove duplicates from .te files using policy.conf
+      # 6. .te ファイルのクリーニング（デバッグ付き）
+      - name: Remove duplicates from .te files (with debug)
         run: |
           cd workspace
           POLICY_CONF="${{ env.POLICY_CONF }}"
@@ -66,13 +77,15 @@ jobs:
 
           clean_te_file() {
             local te_file="$1"
-            local tmp_file="${te_file}.tmp"
+            echo "========================================"
             echo "Processing: $te_file"
+            echo "Original lines: $(wc -l < "$te_file")"
 
-            # ① policy.conf と完全一致する行を削除
-            grep -v -x -F -f "$POLICY_CONF" "$te_file" > "$tmp_file" || true
+            # ① 完全一致行を削除（一時ファイルに保存）
+            grep -v -x -F -f "$POLICY_CONF" "$te_file" > "${te_file}.step1" || true
+            echo "After exact-match removal: $(wc -l < "${te_file}.step1")"
 
-            # ② AOSP に存在する type / attribute 宣言行を削除
+            # ② type/attribute 宣言の重複を削除
             awk -v list="$NAMES_FILE" '
               BEGIN {
                 while ((getline name < list) > 0) aosp_names[name] = 1
@@ -88,45 +101,58 @@ jobs:
                 }
                 print
               }
-            ' "$tmp_file" > "${te_file}.cleaned"
+            ' "${te_file}.step1" > "${te_file}.step2"
 
-            mv "${te_file}.cleaned" "$te_file"
-            rm -f "$tmp_file"
-            echo "  -> Cleaned successfully."
+            echo "After type/attribute removal: $(wc -l < "${te_file}.step2")"
+
+            # もし完全に空になった場合は警告を出し、元のファイルをバックアップ
+            if [ ! -s "${te_file}.step2" ]; then
+              echo "WARNING: $te_file became empty! Keeping original as backup."
+              cp "$te_file" "${te_file}.bak"
+              # ただし、本当に空で良い場合もあるので、空のまま上書きするかはユーザー判断
+              # 今回は空のまま上書き（必要ならバックアップを参照）
+            fi
+
+            mv "${te_file}.step2" "$te_file"
+            rm -f "${te_file}.step1"
+            echo "Final lines: $(wc -l < "$te_file")"
           }
 
           export -f clean_te_file
           export POLICY_CONF
 
-          # すべての .te ファイルを処理（policy.conf や sepolicy バイナリは除外）
           find . -type f -name "*.te" ! -path "*/policy.conf" ! -path "*/sepolicy" \
             -exec bash -c 'clean_te_file "$0"' {} \;
 
-          echo "Deduplication finished for all .te files."
+          echo "Deduplication finished."
 
-      # 6. contexts ファイルも必要に応じて完全一致削除（任意）
-      - name: (Optional) Clean contexts files
+      # 7. contexts も同様に処理（ただし完全一致のみ）
+      - name: Clean contexts files (exact match only)
         run: |
           cd workspace
           POLICY_CONF="${{ env.POLICY_CONF }}"
           for ctx in $(find . -type f -name "*contexts"); do
+            echo "Cleaning $ctx"
+            orig=$(wc -l < "$ctx")
             grep -v -x -F -f "$POLICY_CONF" "$ctx" > "${ctx}.tmp" || true
             mv "${ctx}.tmp" "$ctx"
-            echo "Cleaned $ctx"
+            new=$(wc -l < "$ctx")
+            echo "  $orig -> $new lines"
           done
 
-      # 7. クリーンアップと ZIP 化
+      # 8. 最終パッケージング
       - name: Package cleaned sepolicy into ZIP
         run: |
           cd workspace
           find . -type f -name "*.tmp" -delete
-          find . -type f -name "*.cleaned" -delete
-          # 生成した policy.conf も含めておく（必要に応じて削除可能）
+          find . -type f -name "*.step1" -delete
+          find . -type f -name "*.step2" -delete
+          # policy.conf も同梱（デバッグ用）
           zip -r ../cleaned_sepolicy.zip .
           cd ..
           echo "Final ZIP size: $(du -sh cleaned_sepolicy.zip | cut -f1)"
 
-      # 8. アーティファクトアップロード
+      # 9. アーティファクトアップロード
       - name: Upload cleaned sepolicy artifact
         uses: actions/upload-artifact@v4
         with:
