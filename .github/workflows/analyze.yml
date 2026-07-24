@@ -1,10 +1,10 @@
-name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Type/Attribute Aware)
+name: AOSP 5.1.1_r28 Sepolicy Deduplicator (with checkpolicy)
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'カスタム sepolicy ZIP ファイルの直接URL (.te と *contexts を含む)'
+        description: 'sepolicy バイナリとカスタム .te を含む ZIP ファイルの直接URL'
         required: true
         type: string
 
@@ -12,124 +12,121 @@ jobs:
   sepolicy-clean:
     runs-on: ubuntu-latest
     steps:
-      # 1. AOSP sepolicy の取得
-      - name: Download AOSP android-5.1.1_r28 sepolicy (external/sepolicy)
+      # 1. checkpolicy のインストール（Ubuntu パッケージ）
+      - name: Install checkpolicy
         run: |
-          mkdir -p aosp_sepolicy
-          echo "Downloading AOSP sepolicy..."
-          wget --quiet https://android.googlesource.com/platform/external/sepolicy/+archive/android-5.1.1_r28.tar.gz -O aosp_sepolicy.tar.gz
-          tar -xzf aosp_sepolicy.tar.gz -C aosp_sepolicy
-          echo "AOSP files: $(find aosp_sepolicy -type f | wc -l)"
+          sudo apt-get update
+          sudo apt-get install -y checkpolicy
 
-      # 2. カスタム ZIP の取得
-      - name: Download and extract custom sepolicy ZIP
+      # 2. ユーザー指定の ZIP をダウンロードして展開
+      - name: Download and extract sepolicy ZIP
         run: |
-          mkdir -p custom_sepolicy
-          echo "Downloading custom ZIP..."
-          wget --quiet "${{ github.event.inputs.zip_url }}" -O custom_sepolicy.zip
-          unzip -q custom_sepolicy.zip -d custom_sepolicy
-          echo "Custom files: $(find custom_sepolicy -type f | wc -l)"
+          mkdir -p workspace
+          cd workspace
+          echo "Downloading ZIP from input URL..."
+          wget --quiet "${{ github.event.inputs.zip_url }}" -O sepolicy.zip
+          unzip -q sepolicy.zip
+          echo "Extracted files:"
+          find . -type f | head -30
 
-      # 3. 重複削除（タイプ/属性宣言 + 完全一致行）
-      - name: Remove duplicates (type/attribute + exact lines)
+      # 3. sepolicy バイナリを探して policy.conf に変換
+      - name: Convert sepolicy binary to policy.conf
+        id: convert
         run: |
-          set -e
-          AOSP_DIR="$(pwd)/aosp_sepolicy"
-          CUSTOM_DIR="$(pwd)/custom_sepolicy"
+          cd workspace
+          # sepolicy バイナリを再帰的に探す（ファイル名は 'sepolicy' と仮定）
+          SEPOLICY_BIN=$(find . -type f -name "sepolicy" ! -name "*.te" ! -name "*.conf" | head -n 1)
+          if [ -z "$SEPOLICY_BIN" ]; then
+            echo "ERROR: sepolicy binary not found in the ZIP!"
+            exit 1
+          fi
+          echo "Found sepolicy binary at: $SEPOLICY_BIN"
+          # checkpolicy で policy.conf を生成
+          checkpolicy -b -F -M -o policy.conf "$SEPOLICY_BIN"
+          echo "Generated policy.conf"
+          echo "POLICY_CONF=$(pwd)/policy.conf" >> $GITHUB_ENV
 
-          # ---- (A) AOSP から type / attribute 宣言名を抽出 ----
-          echo "Extracting AOSP type/attribute names..."
-          find "$AOSP_DIR" -type f -name "*.te" -exec cat {} \; \
-            | grep -E '^(type|attribute)\s+' \
+      # 4. policy.conf から AOSP の type/attribute 名を抽出
+      - name: Extract AOSP type/attribute names from policy.conf
+        run: |
+          cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
+          grep -E '^(type|attribute) ' "$POLICY_CONF" \
             | awk '{print $2}' \
-            | sed 's/,.*//' \
-            | sort -u > "$AOSP_DIR/aosp_declared_names.txt"
-          echo "Found $(wc -l < "$AOSP_DIR/aosp_declared_names.txt") unique type/attribute names in AOSP."
+            | sed 's/[,;].*//' \
+            | sort -u > aosp_names.txt
+          echo "Extracted $(wc -l < aosp_names.txt) unique type/attribute names from AOSP."
 
-          # ---- (B) 各 .te ファイルを処理 ----
+      # 5. .te ファイルの重複クリーニング（policy.conf をベース）
+      - name: Remove duplicates from .te files using policy.conf
+        run: |
+          cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
+          NAMES_FILE="aosp_names.txt"
+
           clean_te_file() {
             local te_file="$1"
-            local rel_path="${te_file#$CUSTOM_DIR/}"
-            local aosp_file="$AOSP_DIR/$rel_path"
             local tmp_file="${te_file}.tmp"
+            echo "Processing: $te_file"
 
-            echo "Processing: $rel_path"
+            # ① policy.conf と完全一致する行を削除
+            grep -v -x -F -f "$POLICY_CONF" "$te_file" > "$tmp_file" || true
 
-            # 1) AOSP に同名ファイルがなければ何もしない（独自ファイル）
-            if [ ! -f "$aosp_file" ]; then
-              echo "  -> No AOSP counterpart, keeping all lines."
-              return 0
-            fi
-
-            # 2) 完全一致行の削除（従来の処理）
-            grep -v -x -F -f "$aosp_file" "$te_file" > "$tmp_file" || true
-
-            # 3) タイプ/属性宣言の重複削除（AOSP で宣言済みの名前を持つ行を削除）
-            #    - type 宣言行（例: type adbd, domain; ）の2番目のトークン（カンマ前）を取得し、
-            #      AOSP宣言名リストにあればその行を削除
-            #    - attribute 宣言行も同様
-            if [ -s "$tmp_file" ]; then
-              # 一度に処理するため、awk で宣言名がリストに含まれる行を除外
-              awk -v list="$AOSP_DIR/aosp_declared_names.txt" '
-                BEGIN {
-                  # 宣言名のリストを連想配列に格納
-                  while ((getline name < list) > 0) aosp[name]=1
-                  close(list)
-                }
-                {
-                  # 行が type または attribute で始まる場合のみチェック
-                  if ($1 == "type" || $1 == "attribute") {
-                    # 宣言名は $2 からカンマまでの部分（例: "adbd," → "adbd"）
-                    split($2, arr, ",")
-                    decl_name = arr[1]
-                    if (decl_name in aosp) {
-                      # AOSP に存在する宣言 → この行をスキップ（削除）
-                      next
-                    }
+            # ② AOSP に存在する type / attribute 宣言行を削除
+            awk -v list="$NAMES_FILE" '
+              BEGIN {
+                while ((getline name < list) > 0) aosp_names[name] = 1
+                close(list)
+              }
+              {
+                if ($1 == "type" || $1 == "attribute") {
+                  name = $2
+                  gsub(/[,;].*/, "", name)
+                  if (name in aosp_names) {
+                    next
                   }
-                  # その他の行は出力
-                  print
                 }
-              ' "$tmp_file" > "${te_file}.final" && mv "${te_file}.final" "$tmp_file"
-            fi
+                print
+              }
+            ' "$tmp_file" > "${te_file}.cleaned"
 
-            # 4) 上書き保存
-            mv "$tmp_file" "$te_file"
-            echo "  -> Cleaned (removed exact matches + duplicate type/attribute declarations)."
+            mv "${te_file}.cleaned" "$te_file"
+            rm -f "$tmp_file"
+            echo "  -> Cleaned successfully."
           }
 
           export -f clean_te_file
-          export AOSP_DIR CUSTOM_DIR
+          export POLICY_CONF
 
-          # .te ファイルのみ処理（contexts は従来の完全一致で十分）
-          find "$CUSTOM_DIR" -type f -name "*.te" -exec bash -c 'clean_te_file "$0"' {} \;
+          # すべての .te ファイルを処理（policy.conf や sepolicy バイナリは除外）
+          find . -type f -name "*.te" ! -path "*/policy.conf" ! -path "*/sepolicy" \
+            -exec bash -c 'clean_te_file "$0"' {} \;
 
-          # ---- (C) contexts ファイルは従来の完全一致削除のみ ----
-          echo "Processing contexts files (exact line match only)..."
-          for ctx_file in $(find "$CUSTOM_DIR" -type f -name "*contexts"); do
-            rel_path="${ctx_file#$CUSTOM_DIR/}"
-            aosp_file="$AOSP_DIR/$rel_path"
-            if [ -f "$aosp_file" ]; then
-              grep -v -x -F -f "$aosp_file" "$ctx_file" > "${ctx_file}.tmp" || true
-              mv "${ctx_file}.tmp" "$ctx_file"
-              echo "  Cleaned $rel_path"
-            else
-              echo "  $rel_path has no AOSP counterpart, kept as is."
-            fi
+          echo "Deduplication finished for all .te files."
+
+      # 6. contexts ファイルも必要に応じて完全一致削除（任意）
+      - name: (Optional) Clean contexts files
+        run: |
+          cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
+          for ctx in $(find . -type f -name "*contexts"); do
+            grep -v -x -F -f "$POLICY_CONF" "$ctx" > "${ctx}.tmp" || true
+            mv "${ctx}.tmp" "$ctx"
+            echo "Cleaned $ctx"
           done
 
-          echo "Deduplication finished."
-
-      # 4. クリーンアップと ZIP 化
+      # 7. クリーンアップと ZIP 化
       - name: Package cleaned sepolicy into ZIP
         run: |
-          cd custom_sepolicy
+          cd workspace
           find . -type f -name "*.tmp" -delete
+          find . -type f -name "*.cleaned" -delete
+          # 生成した policy.conf も含めておく（必要に応じて削除可能）
           zip -r ../cleaned_sepolicy.zip .
           cd ..
           echo "Final ZIP size: $(du -sh cleaned_sepolicy.zip | cut -f1)"
 
-      # 5. アーティファクトアップロード
+      # 8. アーティファクトアップロード
       - name: Upload cleaned sepolicy artifact
         uses: actions/upload-artifact@v4
         with:
