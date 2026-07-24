@@ -11,7 +11,7 @@ on:
         description: "比較対象conf.zipのURL"
         required: false
         type: string
-        default: "https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/conf.zip"
+        default: "https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/conf2.zip"
       output_zip_name:
         description: "出力zipのベース名(拡張子なし)"
         required: false
