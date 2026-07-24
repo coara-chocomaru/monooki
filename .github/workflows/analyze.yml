@@ -178,7 +178,6 @@ jobs:
           if __name__ == "__main__":
               main()
           PYEOF
-          sed -i 's/^          //' dedupe_sepolicy.py
 
       - name: 重複行削除を実行
         run: |
