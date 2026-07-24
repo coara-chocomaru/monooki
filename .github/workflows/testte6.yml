@@ -1,4 +1,4 @@
-name: TE Dedup Against conf.zip Policy Declarations
+name: TE Dedup Against conf.zip and AOSP android5.1.1_r28
 
 on:
   workflow_dispatch:
@@ -12,6 +12,16 @@ on:
         required: false
         type: string
         default: "https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/conf2.zip"
+      aosp_repo:
+        description: "比較対象AOSPリポジトリURL"
+        required: false
+        type: string
+        default: "https://android.googlesource.com/platform/external/sepolicy"
+      aosp_ref:
+        description: "比較対象AOSPタグ/ブランチ"
+        required: false
+        type: string
+        default: "android-5.1.1_r28"
       output_zip_name:
         description: "出力zipのベース名(拡張子なし)"
         required: false
@@ -22,6 +32,10 @@ jobs:
   dedupe:
     runs-on: ubuntu-latest
     steps:
+      - name: AOSP sepolicyをclone
+        run: |
+          git clone --depth 1 --branch "${{ inputs.aosp_ref }}" "${{ inputs.aosp_repo }}" aosp_sepolicy
+
       - name: Pythonをセットアップ
         uses: actions/setup-python@v5
         with:
@@ -55,11 +69,15 @@ jobs:
           import sys
 
 
+          TYPE_DECL_RE = re.compile(r"^type\s+([A-Za-z0-9_]+)\s*[,;]")
+          ATTRIBUTE_DECL_RE = re.compile(r"^attribute\s+([A-Za-z0-9_]+)\s*;")
+
+
           def normalize_line(line):
               return re.sub(r"\s+", " ", line.strip())
 
 
-          def is_ignorable_conf_line(line):
+          def is_ignorable(line):
               stripped = line.strip()
               if stripped == "":
                   return True
@@ -70,20 +88,53 @@ jobs:
               return False
 
 
-          def collect_conf_corpus(conf_dir):
-              corpus = set()
-              for filepath in glob.glob(os.path.join(conf_dir, "**", "*.conf"), recursive=True):
+          def extract_type_name(norm_line):
+              m = TYPE_DECL_RE.match(norm_line)
+              if m:
+                  return m.group(1)
+              return None
+
+
+          def extract_attribute_name(norm_line):
+              m = ATTRIBUTE_DECL_RE.match(norm_line)
+              if m:
+                  return m.group(1)
+              return None
+
+
+          def collect_corpus_from_files(filepaths):
+              line_corpus = set()
+              type_names = set()
+              attribute_names = set()
+              for filepath in filepaths:
                   with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                       for line in f:
-                          if is_ignorable_conf_line(line):
+                          if is_ignorable(line):
                               continue
                           norm = normalize_line(line)
-                          if norm:
-                              corpus.add(norm)
-              return corpus
+                          if not norm:
+                              continue
+                          line_corpus.add(norm)
+                          tname = extract_type_name(norm)
+                          if tname:
+                              type_names.add(tname)
+                          aname = extract_attribute_name(norm)
+                          if aname:
+                              attribute_names.add(aname)
+              return line_corpus, type_names, attribute_names
 
 
-          def clean_te_file(filepath, corpus):
+          def collect_conf_corpus(conf_dir):
+              filepaths = glob.glob(os.path.join(conf_dir, "**", "*.conf"), recursive=True)
+              return collect_corpus_from_files(filepaths)
+
+
+          def collect_aosp_te_corpus(aosp_dir):
+              filepaths = glob.glob(os.path.join(aosp_dir, "**", "*.te"), recursive=True)
+              return collect_corpus_from_files(filepaths)
+
+
+          def clean_te_file(filepath, line_corpus, type_names, attribute_names):
               with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                   original_lines = f.readlines()
 
@@ -96,9 +147,21 @@ jobs:
                       kept_lines.append(line)
                       continue
                   norm = normalize_line(line)
-                  if norm in corpus:
+
+                  tname = extract_type_name(norm)
+                  if tname is not None and tname in type_names:
                       removed_entries.append(line.rstrip("\n"))
                       continue
+
+                  aname = extract_attribute_name(norm)
+                  if aname is not None and aname in attribute_names:
+                      removed_entries.append(line.rstrip("\n"))
+                      continue
+
+                  if norm in line_corpus:
+                      removed_entries.append(line.rstrip("\n"))
+                      continue
+
                   kept_lines.append(line)
 
               with open(filepath, "w", encoding="utf-8") as f:
@@ -110,26 +173,35 @@ jobs:
           def main():
               parser = argparse.ArgumentParser()
               parser.add_argument("--conf-dir", required=True)
+              parser.add_argument("--aosp-dir", required=True)
               parser.add_argument("--target-dir", required=True)
               parser.add_argument("--report", default="dedupe_report.md")
               args = parser.parse_args()
 
-              corpus = collect_conf_corpus(args.conf_dir)
+              conf_lines, conf_types, conf_attrs = collect_conf_corpus(args.conf_dir)
+              aosp_lines, aosp_types, aosp_attrs = collect_aosp_te_corpus(args.aosp_dir)
 
-              if not corpus:
-                  print("警告: .confコーパスが空です。conf.zipの展開結果を確認してください。", file=sys.stderr)
+              line_corpus = conf_lines | aosp_lines
+              type_names = conf_types | aosp_types
+              attribute_names = conf_attrs | aosp_attrs
+
+              if not line_corpus:
+                  print("警告: 比較コーパスが空です。conf.zip/AOSP cloneの結果を確認してください。", file=sys.stderr)
 
               report_rows = []
 
               te_files = glob.glob(os.path.join(args.target_dir, "**", "*.te"), recursive=True)
               for filepath in sorted(te_files):
-                  total, removed, removed_lines = clean_te_file(filepath, corpus)
+                  total, removed, removed_lines = clean_te_file(filepath, line_corpus, type_names, attribute_names)
                   report_rows.append((filepath, total, removed, removed_lines))
 
               with open(args.report, "w", encoding="utf-8") as f:
                   f.write("# .te 宣言・定義削除ログ\n\n")
-                  f.write("比較元: conf.zip 内の .conf ファイル群\n\n")
-                  f.write("コーパス行数: {}\n\n".format(len(corpus)))
+                  f.write("比較元1: conf.zip 内の .conf ファイル群\n\n")
+                  f.write("比較元2: AOSP android5.1.1_r28 external/sepolicy の .te ファイル群\n\n")
+                  f.write("行コーパス件数: {}\n\n".format(len(line_corpus)))
+                  f.write("type名コーパス件数: {}\n\n".format(len(type_names)))
+                  f.write("attribute名コーパス件数: {}\n\n".format(len(attribute_names)))
                   f.write("| ファイル | 元の行数 | 削除行数 | 残行数 |\n")
                   f.write("|---|---|---|---|\n")
                   for filepath, total, removed, _ in report_rows:
@@ -157,7 +229,7 @@ jobs:
 
       - name: 削除処理を実行
         run: |
-          python3 dedupe_te.py --conf-dir conf_extracted --target-dir input_extracted --report dedupe_report.md
+          python3 dedupe_te.py --conf-dir conf_extracted --aosp-dir aosp_sepolicy --target-dir input_extracted --report dedupe_report.md
 
       - name: レポートをジョブサマリーに反映
         run: |
