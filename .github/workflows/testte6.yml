@@ -1,0 +1,180 @@
+name: TE Dedup Against conf.zip Policy Declarations
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "整理対象の.teを含むzipのURL"
+        required: true
+        type: string
+      conf_zip_url:
+        description: "比較対象conf.zipのURL"
+        required: false
+        type: string
+        default: "https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/conf.zip"
+      output_zip_name:
+        description: "出力zipのベース名(拡張子なし)"
+        required: false
+        type: string
+        default: "cleaned_te_with_log"
+
+jobs:
+  dedupe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pythonをセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: conf.zipをダウンロード
+        run: |
+          curl -L --fail -o conf.zip "${{ inputs.conf_zip_url }}"
+
+      - name: conf.zipを展開
+        run: |
+          mkdir -p conf_extracted
+          unzip -o conf.zip -d conf_extracted
+
+      - name: 入力zipをダウンロード
+        run: |
+          curl -L --fail -o input.zip "${{ inputs.zip_url }}"
+
+      - name: 入力zipを展開
+        run: |
+          mkdir -p input_extracted
+          unzip -o input.zip -d input_extracted
+
+      - name: 削除スクリプトを配置
+        run: |
+          cat << 'PYEOF' > dedupe_te.py
+          import argparse
+          import glob
+          import os
+          import re
+          import sys
+
+
+          def normalize_line(line):
+              return re.sub(r"\s+", " ", line.strip())
+
+
+          def is_ignorable_conf_line(line):
+              stripped = line.strip()
+              if stripped == "":
+                  return True
+              if stripped.startswith("#line"):
+                  return True
+              if stripped.startswith("#"):
+                  return True
+              return False
+
+
+          def collect_conf_corpus(conf_dir):
+              corpus = set()
+              for filepath in glob.glob(os.path.join(conf_dir, "**", "*.conf"), recursive=True):
+                  with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                      for line in f:
+                          if is_ignorable_conf_line(line):
+                              continue
+                          norm = normalize_line(line)
+                          if norm:
+                              corpus.add(norm)
+              return corpus
+
+
+          def clean_te_file(filepath, corpus):
+              with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                  original_lines = f.readlines()
+
+              kept_lines = []
+              removed_entries = []
+
+              for line in original_lines:
+                  stripped = line.strip()
+                  if stripped == "" or stripped.startswith("#"):
+                      kept_lines.append(line)
+                      continue
+                  norm = normalize_line(line)
+                  if norm in corpus:
+                      removed_entries.append(line.rstrip("\n"))
+                      continue
+                  kept_lines.append(line)
+
+              with open(filepath, "w", encoding="utf-8") as f:
+                  f.writelines(kept_lines)
+
+              return len(original_lines), len(removed_entries), removed_entries
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--conf-dir", required=True)
+              parser.add_argument("--target-dir", required=True)
+              parser.add_argument("--report", default="dedupe_report.md")
+              args = parser.parse_args()
+
+              corpus = collect_conf_corpus(args.conf_dir)
+
+              if not corpus:
+                  print("警告: .confコーパスが空です。conf.zipの展開結果を確認してください。", file=sys.stderr)
+
+              report_rows = []
+
+              te_files = glob.glob(os.path.join(args.target_dir, "**", "*.te"), recursive=True)
+              for filepath in sorted(te_files):
+                  total, removed, removed_lines = clean_te_file(filepath, corpus)
+                  report_rows.append((filepath, total, removed, removed_lines))
+
+              with open(args.report, "w", encoding="utf-8") as f:
+                  f.write("# .te 宣言・定義削除ログ\n\n")
+                  f.write("比較元: conf.zip 内の .conf ファイル群\n\n")
+                  f.write("コーパス行数: {}\n\n".format(len(corpus)))
+                  f.write("| ファイル | 元の行数 | 削除行数 | 残行数 |\n")
+                  f.write("|---|---|---|---|\n")
+                  for filepath, total, removed, _ in report_rows:
+                      kept = total - removed
+                      f.write("| {} | {} | {} | {} |\n".format(filepath, total, removed, kept))
+                  f.write("\n## 削除された行の詳細\n\n")
+                  for filepath, total, removed, removed_lines in report_rows:
+                      if removed == 0:
+                          continue
+                      f.write("### {}\n\n".format(filepath))
+                      f.write("```\n")
+                      for line in removed_lines:
+                          f.write(line + "\n")
+                      f.write("```\n\n")
+
+              total_removed = sum(row[2] for row in report_rows)
+              total_files = len(report_rows)
+              print("処理ファイル数: {}".format(total_files))
+              print("削除行数合計: {}".format(total_removed))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: 削除処理を実行
+        run: |
+          python3 dedupe_te.py --conf-dir conf_extracted --target-dir input_extracted --report dedupe_report.md
+
+      - name: レポートをジョブサマリーに反映
+        run: |
+          cat dedupe_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 削除ログをinput_extracted配下にコピー
+        run: |
+          cp dedupe_report.md input_extracted/dedupe_report.md
+
+      - name: 整理済み.teと削除ログをまとめてzip化
+        run: |
+          cd input_extracted
+          zip -r "../${{ inputs.output_zip_name }}.zip" .
+          cd ..
+
+      - name: 成果物をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_zip_name }}
+          path: ${{ inputs.output_zip_name }}.zip
