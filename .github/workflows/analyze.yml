@@ -1,109 +1,207 @@
-name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Type/Attribute only, no checkpolicy)
+name: SEPolicy Dedup Against AOSP android5.1.1_r28
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'カスタム sepolicy ZIP ファイルの直接URL (.te と *contexts を含む)'
+        description: "整理対象の.te/contextsを含むzipのURL"
         required: true
         type: string
+      aosp_repo:
+        description: "比較対象AOSPリポジトリURL"
+        required: false
+        type: string
+        default: "https://android.googlesource.com/platform/external/sepolicy"
+      aosp_ref:
+        description: "比較対象AOSPタグ/ブランチ"
+        required: false
+        type: string
+        default: "android-5.1.1_r28"
+      output_zip_name:
+        description: "出力zipのベース名(拡張子なし)"
+        required: false
+        type: string
+        default: "cleaned_sepolicy"
 
 jobs:
-  sepolicy-clean:
+  dedupe:
     runs-on: ubuntu-latest
     steps:
-      # 1. AOSP ソースから type/attribute 名を抽出
-      - name: Download AOSP android-5.1.1_r28 sepolicy (external/sepolicy)
+      - name: AOSP sepolicyをclone
         run: |
-          mkdir -p aosp_sepolicy
-          echo "Downloading AOSP sepolicy from android.googlesource.com..."
-          wget --quiet https://android.googlesource.com/platform/external/sepolicy/+archive/android-5.1.1_r28.tar.gz -O aosp_sepolicy.tar.gz
-          tar -xzf aosp_sepolicy.tar.gz -C aosp_sepolicy
-          echo "AOSP files: $(find aosp_sepolicy -type f | wc -l)"
+          git clone --depth 1 --branch "${{ inputs.aosp_ref }}" "${{ inputs.aosp_repo }}" aosp_sepolicy
 
-      - name: Extract AOSP type/attribute names from .te files
+      - name: Pythonをセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 入力zipをダウンロード
         run: |
-          cd aosp_sepolicy
-          # 全 .te ファイルから type / attribute 宣言名を抽出
-          find . -type f -name "*.te" -exec cat {} \; \
-            | grep -E '^(type|attribute)\s+' \
-            | awk '{print $2}' \
-            | sed 's/[,;].*//' \
-            | sort -u > ../aosp_names.txt
-          echo "Extracted $(wc -l < ../aosp_names.txt) unique type/attribute names from AOSP."
+          curl -L --fail -o input.zip "${{ inputs.zip_url }}"
 
-      # 2. カスタム ZIP をダウンロードして展開
-      - name: Download and extract custom sepolicy ZIP
+      - name: 入力zipを展開
         run: |
-          mkdir -p custom_sepolicy
-          echo "Downloading custom ZIP from input URL..."
-          wget --quiet "${{ github.event.inputs.zip_url }}" -O custom_sepolicy.zip
-          unzip -q custom_sepolicy.zip -d custom_sepolicy
-          echo "Custom files: $(find custom_sepolicy -type f | wc -l)"
+          mkdir -p input_extracted
+          unzip -o input.zip -d input_extracted
 
-      # 3. 重複する type/attribute 宣言を削除（完全一致行は削除しない）
-      - name: Remove duplicate type/attribute declarations from .te files
+      - name: 重複行削除スクリプトを配置
         run: |
-          cd custom_sepolicy
-          NAMES_FILE="../aosp_names.txt"
+          cat << 'PYEOF' > dedupe_sepolicy.py
+          import argparse
+          import glob
+          import os
+          import re
+          import sys
 
-          # リストファイルが存在し、かつ空でないことを確認
-          if [ ! -s "$NAMES_FILE" ]; then
-            echo "ERROR: aosp_names.txt is empty or missing!"
-            exit 1
-          fi
 
-          clean_te_file() {
-            local te_file="$1"
-            echo "Processing: $te_file"
-            local orig=$(wc -l < "$te_file")
+          def normalize_line(line):
+              return re.sub(r"\s+", " ", line.strip())
 
-            # type/attribute 宣言行のみチェックし、AOSPに同名があれば削除
-            awk -v list="$NAMES_FILE" '
-              BEGIN {
-                while ((getline name < list) > 0) aosp_names[name] = 1
-                close(list)
-              }
-              {
-                if ($1 == "type" || $1 == "attribute") {
-                  name = $2
-                  gsub(/[,;].*/, "", name)
-                  if (name in aosp_names) {
-                    next   # この宣言行を削除
-                  }
-                }
-                print
-              }
-            ' "$te_file" > "${te_file}.cleaned"
 
-            mv "${te_file}.cleaned" "$te_file"
-            local new=$(wc -l < "$te_file")
-            echo "  Lines: $orig -> $new (removed $((orig - new)) type/attribute declarations)"
-          }
+          def is_comment_or_blank(line):
+              stripped = line.strip()
+              return stripped == "" or stripped.startswith("#")
 
-          export -f clean_te_file
-          export NAMES_FILE
 
-          find . -type f -name "*.te" -exec bash -c 'clean_te_file "$0"' {} \;
+          def collect_te_corpus(aosp_dir):
+              corpus = set()
+              for filepath in glob.glob(os.path.join(aosp_dir, "**", "*.te"), recursive=True):
+                  with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                      for line in f:
+                          if is_comment_or_blank(line):
+                              continue
+                          norm = normalize_line(line)
+                          if norm:
+                              corpus.add(norm)
+              return corpus
 
-          echo "Deduplication finished."
 
-      # 4. contexts ファイルは手を加えずそのまま保持（エラー原因ではないため）
-      #    （必要なら AOSP の contexts と完全一致削除も可能だが、今回はスキップ）
+          def collect_contexts_corpus(aosp_dir, basename):
+              corpus = set()
+              for filepath in glob.glob(os.path.join(aosp_dir, "**", basename), recursive=True):
+                  with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                      for line in f:
+                          if is_comment_or_blank(line):
+                              continue
+                          norm = normalize_line(line)
+                          if norm:
+                              corpus.add(norm)
+              return corpus
 
-      # 5. クリーンアップと ZIP 化
-      - name: Package cleaned sepolicy into ZIP
+
+          def clean_file(filepath, corpus):
+              with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                  original_lines = f.readlines()
+
+              kept_lines = []
+              removed_lines = []
+
+              for line in original_lines:
+                  if is_comment_or_blank(line):
+                      kept_lines.append(line)
+                      continue
+                  norm = normalize_line(line)
+                  if norm in corpus:
+                      removed_lines.append(line.rstrip("\n"))
+                      continue
+                  kept_lines.append(line)
+
+              with open(filepath, "w", encoding="utf-8") as f:
+                  f.writelines(kept_lines)
+
+              return len(original_lines), len(removed_lines), removed_lines
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--aosp-dir", required=True)
+              parser.add_argument("--target-dir", required=True)
+              parser.add_argument("--report", default="dedupe_report.md")
+              args = parser.parse_args()
+
+              te_corpus = collect_te_corpus(args.aosp_dir)
+
+              contexts_names = [
+                  "file_contexts",
+                  "seapp_contexts",
+                  "property_contexts",
+                  "service_contexts",
+              ]
+
+              contexts_corpus_map = {}
+              for name in contexts_names:
+                  contexts_corpus_map[name] = collect_contexts_corpus(args.aosp_dir, name)
+
+              if not te_corpus:
+                  print("警告: AOSP側の.teコーパスが空です。cloneの結果を確認してください。", file=sys.stderr)
+
+              report_rows = []
+
+              te_files = glob.glob(os.path.join(args.target_dir, "**", "*.te"), recursive=True)
+              for filepath in sorted(te_files):
+                  total, removed, removed_lines = clean_file(filepath, te_corpus)
+                  report_rows.append((filepath, "te", total, removed, removed_lines))
+
+              for name, corpus in contexts_corpus_map.items():
+                  matched_files = glob.glob(os.path.join(args.target_dir, "**", name), recursive=True)
+                  for filepath in sorted(matched_files):
+                      total, removed, removed_lines = clean_file(filepath, corpus)
+                      report_rows.append((filepath, name, total, removed, removed_lines))
+
+              with open(args.report, "w", encoding="utf-8") as f:
+                  f.write("# SEPolicy 重複行削除レポート\n\n")
+                  f.write("比較元: android5.1.1_r28 external/sepolicy\n\n")
+                  f.write("| ファイル | 種別 | 元の行数 | 削除行数 | 残行数 |\n")
+                  f.write("|---|---|---|---|---|\n")
+                  for row in report_rows:
+                      filepath, kind, total, removed = row[0], row[1], row[2], row[3]
+                      kept = total - removed
+                      f.write("| {} | {} | {} | {} | {} |\n".format(filepath, kind, total, removed, kept))
+                  f.write("\n## 削除された行の詳細\n\n")
+                  for row in report_rows:
+                      filepath, kind, total, removed, removed_lines = row
+                      if removed == 0:
+                          continue
+                      f.write("### {}\n\n".format(filepath))
+                      f.write("```\n")
+                      for line in removed_lines:
+                          f.write(line + "\n")
+                      f.write("```\n\n")
+
+              total_removed = sum(row[3] for row in report_rows)
+              total_files = len(report_rows)
+              print("処理ファイル数: {}".format(total_files))
+              print("削除行数合計: {}".format(total_removed))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          sed -i 's/^          //' dedupe_sepolicy.py
+
+      - name: 重複行削除を実行
         run: |
-          cd custom_sepolicy
-          find . -type f -name "*.cleaned" -delete
-          zip -r ../cleaned_sepolicy.zip .
+          python3 dedupe_sepolicy.py --aosp-dir aosp_sepolicy --target-dir input_extracted --report dedupe_report.md
+
+      - name: レポートをジョブサマリーに反映
+        run: |
+          cat dedupe_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 出力zipを作成
+        run: |
+          cd input_extracted
+          zip -r "../${{ inputs.output_zip_name }}.zip" .
           cd ..
-          echo "Final ZIP size: $(du -sh cleaned_sepolicy.zip | cut -f1)"
 
-      # 6. アーティファクトアップロード
-      - name: Upload cleaned sepolicy artifact
+      - name: 整理済みzipをアップロード
         uses: actions/upload-artifact@v4
         with:
-          name: cleaned-aosp-5.1.1_sepolicy
-          path: cleaned_sepolicy.zip
-          retention-days: 7
+          name: ${{ inputs.output_zip_name }}
+          path: ${{ inputs.output_zip_name }}.zip
+
+      - name: レポートをアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: dedupe_report
+          path: dedupe_report.md
