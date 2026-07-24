@@ -1,4 +1,4 @@
-name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Type/Attribute only, no exact match)
+name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Full Debug)
 
 on:
   workflow_dispatch:
@@ -27,6 +27,7 @@ jobs:
           find . -type f | head -30
 
       - name: Convert sepolicy binary to policy.conf
+        id: convert
         run: |
           cd workspace
           SEPOLICY_BIN=$(find . -type f -name "sepolicy" ! -name "*.te" ! -name "*.conf" | head -n 1)
@@ -39,6 +40,17 @@ jobs:
           echo "Generated policy.conf"
           echo "POLICY_CONF=$(pwd)/policy.conf" >> $GITHUB_ENV
 
+      - name: Debug policy.conf
+        run: |
+          cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
+          echo "=== policy.conf line count ==="
+          wc -l "$POLICY_CONF"
+          echo "=== First 5 lines of policy.conf ==="
+          head -n 5 "$POLICY_CONF"
+          echo "=== Last 5 lines of policy.conf ==="
+          tail -n 5 "$POLICY_CONF"
+
       - name: Extract AOSP type/attribute names
         run: |
           cd workspace
@@ -49,45 +61,68 @@ jobs:
             | sort -u > aosp_names.txt
           echo "Extracted $(wc -l < aosp_names.txt) unique type/attribute names."
 
-      - name: Remove duplicate type/attribute declarations only (keep all others)
+      - name: Remove duplicates from .te files (with detailed debug)
         run: |
           cd workspace
+          POLICY_CONF="${{ env.POLICY_CONF }}"
           NAMES_FILE="aosp_names.txt"
 
           clean_te_file() {
             local te_file="$1"
+            echo "========================================"
             echo "Processing: $te_file"
-            local orig=$(wc -l < "$te_file")
+            echo "--- Original file (first 3 lines) ---"
+            head -n 3 "$te_file"
+            echo "--- Original line count: $(wc -l < "$te_file") ---"
 
-            # type/attribute 宣言行だけをチェックし、AOSP に同名があればその行を削除
-            # それ以外の行（allow, neverallow, comments, empty lines, etc.）は絶対に保持
+            # ① 完全一致行を削除（tmp1）
+            grep -v -x -F -f "$POLICY_CONF" "$te_file" > "${te_file}.step1" || true
+            local step1_count=$(wc -l < "${te_file}.step1")
+            echo "After exact-match removal: $step1_count lines"
+
+            # もし削除された行が多い場合、そのサンプルを表示
+            local orig_count=$(wc -l < "$te_file")
+            local removed=$((orig_count - step1_count))
+            if [ $removed -gt 0 ]; then
+              echo "--- Sample of removed lines (first 3) ---"
+              comm -12 <(sort "$te_file") <(sort "$POLICY_CONF") | head -n 3
+            fi
+
+            # ② type/attribute 宣言の重複を削除
             awk -v list="$NAMES_FILE" '
               BEGIN {
                 while ((getline name < list) > 0) aosp_names[name] = 1
                 close(list)
               }
               {
-                # 行が "type" または "attribute" で始まる場合のみチェック
                 if ($1 == "type" || $1 == "attribute") {
-                  # 2番目のトークンからカンマ/セミコロンを除去して型名を取得
                   name = $2
                   gsub(/[,;].*/, "", name)
-                  # AOSP のリストに含まれていればこの行をスキップ（削除）
                   if (name in aosp_names) {
                     next
                   }
                 }
-                # それ以外の行は全て出力（保持）
                 print
               }
-            ' "$te_file" > "${te_file}.cleaned"
+            ' "${te_file}.step1" > "${te_file}.step2"
 
-            mv "${te_file}.cleaned" "$te_file"
-            local new=$(wc -l < "$te_file")
-            echo "  Lines: $orig -> $new (removed $((orig - new)) type/attribute declarations)"
+            local step2_count=$(wc -l < "${te_file}.step2")
+            echo "After type/attribute removal: $step2_count lines"
+
+            if [ $step2_count -eq 0 ]; then
+              echo "WARNING: $te_file became EMPTY! All lines were removed."
+              echo "This means every line in this file matches AOSP policy.conf."
+              echo "Keeping original as backup: ${te_file}.bak"
+              cp "$te_file" "${te_file}.bak"
+            fi
+
+            mv "${te_file}.step2" "$te_file"
+            rm -f "${te_file}.step1"
+            echo "Final line count: $(wc -l < "$te_file")"
           }
 
           export -f clean_te_file
+          export POLICY_CONF
 
           find . -type f -name "*.te" ! -path "*/policy.conf" ! -path "*/sepolicy" \
             -exec bash -c 'clean_te_file "$0"' {} \;
