@@ -1,10 +1,10 @@
-name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Full Debug)
+name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Type/Attribute only, no checkpolicy)
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: 'sepolicy バイナリとカスタム .te を含む ZIP ファイルの直接URL'
+        description: 'カスタム sepolicy ZIP ファイルの直接URL (.te と *contexts を含む)'
         required: true
         type: string
 
@@ -12,83 +12,53 @@ jobs:
   sepolicy-clean:
     runs-on: ubuntu-latest
     steps:
-      - name: Install checkpolicy
+      # 1. AOSP ソースから type/attribute 名を抽出
+      - name: Download AOSP android-5.1.1_r28 sepolicy (external/sepolicy)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y checkpolicy
+          mkdir -p aosp_sepolicy
+          echo "Downloading AOSP sepolicy from android.googlesource.com..."
+          wget --quiet https://android.googlesource.com/platform/external/sepolicy/+archive/android-5.1.1_r28.tar.gz -O aosp_sepolicy.tar.gz
+          tar -xzf aosp_sepolicy.tar.gz -C aosp_sepolicy
+          echo "AOSP files: $(find aosp_sepolicy -type f | wc -l)"
 
-      - name: Download and extract sepolicy ZIP
+      - name: Extract AOSP type/attribute names from .te files
         run: |
-          mkdir -p workspace
-          cd workspace
-          wget --quiet "${{ github.event.inputs.zip_url }}" -O sepolicy.zip
-          unzip -q sepolicy.zip
-          echo "Extracted files:"
-          find . -type f | head -30
-
-      - name: Convert sepolicy binary to policy.conf
-        id: convert
-        run: |
-          cd workspace
-          SEPOLICY_BIN=$(find . -type f -name "sepolicy" ! -name "*.te" ! -name "*.conf" | head -n 1)
-          if [ -z "$SEPOLICY_BIN" ]; then
-            echo "ERROR: sepolicy binary not found!"
-            exit 1
-          fi
-          echo "Found sepolicy at: $SEPOLICY_BIN"
-          checkpolicy -b -M -o policy.conf "$SEPOLICY_BIN"
-          echo "Generated policy.conf"
-          echo "POLICY_CONF=$(pwd)/policy.conf" >> $GITHUB_ENV
-
-      - name: Debug policy.conf
-        run: |
-          cd workspace
-          POLICY_CONF="${{ env.POLICY_CONF }}"
-          echo "=== policy.conf line count ==="
-          wc -l "$POLICY_CONF"
-          echo "=== First 5 lines of policy.conf ==="
-          head -n 5 "$POLICY_CONF"
-          echo "=== Last 5 lines of policy.conf ==="
-          tail -n 5 "$POLICY_CONF"
-
-      - name: Extract AOSP type/attribute names
-        run: |
-          cd workspace
-          POLICY_CONF="${{ env.POLICY_CONF }}"
-          grep -E '^(type|attribute) ' "$POLICY_CONF" \
+          cd aosp_sepolicy
+          # 全 .te ファイルから type / attribute 宣言名を抽出
+          find . -type f -name "*.te" -exec cat {} \; \
+            | grep -E '^(type|attribute)\s+' \
             | awk '{print $2}' \
             | sed 's/[,;].*//' \
-            | sort -u > aosp_names.txt
-          echo "Extracted $(wc -l < aosp_names.txt) unique type/attribute names."
+            | sort -u > ../aosp_names.txt
+          echo "Extracted $(wc -l < ../aosp_names.txt) unique type/attribute names from AOSP."
 
-      - name: Remove duplicates from .te files (with detailed debug)
+      # 2. カスタム ZIP をダウンロードして展開
+      - name: Download and extract custom sepolicy ZIP
         run: |
-          cd workspace
-          POLICY_CONF="${{ env.POLICY_CONF }}"
-          NAMES_FILE="aosp_names.txt"
+          mkdir -p custom_sepolicy
+          echo "Downloading custom ZIP from input URL..."
+          wget --quiet "${{ github.event.inputs.zip_url }}" -O custom_sepolicy.zip
+          unzip -q custom_sepolicy.zip -d custom_sepolicy
+          echo "Custom files: $(find custom_sepolicy -type f | wc -l)"
+
+      # 3. 重複する type/attribute 宣言を削除（完全一致行は削除しない）
+      - name: Remove duplicate type/attribute declarations from .te files
+        run: |
+          cd custom_sepolicy
+          NAMES_FILE="../aosp_names.txt"
+
+          # リストファイルが存在し、かつ空でないことを確認
+          if [ ! -s "$NAMES_FILE" ]; then
+            echo "ERROR: aosp_names.txt is empty or missing!"
+            exit 1
+          fi
 
           clean_te_file() {
             local te_file="$1"
-            echo "========================================"
             echo "Processing: $te_file"
-            echo "--- Original file (first 3 lines) ---"
-            head -n 3 "$te_file"
-            echo "--- Original line count: $(wc -l < "$te_file") ---"
+            local orig=$(wc -l < "$te_file")
 
-            # ① 完全一致行を削除（tmp1）
-            grep -v -x -F -f "$POLICY_CONF" "$te_file" > "${te_file}.step1" || true
-            local step1_count=$(wc -l < "${te_file}.step1")
-            echo "After exact-match removal: $step1_count lines"
-
-            # もし削除された行が多い場合、そのサンプルを表示
-            local orig_count=$(wc -l < "$te_file")
-            local removed=$((orig_count - step1_count))
-            if [ $removed -gt 0 ]; then
-              echo "--- Sample of removed lines (first 3) ---"
-              comm -12 <(sort "$te_file") <(sort "$POLICY_CONF") | head -n 3
-            fi
-
-            # ② type/attribute 宣言の重複を削除
+            # type/attribute 宣言行のみチェックし、AOSPに同名があれば削除
             awk -v list="$NAMES_FILE" '
               BEGIN {
                 while ((getline name < list) > 0) aosp_names[name] = 1
@@ -99,43 +69,38 @@ jobs:
                   name = $2
                   gsub(/[,;].*/, "", name)
                   if (name in aosp_names) {
-                    next
+                    next   # この宣言行を削除
                   }
                 }
                 print
               }
-            ' "${te_file}.step1" > "${te_file}.step2"
+            ' "$te_file" > "${te_file}.cleaned"
 
-            local step2_count=$(wc -l < "${te_file}.step2")
-            echo "After type/attribute removal: $step2_count lines"
-
-            if [ $step2_count -eq 0 ]; then
-              echo "WARNING: $te_file became EMPTY! All lines were removed."
-              echo "This means every line in this file matches AOSP policy.conf."
-              echo "Keeping original as backup: ${te_file}.bak"
-              cp "$te_file" "${te_file}.bak"
-            fi
-
-            mv "${te_file}.step2" "$te_file"
-            rm -f "${te_file}.step1"
-            echo "Final line count: $(wc -l < "$te_file")"
+            mv "${te_file}.cleaned" "$te_file"
+            local new=$(wc -l < "$te_file")
+            echo "  Lines: $orig -> $new (removed $((orig - new)) type/attribute declarations)"
           }
 
           export -f clean_te_file
-          export POLICY_CONF
+          export NAMES_FILE
 
-          find . -type f -name "*.te" ! -path "*/policy.conf" ! -path "*/sepolicy" \
-            -exec bash -c 'clean_te_file "$0"' {} \;
+          find . -type f -name "*.te" -exec bash -c 'clean_te_file "$0"' {} \;
 
           echo "Deduplication finished."
 
+      # 4. contexts ファイルは手を加えずそのまま保持（エラー原因ではないため）
+      #    （必要なら AOSP の contexts と完全一致削除も可能だが、今回はスキップ）
+
+      # 5. クリーンアップと ZIP 化
       - name: Package cleaned sepolicy into ZIP
         run: |
-          cd workspace
+          cd custom_sepolicy
+          find . -type f -name "*.cleaned" -delete
           zip -r ../cleaned_sepolicy.zip .
           cd ..
           echo "Final ZIP size: $(du -sh cleaned_sepolicy.zip | cut -f1)"
 
+      # 6. アーティファクトアップロード
       - name: Upload cleaned sepolicy artifact
         uses: actions/upload-artifact@v4
         with:
