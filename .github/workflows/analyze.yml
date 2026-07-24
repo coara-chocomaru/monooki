@@ -41,7 +41,8 @@ jobs:
           fi
           echo "Found sepolicy at: $SEPOLICY_BIN"
           # 変換（-F は file_contexts 出力のため除外）
-          checkpolicy -b -o policy.conf "$SEPOLICY_BIN"
+          # 修正箇所（checkpolicy 実行行）
+          checkpolicy -b -M -o policy.conf "$SEPOLICY_BIN"
           echo "Generated policy.conf"
           echo "POLICY_CONF=$(pwd)/policy.conf" >> $GITHUB_ENV
 
