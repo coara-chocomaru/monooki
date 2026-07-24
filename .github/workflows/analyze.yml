@@ -1,0 +1,100 @@
+name: AOSP 5.1.1_r28 Sepolicy Deduplicator (Cleaner)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'カスタム sepolicy ZIP ファイルの直接URL (.te と *contexts を含む)'
+        required: true
+        type: string
+
+jobs:
+  sepolicy-clean:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 作業ディレクトリの準備と AOSP 5.1.1_r28 公式 sepolicy のダウンロード
+      - name: Download AOSP android-5.1.1_r28 sepolicy (external/sepolicy)
+        run: |
+          mkdir -p aosp_sepolicy
+          echo "Downloading AOSP sepolicy from android.googlesource.com..."
+          wget --quiet https://android.googlesource.com/platform/external/sepolicy/+archive/android-5.1.1_r28.tar.gz -O aosp_sepolicy.tar.gz
+          tar -xzf aosp_sepolicy.tar.gz -C aosp_sepolicy
+          echo "AOSP sepolicy files count: $(find aosp_sepolicy -type f | wc -l)"
+          ls -la aosp_sepolicy/
+
+      # 2. ユーザー指定のカスタム ZIP をダウンロードして展開
+      - name: Download and extract custom sepolicy ZIP
+        run: |
+          mkdir -p custom_sepolicy
+          echo "Downloading custom ZIP from input URL..."
+          wget --quiet "${{ github.event.inputs.zip_url }}" -O custom_sepolicy.zip
+          unzip -q custom_sepolicy.zip -d custom_sepolicy
+          echo "Custom sepolicy files count: $(find custom_sepolicy -type f | wc -l)"
+          ls -la custom_sepolicy/
+
+      # 3. 重複行削除処理 (高度なフィルタリング)
+      - name: Remove lines exactly matching AOSP definitions
+        run: |
+          set -e
+          AOSP_DIR="$(pwd)/aosp_sepolicy"
+          CUSTOM_DIR="$(pwd)/custom_sepolicy"
+
+          # フィルタリング関数 (Bash で export して find -exec で利用)
+          clean_target_files() {
+            local custom_file="$1"
+            # AOSP ディレクトリからの相対パスを算出
+            local rel_path="${custom_file#$CUSTOM_DIR/}"
+            local aosp_file="$AOSP_DIR/$rel_path"
+
+            # 処理対象ファイルか拡張子/名前で再チェック (念のため)
+            if [[ ! "$custom_file" =~ \.te$ ]] && [[ ! "$custom_file" =~ contexts ]]; then
+              echo "Skipping non-target file: $rel_path"
+              return 0
+            fi
+
+            echo "Processing: $rel_path"
+
+            # AOSP に同名ファイルが存在しない場合はそのまま保持 (カスタム独自ファイル)
+            if [ ! -f "$aosp_file" ]; then
+              echo "  -> No AOSP counterpart found. Keeping all lines."
+              return 0
+            fi
+
+            # AOSP の行を参照ファイルとして利用し、カスタムファイルから完全一致行を除去
+            # -v: 除外, -x: 行全体一致, -F: 固定文字列, -f: パターンファイル
+            # grep がマッチなしで終了コード 1 を返すのを許容するため || true
+            grep -v -x -F -f "$aosp_file" "$custom_file" > "${custom_file}.tmp" || true
+
+            # 上書き保存 (元のパーミッションは維持)
+            mv "${custom_file}.tmp" "$custom_file"
+
+            local removed_lines=$(($(wc -l < "$custom_file") - $(wc -l < "${custom_file}"))) # 簡易表示
+            echo "  -> Cleaned. Removed duplicate lines matching AOSP."
+          }
+
+          export -f clean_target_files
+          export AOSP_DIR CUSTOM_DIR
+
+          # .te ファイル および 名前に "contexts" を含む全ファイルを対象に実行
+          find "$CUSTOM_DIR" -type f \( -name "*.te" -o -name "*contexts" \) \
+            -exec bash -c 'clean_target_files "$0"' {} \;
+
+          echo "Deduplication finished."
+
+      # 4. 不要な中間ファイル(.tmp)が残っていないか最終確認してから ZIP 化
+      - name: Package cleaned sepolicy into ZIP
+        run: |
+          cd custom_sepolicy
+          # 万が一 .tmp ファイルが残っていれば削除 (通常は上書きで消える)
+          find . -type f -name "*.tmp" -delete
+          zip -r ../cleaned_sepolicy.zip .
+          cd ..
+          echo "Final ZIP size: $(du -sh cleaned_sepolicy.zip | cut -f1)"
+
+      # 5. 成果物 (artifact) としてアップロード
+      - name: Upload cleaned sepolicy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleaned-aosp-5.1.1_sepolicy
+          path: cleaned_sepolicy.zip
+          retention-days: 7
