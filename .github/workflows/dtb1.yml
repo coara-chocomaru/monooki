@@ -1,0 +1,375 @@
+name: Extract Kernel and DTB, Patch SELinux Cmdline, Repack
+
+on:
+  workflow_dispatch:
+    inputs:
+      img_url:
+        description: "boot.img or uImage kernel file URL"
+        required: true
+        type: string
+      output_name:
+        description: "Output ZIP base name"
+        required: false
+        default: "selinux_permissive_kernel"
+        type: string
+      extra_cmdline:
+        description: "Cmdline parameters to inject"
+        required: false
+        default: "androidboot.selinux=permissive enforcing=0 selinux=0 audit=0 checkreqprot=0"
+        type: string
+
+jobs:
+  patch-kernel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            device-tree-compiler \
+            u-boot-tools \
+            python3 \
+            curl \
+            file \
+            zip \
+            unzip \
+            xxd
+
+      - name: Prepare workspace
+        run: |
+          rm -rf work
+          mkdir -p work/in work/out work/out/dts
+
+      - name: Download image
+        run: |
+          curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.img_url }}" -o work/in/input.img
+          file work/in/input.img
+          xxd -l 16 work/in/input.img
+
+      - name: Split image into kernel payload and detect format
+        run: |
+          cat > work/split_image.py << 'PY'
+          import struct
+          import sys
+          import zlib
+          import json
+
+          data = open("work/in/input.img", "rb").read()
+
+          result = {}
+
+          if data[0:8] == b"ANDROID!":
+              result["format"] = "android_bootimg"
+              magic = data[0:8]
+              (kernel_size, kernel_addr,
+               ramdisk_size, ramdisk_addr,
+               second_size, second_addr,
+               tags_addr, page_size,
+               unused0, unused1) = struct.unpack_from("<10I", data, 8)
+              name = data[48:64]
+              cmdline = data[64:576]
+              img_id = data[576:608]
+              extra_cmdline = data[608:1632]
+
+              header_len = 1632
+              pages = lambda n: ((n + page_size - 1) // page_size) * page_size
+
+              kernel_off = pages(header_len)
+              kernel = data[kernel_off:kernel_off + kernel_size]
+              ramdisk_off = kernel_off + pages(kernel_size)
+              ramdisk = data[ramdisk_off:ramdisk_off + ramdisk_size]
+              second_off = ramdisk_off + pages(ramdisk_size)
+              second = data[second_off:second_off + second_size]
+
+              open("work/out/kernel_payload.bin", "wb").write(kernel)
+              open("work/out/ramdisk.img", "wb").write(ramdisk)
+              open("work/out/second.img", "wb").write(second)
+
+              result["page_size"] = page_size
+              result["kernel_size"] = kernel_size
+              result["ramdisk_size"] = ramdisk_size
+              result["second_size"] = second_size
+              result["kernel_addr"] = kernel_addr
+              result["ramdisk_addr"] = ramdisk_addr
+              result["second_addr"] = second_addr
+              result["tags_addr"] = tags_addr
+              result["name"] = name.rstrip(b"\x00").decode("ascii", "replace")
+              result["cmdline"] = (cmdline + extra_cmdline).rstrip(b"\x00").decode("ascii", "replace")
+
+          elif len(data) >= 4 and struct.unpack_from(">I", data, 0)[0] == 0x27051956:
+              result["format"] = "uboot_uimage"
+              (magic, hcrc, itime, isize, load, ep, dcrc,
+               ios, arch, itype, comp) = struct.unpack_from(">7I4B", data, 0)
+              name = data[32:64]
+              payload = data[64:]
+
+              open("work/out/kernel_payload.bin", "wb").write(payload)
+
+              result["load"] = load
+              result["ep"] = ep
+              result["os"] = ios
+              result["arch"] = arch
+              result["itype"] = itype
+              result["comp"] = comp
+              result["name"] = name.rstrip(b"\x00").decode("ascii", "replace")
+              result["isize"] = isize
+
+          else:
+              print("Unrecognized image format, unable to split")
+              sys.exit(1)
+
+          json.dump(result, open("work/out/format_info.json", "w"), indent=2)
+          print(json.dumps(result, indent=2))
+          PY
+          python3 work/split_image.py
+
+      - name: Locate gzip kernel end and extract embedded DTB
+        run: |
+          cat > work/extract_dtb.py << 'PY'
+          import zlib
+          import struct
+          import json
+
+          payload = open("work/out/kernel_payload.bin", "rb").read()
+
+          if payload[0:2] != b"\x1f\x8b":
+              raise SystemExit("kernel payload is not gzip compressed, cannot locate appended DTB automatically")
+
+          d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+          kernel_raw = d.decompress(payload)
+          gzip_end = len(payload) - len(d.unused_data)
+          trailer = payload[gzip_end:]
+
+          magic = b"\xd0\x0d\xfe\xed"
+          idx = trailer.find(magic)
+
+          if idx == -1:
+              raise SystemExit("no appended DTB (FDT magic) found after gzip kernel stream")
+
+          padding = trailer[:idx]
+          dtb_and_after = trailer[idx:]
+          dtb_totalsize = struct.unpack_from(">I", dtb_and_after, 4)[0]
+          dtb = dtb_and_after[:dtb_totalsize]
+          leftover = dtb_and_after[dtb_totalsize:]
+
+          open("work/out/kernel_raw.img", "wb").write(kernel_raw)
+          open("work/out/original.dtb", "wb").write(dtb)
+          open("work/out/padding.bin", "wb").write(padding)
+          open("work/out/leftover_after_dtb.bin", "wb").write(leftover)
+
+          info = {
+              "gzip_end_offset": gzip_end,
+              "padding_len": len(padding),
+              "dtb_len": len(dtb),
+              "leftover_len": len(leftover),
+              "kernel_raw_len": len(kernel_raw),
+          }
+          json.dump(info, open("work/out/split_info.json", "w"), indent=2)
+          print(json.dumps(info, indent=2))
+          PY
+          python3 work/extract_dtb.py
+
+      - name: Decompile DTB to DTS
+        run: |
+          dtc -I dtb -O dts -o work/out/dts/original.dts work/out/original.dtb
+
+      - name: Patch bootargs in DTS
+        run: |
+          cat > work/patch_dts.py << 'PY'
+          import re
+
+          extra = "${{ inputs.extra_cmdline }}"
+
+          dts = open("work/out/dts/original.dts", "r", encoding="utf-8").read()
+
+          chosen_block = re.search(r"chosen\s*{([^}]*)}", dts, re.DOTALL)
+
+          if chosen_block:
+              block = chosen_block.group(1)
+              bootargs_match = re.search(r'bootargs\s*=\s*"([^"]*)"\s*;', block)
+              if bootargs_match:
+                  original = bootargs_match.group(1)
+                  tokens = original.split()
+                  extra_tokens = extra.split()
+                  for t in extra_tokens:
+                      key = t.split("=")[0]
+                      tokens = [x for x in tokens if not x.startswith(key + "=") and x != key]
+                  merged = " ".join(tokens + extra_tokens)
+                  new_block = block[:bootargs_match.start()] + f'bootargs = "{merged}";' + block[bootargs_match.end():]
+              else:
+                  merged = extra
+                  new_block = block + f'\n\tbootargs = "{merged}";\n'
+              dts = dts[:chosen_block.start(1)] + new_block + dts[chosen_block.end(1):]
+              print("existing chosen node patched")
+          else:
+              insert_pos = dts.rstrip().rfind("};")
+              chosen_node = f'\n\tchosen {{\n\t\tbootargs = "{extra}";\n\t}};\n'
+              dts = dts[:insert_pos] + chosen_node + dts[insert_pos:]
+              print("new chosen node inserted")
+
+          open("work/out/dts/patched.dts", "w", encoding="utf-8").write(dts)
+          PY
+          python3 work/patch_dts.py
+          echo "----- patched chosen node -----"
+          grep -A5 "chosen" work/out/dts/patched.dts || true
+
+      - name: Recompile DTS to DTB
+        run: |
+          dtc -I dts -O dtb -o work/out/patched.dtb work/out/dts/patched.dts
+          ls -la work/out/original.dtb work/out/patched.dtb
+
+      - name: Reassemble kernel payload with patched DTB
+        run: |
+          cat > work/repack_payload.py << 'PY'
+          import gzip
+          import json
+
+          info = json.load(open("work/out/split_info.json"))
+
+          kernel_raw = open("work/out/kernel_raw.img", "rb").read()
+          padding = open("work/out/padding.bin", "rb").read()
+          patched_dtb = open("work/out/patched.dtb", "rb").read()
+          leftover = open("work/out/leftover_after_dtb.bin", "rb").read()
+
+          compressed = gzip.compress(kernel_raw, compresslevel=9, mtime=0)
+
+          new_payload = compressed + padding + patched_dtb + leftover
+
+          open("work/out/new_kernel_payload.bin", "wb").write(new_payload)
+
+          info["compressed_len"] = len(compressed)
+          info["new_payload_len"] = len(new_payload)
+          json.dump(info, open("work/out/split_info.json", "w"), indent=2)
+
+          print("new payload size:", len(new_payload))
+          print("compressed kernel size:", len(compressed))
+          PY
+          python3 work/repack_payload.py
+
+      - name: Repack into original container format
+        run: |
+          cat > work/repack_container.py << 'PY'
+          import struct
+          import zlib
+          import json
+
+          fmt_info = json.load(open("work/out/format_info.json"))
+          split_info = json.load(open("work/out/split_info.json"))
+          new_payload = open("work/out/new_kernel_payload.bin", "rb").read()
+          extra_cmdline_str = "${{ inputs.extra_cmdline }}"
+
+          if fmt_info["format"] == "uboot_uimage":
+              magic = 0x27051956
+              itime = 0
+              load = fmt_info["load"]
+              ep = fmt_info["ep"]
+              ios = fmt_info["os"]
+              arch = fmt_info["arch"]
+              itype = fmt_info["itype"]
+              comp = fmt_info["comp"]
+              name = fmt_info["name"].encode("ascii")[:32].ljust(32, b"\x00")
+              isize = split_info["compressed_len"]
+
+              dcrc = zlib.crc32(new_payload[:isize]) & 0xffffffff
+
+              header_wo_hcrc = struct.pack(
+                  ">7I4B32s",
+                  magic, 0, itime, isize, load, ep, dcrc,
+                  ios, arch, itype, comp, name
+              )
+              hcrc = zlib.crc32(header_wo_hcrc) & 0xffffffff
+
+              header = struct.pack(
+                  ">7I4B32s",
+                  magic, hcrc, itime, isize, load, ep, dcrc,
+                  ios, arch, itype, comp, name
+              )
+
+              output = header + new_payload
+              open("work/out/final_kernel.uimg", "wb").write(output)
+              print("uImage written, size:", len(output))
+
+          elif fmt_info["format"] == "android_bootimg":
+              orig = open("work/in/input.img", "rb").read()
+              page_size = fmt_info["page_size"]
+              pages = lambda n: ((n + page_size - 1) // page_size) * page_size
+
+              ramdisk = open("work/out/ramdisk.img", "rb").read()
+              second = open("work/out/second.img", "rb").read()
+
+              merged_cmdline = fmt_info["cmdline"]
+              tokens = merged_cmdline.split()
+              extra_tokens = extra_cmdline_str.split()
+              for t in extra_tokens:
+                  key = t.split("=")[0]
+                  tokens = [x for x in tokens if not x.startswith(key + "=") and x != key]
+              full_cmdline = " ".join(tokens + extra_tokens)
+              cmdline_bytes = full_cmdline.encode("ascii")[:512 + 1024]
+              cmdline_field = cmdline_bytes[:512].ljust(512, b"\x00")
+              extra_cmdline_field = cmdline_bytes[512:].ljust(1024, b"\x00")
+
+              header = bytearray(orig[:1632])
+              struct.pack_into("<I", header, 8, len(new_payload))
+              header[64:576] = cmdline_field
+              header[608:1632] = extra_cmdline_field
+
+              header_padded = bytes(header).ljust(pages(1632), b"\x00")
+
+              out = bytearray()
+              out += header_padded
+              out += new_payload.ljust(pages(len(new_payload)), b"\x00")
+              out += ramdisk.ljust(pages(len(ramdisk)), b"\x00")
+              if len(second) > 0:
+                  out += second.ljust(pages(len(second)), b"\x00")
+
+              open("work/out/final_boot.img", "wb").write(bytes(out))
+              print("boot.img written, size:", len(out))
+              print("final cmdline:", full_cmdline)
+          PY
+          python3 work/repack_container.py
+
+      - name: Generate README
+        run: |
+          cat > work/out/README.txt << EOF
+          SELinux Cmdline Patch Report
+          =============================
+
+          Input URL: ${{ inputs.img_url }}
+          Injected cmdline parameters: ${{ inputs.extra_cmdline }}
+          Generated: $(date -u)
+
+          Files Included:
+          -----------------
+          - format_info.json          detected container format and header fields
+          - split_info.json           gzip/dtb split offsets within kernel payload
+          - kernel_raw.img            decompressed raw kernel Image
+          - original.dtb              DTB as originally embedded
+          - patched.dtb               DTB with patched chosen/bootargs
+          - dts/original.dts          decompiled original DTS
+          - dts/patched.dts           decompiled patched DTS
+          - new_kernel_payload.bin    recompressed kernel + patched DTB
+          - final_kernel.uimg         repacked u-boot uImage (if input was uImage)
+          - final_boot.img            repacked Android boot.img (if input was Android bootimg, cmdline header also patched)
+
+          Notes:
+          -------
+          - If your bootloader overrides bootargs from its own environment (u-boot bootargs env var),
+            this DTB patch alone may not take effect. Verify with printenv bootargs on the device
+            or check /proc/cmdline after flashing.
+          EOF
+
+      - name: Package ZIP
+        run: |
+          cd work/out
+          zip -9 -r "../../${{ inputs.output_name }}.zip" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: ${{ inputs.output_name }}.zip
+          if-no-files-found: error
