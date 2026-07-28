@@ -127,6 +127,44 @@ jobs:
           PY
           python3 work/split_image.py
 
+      - name: Unwrap inner u-boot uImage if present
+        run: |
+          cat > work/unwrap_inner.py << 'PY'
+          import struct
+          import json
+
+          kernel_payload = open("work/out/kernel_payload.bin", "rb").read()
+
+          info = {}
+
+          if len(kernel_payload) >= 4 and struct.unpack_from(">I", kernel_payload, 0)[0] == 0x27051956:
+              (magic, hcrc, itime, isize, load, ep, dcrc,
+               ios, arch, itype, comp) = struct.unpack_from(">7I4B", kernel_payload, 0)
+              name = kernel_payload[32:64]
+              inner_payload = kernel_payload[64:]
+
+              info["wrapped"] = True
+              info["load"] = load
+              info["ep"] = ep
+              info["os"] = ios
+              info["arch"] = arch
+              info["itype"] = itype
+              info["comp"] = comp
+              info["name"] = name.rstrip(b"\x00").decode("ascii", "replace")
+              info["outer_isize"] = isize
+
+              open("work/out/gzip_dtb_payload.bin", "wb").write(inner_payload)
+              print("inner u-boot uImage detected and unwrapped")
+          else:
+              info["wrapped"] = False
+              open("work/out/gzip_dtb_payload.bin", "wb").write(kernel_payload)
+              print("kernel payload has no inner uImage wrapper, using as-is")
+
+          json.dump(info, open("work/out/inner_uimage_info.json", "w"), indent=2)
+          print(json.dumps(info, indent=2))
+          PY
+          python3 work/unwrap_inner.py
+
       - name: Locate gzip kernel end and extract embedded DTB
         run: |
           cat > work/extract_dtb.py << 'PY'
@@ -134,7 +172,7 @@ jobs:
           import struct
           import json
 
-          payload = open("work/out/kernel_payload.bin", "rb").read()
+          payload = open("work/out/gzip_dtb_payload.bin", "rb").read()
 
           if payload[0:2] != b"\x1f\x8b":
               raise SystemExit("kernel payload is not gzip compressed, cannot locate appended DTB automatically")
