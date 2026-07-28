@@ -15,7 +15,7 @@ on:
       extra_cmdline:
         description: "Cmdline parameters to inject"
         required: false
-        default: "androidboot.selinux=permissive enforcing=0 selinux=0 audit=0 checkreqprot=0"
+        default: "enforcing=0"
         type: string
 
 jobs:
