@@ -1,21 +1,25 @@
-adb shell
-stop teed
-setprop init.svc.teed stopped
-/vendor/bin/teed \
-  --tzdev /dev/tkcore_admin \
-  --datapath /mnt/vendor/protect_f/tee_twrp/fs \
-  --sptapath /mnt/vendor/protect_f/tee_twrp/app \
-  --systapath /vendor/app/t6 \
-  --rpmbdev /dev/mmcblk0rpmb \
-  --rpmbdev /dev/rpmb0 \
-  --prot /mnt/vendor/protect_f/tee \
-  --prebuilt /vendor/app/t6/data \
-  --logpath /mnt/vendor/protect_f/tee_twrp/tkcore.log \
-  --proprefix vendor.trustkernel
-echo "EXIT: $?"
+system/lib/libMarvellWireless.so
+system/lib64/libMarvellWireless.so
+system/lib/libwpa_client.so
+system/lib64/libwpa_client.so
+system/lib/libnl.so
+system/lib64/libnl.so
+system/lib/libnetutils.so
+system/lib64/libnetutils.so
+system/lib/libcrypto.so
+system/lib64/libcrypto.so
+system/lib/libssl.so
+system/lib64/libssl.so
 
-ls -la /vendor/app/t6
-ls -la /vendor/app/t6/data
-ls -la /mnt/vendor/protect_f/tee
-ls -la /mnt/vendor/protect_f/tee_twrp
-ls -la /dev/mmcblk0rpmb /dev/rpmb0
+
+system/bin/wpa_supplicant 
+system/bin/hostapd
+system/bin/dhcpcd
+system/bin/mlanconfig
+system/bin/mlanutl
+system/bin/mlan2040coex
+system/bin/mlaninit.sh
+system/bin/load_prod_8787.sh
+system/bin/load_mfg_8787.sh
+system/bin/unload_8787.sh
+system/bin/MarvellWirelessDaemon
