@@ -1,4 +1,4 @@
-name: QCOM Bootloader Full Disassembly (XBL & ABL)
+name: QCOM Bootloader Full Disassembly & Analysis (XBL & ABL)
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
       options: --privileged
 
     steps:
-      - name: Install Git (for checkout)
+      - name: Install Git
         run: |
           apt-get update -y
           apt-get install -y git
@@ -26,7 +26,7 @@ jobs:
           fetch-depth: 0
 
       # ============================================================
-      # 1. Radare2 と必要なツールのインストール
+      # 1. Radare2 と依存ツールのインストール
       # ============================================================
       - name: Install Radare2 and Tools
         run: |
@@ -39,7 +39,6 @@ jobs:
             default-jdk-headless
           apt-get clean
 
-          # Radare2 をソースからビルド（最新安定版）
           git clone --depth 1 https://github.com/radareorg/radare2
           cd radare2
           ./configure --prefix=/usr/local
@@ -59,102 +58,218 @@ jobs:
           pip3 install r2pipe pefile
 
       # ============================================================
-      # 2. フル逆アセンブルを生成する Python スクリプト
+      # 2. 高度な解析スクリプトの作成
       # ============================================================
-      - name: Create Disassembly Script
+      - name: Create Advanced Analysis Script
         run: |
-          cat > /tmp/full_disasm.py << 'EOF'
+          cat > /tmp/analyze_bootloader.py << 'EOF'
           #!/usr/bin/env python3
-          import os, sys, subprocess, json
+          import os, sys, json, re
           import r2pipe
 
-          def disassemble_full(img_path, name):
-              print(f"[+] Disassembling {name}...")
-              # r2 を開く（アーキテクチャは自動判定）
-              r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true', '-e', 'bin.cache=true'])
-              r2.cmd('aaaa')  # フル解析
-              # プログラム全体の逆アセンブル（pdr: 全関数＋コード）
-              disasm = r2.cmd('pdr')
-              # データを含めた完全逆アセンブル（pD: アドレス指定なしで全範囲）
-              disasm_full = r2.cmd('pD')
-              # 全関数一覧
-              funcs = r2.cmd('afl')
-              # 文字列一覧
-              strings = r2.cmd('iz')
-              r2.quit()
+          # ターゲットのfastboot関連キーワード
+          FASTBOOT_KEYWORDS = [
+              'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
+              'download', 'continue', 'boot', 'update', 'unlock', 'lock',
+              'device_state', 'secure', 'critical', 'slot', 'partition'
+          ]
+          UNLOCK_KEYWORDS = ['unlock', 'lock', 'oem_unlock', 'device_locked',
+                             'device_unlocked', 'lock_state', 'secure_boot']
 
-              # ファイルに保存
+          def analyze_fastboot(img_path, name):
+              print(f"[+] Analyzing {name} for Fastboot & Unlock...")
               out_dir = "/tmp/artifacts"
               os.makedirs(out_dir, exist_ok=True)
-              with open(f"{out_dir}/{name}_full_disasm_pdr.txt", "w") as f:
-                  f.write(disasm)
-              with open(f"{out_dir}/{name}_full_disasm_pD.txt", "w") as f:
-                  f.write(disasm_full)
-              with open(f"{out_dir}/{name}_functions.txt", "w") as f:
-                  f.write(funcs)
-              with open(f"{out_dir}/{name}_strings.txt", "w") as f:
-                  f.write(strings)
 
-              # 各関数の逆アセンブルも個別に取得（オプション）
-              func_addrs = []
-              for line in funcs.splitlines():
-                  if 'sym.' in line or 'fcn.' in line:
-                      parts = line.split()
-                      if parts and parts[0].startswith('0x'):
-                          func_addrs.append(parts[0])
-              # 最初の20個だけ取得（全関数だと多すぎるため）
-              for addr in func_addrs[:50]:
-                  r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-                  r2.cmd(f's {addr}')
-                  pdf = r2.cmd('pdf')
-                  r2.quit()
-                  with open(f"{out_dir}/{name}_func_{addr}.txt", "w") as f:
-                      f.write(pdf)
+              r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
+              r2.cmd('aaaa')  # フル解析
 
-              print(f"[+] {name} disassembly complete.")
-              return
+              # 1) 全文字列を取得（JSON形式で）
+              strings_json = r2.cmdj('izzj') if hasattr(r2, 'cmdj') else []
+              if not strings_json:
+                  strings_raw = r2.cmd('izz')
+                  # 簡易パース（実運用ではより堅牢に）
+                  strings_json = []
+                  for line in strings_raw.splitlines():
+                      if line.strip() and '=' in line:
+                          parts = line.split('=', 1)
+                          if len(parts)==2:
+                              addr = parts[0].strip()
+                              s = parts[1].strip()
+                              strings_json.append({'addr': addr, 'string': s})
+
+              fastboot_matches = []
+              unlock_matches = []
+              for entry in strings_json:
+                  s = entry.get('string', '')
+                  addr = entry.get('addr', '')
+                  # 大文字小文字を区別せず検索
+                  lower_s = s.lower()
+                  for kw in FASTBOOT_KEYWORDS:
+                      if kw in lower_s:
+                          fastboot_matches.append({
+                              'addr': addr,
+                              'string': s,
+                              'keyword': kw
+                          })
+                          break
+                  for ukw in UNLOCK_KEYWORDS:
+                      if ukw in lower_s:
+                          unlock_matches.append({
+                              'addr': addr,
+                              'string': s,
+                              'keyword': ukw
+                          })
+                          break
+
+              # 2) 関数一覧を取得
+              funcs_json = r2.cmdj('aflj')
+              if not funcs_json:
+                  # フォールバック: afl テキストを解析
+                  funcs_raw = r2.cmd('afl')
+                  funcs_json = []
+                  for line in funcs_raw.splitlines():
+                      if line.strip() and line.strip().startswith('0x'):
+                          parts = line.split()
+                          if len(parts) >= 2:
+                              funcs_json.append({
+                                  'addr': parts[0],
+                                  'name': parts[1] if len(parts)>1 else '',
+                                  'size': parts[2] if len(parts)>2 else ''
+                              })
+
+              # 3) 各関数の内容をスキャン（Unlock関連に絞る）
+              unlock_functions = []
+              for f in funcs_json:
+                  addr = f.get('addr')
+                  name = f.get('name', '')
+                  if not addr:
+                      continue
+                  # 関数名にunlock/lock関連が含まれるか
+                  if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
+                      r2.cmd(f's {addr}')
+                      # 逆アセンブル取得
+                      pdf = r2.cmd('pdf')
+                      unlock_functions.append({
+                          'addr': addr,
+                          'name': name,
+                          'disasm': pdf
+                      })
+                  else:
+                      # さらに、その関数内でunlock関連文字列を参照しているか調べる（簡易: 文字列参照先から逆引き）
+                      refs = r2.cmdj(f'axtj {addr}') if hasattr(r2, 'cmdj') else []
+                      if refs:
+                          for ref in refs:
+                              ref_str = ref.get('string', '')
+                              if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
+                                  r2.cmd(f's {addr}')
+                                  pdf = r2.cmd('pdf')
+                                  unlock_functions.append({
+                                      'addr': addr,
+                                      'name': name,
+                                      'disasm': pdf,
+                                      'reason': f'References string: {ref_str}'
+                                  })
+                                  break
+
+              # 4) パーティション名の特定（文字列から推測）
+              partition_candidates = []
+              for s in strings_json:
+                  if 'partition' in s['string'].lower():
+                      partition_candidates.append(s['string'])
+                  # よくあるパーティション名（aboot, misc, persist, frp, etc）
+                  for p in ['aboot', 'misc', 'persist', 'frp', 'userdata', 'boot']:
+                      if p in s['string'].lower():
+                          partition_candidates.append(s['string'])
+
+              # 5) レポートの生成
+              report_path = f"{out_dir}/{name}_fastboot_report.md"
+              with open(report_path, 'w') as f:
+                  f.write(f"# Fastboot Analysis Report for {name}\n\n")
+                  f.write("## Fastboot Commands/Keywords Found\n")
+                  if fastboot_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in fastboot_matches[:100]:  # 上限
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No fastboot-related strings found.\n")
+
+                  f.write("\n## Unlock/Lock Related Strings\n")
+                  if unlock_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in unlock_matches[:50]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No unlock-related strings found.\n")
+
+                  f.write("\n## Suspected Functions Handling Unlock\n")
+                  if unlock_functions:
+                      for uf in unlock_functions[:20]:
+                          f.write(f"### Function {uf['name']} at {uf['addr']}\n")
+                          if 'reason' in uf:
+                              f.write(f"Reason: {uf['reason']}\n")
+                          f.write("```asm\n")
+                          f.write(uf['disasm'][:2000])  # 最初の2000文字だけ表示
+                          f.write("\n```\n\n")
+                  else:
+                      f.write("No unlock-related functions identified.\n")
+
+                  f.write("\n## Partition Names Mentioned\n")
+                  if partition_candidates:
+                      for p in set(partition_candidates):
+                          f.write(f"- {p}\n")
+                  else:
+                      f.write("No explicit partition names found in strings.\n")
+
+              # 6) 生データもJSONで保存
+              with open(f"{out_dir}/{name}_fastboot_data.json", 'w') as f:
+                  json.dump({
+                      'fastboot_matches': fastboot_matches,
+                      'unlock_matches': unlock_matches,
+                      'unlock_functions': [{'addr': uf['addr'], 'name': uf['name']} for uf in unlock_functions],
+                      'partition_candidates': list(set(partition_candidates))
+                  }, f, indent=2)
+
+              r2.quit()
+              print(f"[+] Report for {name} generated.")
 
           if __name__ == "__main__":
               if len(sys.argv) < 3:
-                  print("Usage: python3 full_disasm.py <xbl.img> <abl.img>")
+                  print("Usage: python3 analyze_bootloader.py <xbl.img> <abl.img>")
                   sys.exit(1)
-              disassemble_full(sys.argv[1], "xbl")
-              disassemble_full(sys.argv[2], "abl")
-              print("All disassembly files saved to /tmp/artifacts/")
+              analyze_fastboot(sys.argv[1], "xbl")
+              analyze_fastboot(sys.argv[2], "abl")
+              print("[+] All analysis complete. Reports are in /tmp/artifacts/")
           EOF
-          chmod +x /tmp/full_disasm.py
+          chmod +x /tmp/analyze_bootloader.py
 
       # ============================================================
-      # 3. 実行（フル逆アセンブル）
+      # 3. 解析実行
       # ============================================================
-      - name: Execute Full Disassembly
+      - name: Run Advanced Analysis
         run: |
           export PATH="/usr/local/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
-          python3 /tmp/full_disasm.py ./xbl.img ./abl.img
+          python3 /tmp/analyze_bootloader.py ./xbl.img ./abl.img
 
       # ============================================================
-      # 4. 成果物のアップロード（逆アセンブルがメイン）
+      # 4. 成果物のアップロード（従来の逆アセンブル＋解析レポート）
       # ============================================================
-      - name: Upload Disassembly Artifacts
+      - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: qcom_full_disassembly
+          name: qcom_bootloader_analysis
           path: |
-            /tmp/artifacts/xbl_full_disasm_pdr.txt
-            /tmp/artifacts/xbl_full_disasm_pD.txt
-            /tmp/artifacts/xbl_functions.txt
-            /tmp/artifacts/xbl_strings.txt
-            /tmp/artifacts/xbl_func_*.txt
-            /tmp/artifacts/abl_full_disasm_pdr.txt
-            /tmp/artifacts/abl_full_disasm_pD.txt
-            /tmp/artifacts/abl_functions.txt
-            /tmp/artifacts/abl_strings.txt
-            /tmp/artifacts/abl_func_*.txt
+            /tmp/artifacts/*.txt
+            /tmp/artifacts/*.md
+            /tmp/artifacts/*.json
+            /tmp/artifacts/*.html  # もしあれば
           retention-days: 30
           compression-level: 0
 
       - name: Notify Completion
         if: success()
         run: |
-          echo "::notice title=Full Disassembly Complete::All disassembly files uploaded. Check the artifacts."
+          echo "::notice title=Bootloader Analysis Complete::Reports and disassembly artifacts uploaded."
