@@ -56,14 +56,12 @@ jobs:
             default-jdk-headless
           apt-get clean
 
-          # ---- Radare2 をソースからビルド（apt にはないため） ----
+          # ---- Radare2 をソースからビルド ----
           git clone --depth 1 https://github.com/radareorg/radare2
           cd radare2
           ./sys/install.sh
           cd ..
           rm -rf radare2
-
-          # r2dec / r2ghidra は必要に応じて r2pm で後付け可能（ここではスキップ）
 
       - name: Install Python Multi-Arch Analysis Libraries
         run: |
@@ -75,15 +73,32 @@ jobs:
             jinja2 markdown \
             numpy pandas
 
-      # ---- Ghidra Headless のセットアップ（変更なし） ----
+      # ---- Ghidra Headless（API で最新取得） ----
       - name: Setup Ghidra Headless
         run: |
+          apt-get update -y
+          apt-get install -y jq curl
+
           mkdir -p /opt/ghidra
           cd /opt/ghidra
-          wget https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2_build/ghidra_11.2_PUBLIC_20241122.zip
-          unzip ghidra_11.2_PUBLIC_20241122.zip
-          mv ghidra_11.2_PUBLIC/* .
-          rm -rf ghidra_11.2_PUBLIC ghidra_11.2_PUBLIC_20241122.zip
+
+          LATEST_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url')
+          if [ -z "$LATEST_URL" ]; then
+            echo "Failed to get latest Ghidra release URL"
+            exit 1
+          fi
+
+          echo "Downloading $LATEST_URL"
+          wget "$LATEST_URL"
+          ZIP_FILE=$(basename "$LATEST_URL")
+
+          unzip "$ZIP_FILE"
+          EXTRACT_DIR=$(unzip -l "$ZIP_FILE" | head -n 4 | tail -n 1 | awk '{print $4}' | sed 's/\/$//')
+          echo "Extracted directory: $EXTRACT_DIR"
+
+          mv "$EXTRACT_DIR"/* .
+          rm -rf "$EXTRACT_DIR" "$ZIP_FILE"
+
           echo "export PATH=/opt/ghidra/support:\$PATH" >> /etc/bash.bashrc
 
       # ============================================================
@@ -243,7 +258,6 @@ jobs:
 
               def run_ghidra_headless(self, img_path, name):
                   print(f"[+] Ghidra Headless processing {name}")
-                  ghidra_project = f"/tmp/ghidra_{name}"
                   ghidra_out = f"{self.output_dir}/{name}_ghidra"
                   os.makedirs(ghidra_out, exist_ok=True)
                   cmd = (
