@@ -26,20 +26,18 @@ jobs:
       options: --privileged
 
     steps:
-      # ---- Git を先にインストール（checkout 前に必須） ----
       - name: Install Git (for checkout)
         run: |
           apt-get update -y
           apt-get install -y git
 
-      # ---- Checkout（submodules は不使用） ----
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # ============================================================
-      # 1. 多角的解析ツールチェーンのインストール（修正版）
+      # 1. ツールチェーン（Radare2 も PATH 付きでインストール）
       # ============================================================
       - name: Install Full Toolchain (Static & Dynamic)
         run: |
@@ -56,12 +54,18 @@ jobs:
             default-jdk-headless
           apt-get clean
 
-          # ---- Radare2 をソースからビルド ----
+          # Radare2 のビルド（/usr/local/bin にインストール）
           git clone --depth 1 https://github.com/radareorg/radare2
           cd radare2
           ./sys/install.sh
           cd ..
           rm -rf radare2
+
+          # PATH に /usr/local/bin を追加（GitHub Actions 用）
+          echo "/usr/local/bin" >> $GITHUB_PATH
+          # 現在のシェルでも有効にする
+          export PATH="/usr/local/bin:$PATH"
+          r2 -v   # バージョン表示でインストール確認
 
       - name: Install Python Multi-Arch Analysis Libraries
         run: |
@@ -88,21 +92,17 @@ jobs:
             exit 1
           fi
 
-          echo "Downloading $LATEST_URL"
           wget "$LATEST_URL"
           ZIP_FILE=$(basename "$LATEST_URL")
-
           unzip "$ZIP_FILE"
           EXTRACT_DIR=$(unzip -l "$ZIP_FILE" | head -n 4 | tail -n 1 | awk '{print $4}' | sed 's/\/$//')
-          echo "Extracted directory: $EXTRACT_DIR"
-
           mv "$EXTRACT_DIR"/* .
           rm -rf "$EXTRACT_DIR" "$ZIP_FILE"
 
           echo "export PATH=/opt/ghidra/support:\$PATH" >> /etc/bash.bashrc
 
       # ============================================================
-      # 2. 解析スクリプト（前回と同一）
+      # 2. 解析スクリプト（PATH を Python 内でも設定）
       # ============================================================
       - name: Create Multi-Angle Analyzer Script
         run: |
@@ -119,6 +119,9 @@ jobs:
           from capstone import *
           from capstone.arm import *
           from collections import defaultdict
+
+          # ---- Radare2 が確実に見つかるように PATH を設定 ----
+          os.environ['PATH'] = "/usr/local/bin:" + os.environ.get('PATH', '')
 
           # 調査対象パーティション (FRPを意図的に除外)
           TARGET_PARTITIONS = [
@@ -375,11 +378,12 @@ jobs:
           chmod +x /tmp/qcom_analyzer.py
 
       # ============================================================
-      # 3. 実行
+      # 3. 実行（PATH を明示指定）
       # ============================================================
       - name: Execute Reversible Analysis
         id: analysis
         run: |
+          export PATH="/usr/local/bin:$PATH"
           python3 /tmp/qcom_analyzer.py ./xbl.img ./abl.img
 
       # ============================================================
