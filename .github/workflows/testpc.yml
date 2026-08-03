@@ -13,23 +13,21 @@ on:
         default: 'false'
 
 env:
-  # QCOM固有の解析深度フラグ
   ANALYZE_SECBOOT: true
   ANALYZE_FASTBOOT: true
-  ANALYZE_FRP_EXCLUSION: true  # FRP以外のパーティションにフォーカス
+  ANALYZE_FRP_EXCLUSION: true
   GHIDRA_INSTALL_DIR: /opt/ghidra
 
 jobs:
   reversible-analysis:
     runs-on: ubuntu-latest
-    # 完全な逆コンパイル環境を用意
     container:
       image: ubuntu:22.04
       options: --privileged
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
         with:
           fetch-depth: 0
           submodules: recursive
