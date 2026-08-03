@@ -37,7 +37,7 @@ jobs:
           fetch-depth: 0
 
       # ============================================================
-      # 1. ツールチェーン（Radare2 も PATH 付きでインストール）
+      # 1. ツールチェーン（Radare2 は make でビルド）
       # ============================================================
       - name: Install Full Toolchain (Static & Dynamic)
         run: |
@@ -54,18 +54,21 @@ jobs:
             default-jdk-headless
           apt-get clean
 
-          # Radare2 のビルド（/usr/local/bin にインストール）
+          # Radare2 のビルドとインストール（make を使用）
           git clone --depth 1 https://github.com/radareorg/radare2
           cd radare2
-          ./sys/install.sh
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          make install
           cd ..
           rm -rf radare2
 
-          # PATH に /usr/local/bin を追加（GitHub Actions 用）
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          # 現在のシェルでも有効にする
+          # PATH に /usr/local/bin を追加
           export PATH="/usr/local/bin:$PATH"
-          r2 -v   # バージョン表示でインストール確認
+          echo "/usr/local/bin" >> $GITHUB_PATH
+
+          # 動作確認
+          r2 -v
 
       - name: Install Python Multi-Arch Analysis Libraries
         run: |
@@ -102,7 +105,7 @@ jobs:
           echo "export PATH=/opt/ghidra/support:\$PATH" >> /etc/bash.bashrc
 
       # ============================================================
-      # 2. 解析スクリプト（PATH を Python 内でも設定）
+      # 2. 解析スクリプト（Python 内でも PATH 設定）
       # ============================================================
       - name: Create Multi-Angle Analyzer Script
         run: |
@@ -378,7 +381,7 @@ jobs:
           chmod +x /tmp/qcom_analyzer.py
 
       # ============================================================
-      # 3. 実行（PATH を明示指定）
+      # 3. 実行（PATH を明示）
       # ============================================================
       - name: Execute Reversible Analysis
         id: analysis
