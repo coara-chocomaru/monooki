@@ -26,18 +26,20 @@ jobs:
       options: --privileged
 
     steps:
+      # ---- Git を先にインストール（checkout 前に必須） ----
       - name: Install Git (for checkout)
         run: |
           apt-get update -y
           apt-get install -y git
 
+      # ---- Checkout（submodules は不使用） ----
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # ============================================================
-      # 1. ツールチェーン（Radare2 は make でビルド）
+      # 1. 多角的解析ツールチェーンのインストール（修正版）
       # ============================================================
       - name: Install Full Toolchain (Static & Dynamic)
         run: |
@@ -54,7 +56,7 @@ jobs:
             default-jdk-headless
           apt-get clean
 
-          # Radare2 のビルドとインストール（make を使用）
+          # ---- Radare2 をソースからビルド（make install） ----
           git clone --depth 1 https://github.com/radareorg/radare2
           cd radare2
           ./configure --prefix=/usr/local
@@ -63,11 +65,14 @@ jobs:
           cd ..
           rm -rf radare2
 
-          # PATH に /usr/local/bin を追加
+          # ★ 共有ライブラリのキャッシュを更新（libr_util.so が見つかるように）
+          ldconfig
+
+          # PATH を通す（現在のシェルと後続ステップ用）
           export PATH="/usr/local/bin:$PATH"
           echo "/usr/local/bin" >> $GITHUB_PATH
 
-          # 動作確認
+          # 動作確認（これで r2 が正しく動くはず）
           r2 -v
 
       - name: Install Python Multi-Arch Analysis Libraries
@@ -80,7 +85,7 @@ jobs:
             jinja2 markdown \
             numpy pandas
 
-      # ---- Ghidra Headless（API で最新取得） ----
+      # ---- Ghidra Headless（API で最新リリースを動的に取得） ----
       - name: Setup Ghidra Headless
         run: |
           apt-get update -y
@@ -89,23 +94,30 @@ jobs:
           mkdir -p /opt/ghidra
           cd /opt/ghidra
 
+          # 最新リリースの ZIP アセット URL を取得
           LATEST_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url')
           if [ -z "$LATEST_URL" ]; then
             echo "Failed to get latest Ghidra release URL"
             exit 1
           fi
 
+          echo "Downloading $LATEST_URL"
           wget "$LATEST_URL"
           ZIP_FILE=$(basename "$LATEST_URL")
+
           unzip "$ZIP_FILE"
+          # 解凍されたディレクトリ名を自動検出
           EXTRACT_DIR=$(unzip -l "$ZIP_FILE" | head -n 4 | tail -n 1 | awk '{print $4}' | sed 's/\/$//')
+          echo "Extracted directory: $EXTRACT_DIR"
+
+          # 中身を /opt/ghidra 直下に移動
           mv "$EXTRACT_DIR"/* .
           rm -rf "$EXTRACT_DIR" "$ZIP_FILE"
 
           echo "export PATH=/opt/ghidra/support:\$PATH" >> /etc/bash.bashrc
 
       # ============================================================
-      # 2. 解析スクリプト（Python 内でも PATH 設定）
+      # 2. 解析スクリプト（Python）の作成
       # ============================================================
       - name: Create Multi-Angle Analyzer Script
         run: |
@@ -125,6 +137,8 @@ jobs:
 
           # ---- Radare2 が確実に見つかるように PATH を設定 ----
           os.environ['PATH'] = "/usr/local/bin:" + os.environ.get('PATH', '')
+          # 共有ライブラリのパスも明示
+          os.environ['LD_LIBRARY_PATH'] = "/usr/local/lib:" + os.environ.get('LD_LIBRARY_PATH', '')
 
           # 調査対象パーティション (FRPを意図的に除外)
           TARGET_PARTITIONS = [
@@ -381,12 +395,13 @@ jobs:
           chmod +x /tmp/qcom_analyzer.py
 
       # ============================================================
-      # 3. 実行（PATH を明示）
+      # 3. 解析の実行（PATH とライブラリパスを明示）
       # ============================================================
       - name: Execute Reversible Analysis
         id: analysis
         run: |
           export PATH="/usr/local/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
           python3 /tmp/qcom_analyzer.py ./xbl.img ./abl.img
 
       # ============================================================
