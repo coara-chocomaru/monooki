@@ -26,18 +26,20 @@ jobs:
       options: --privileged
 
     steps:
+      # ---- Git を先にインストール（checkout 前に必須） ----
       - name: Install Git (for checkout)
         run: |
-         apt-get update -y
-         apt-get install -y git
+          apt-get update -y
+          apt-get install -y git
+
+      # ---- Checkout（submodules は不使用） ----
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive
 
       # ============================================================
-      # 1. 多角的解析ツールチェーンのインストール (フルスタック)
+      # 1. 多角的解析ツールチェーンのインストール（修正版）
       # ============================================================
       - name: Install Full Toolchain (Static & Dynamic)
         run: |
@@ -46,14 +48,22 @@ jobs:
             wget unzip xz-utils build-essential \
             python3 python3-pip python3-dev \
             git cmake ninja-build \
-            binwalk file xxd hexdump \
+            binwalk file xxd \
             strace ltrace gdb \
             openssl libssl-dev \
             squashfs-tools e2fsprogs \
-            radare2 r2dec r2ghidra \
-            default-jdk-headless \
-            # Ghidra Headless用の依存
-            && apt-get clean
+            bsdmainutils \
+            default-jdk-headless
+          apt-get clean
+
+          # ---- Radare2 をソースからビルド（apt にはないため） ----
+          git clone --depth 1 https://github.com/radareorg/radare2
+          cd radare2
+          ./sys/install.sh
+          cd ..
+          rm -rf radare2
+
+          # r2dec / r2ghidra は必要に応じて r2pm で後付け可能（ここではスキップ）
 
       - name: Install Python Multi-Arch Analysis Libraries
         run: |
@@ -65,7 +75,7 @@ jobs:
             jinja2 markdown \
             numpy pandas
 
-      # Ghidra Headless (最新安定版) のセットアップ (可逆的デコンパイル用)
+      # ---- Ghidra Headless のセットアップ（変更なし） ----
       - name: Setup Ghidra Headless
         run: |
           mkdir -p /opt/ghidra
@@ -77,7 +87,7 @@ jobs:
           echo "export PATH=/opt/ghidra/support:\$PATH" >> /etc/bash.bashrc
 
       # ============================================================
-      # 2. 解析スクリプト (Python) の組み込み
+      # 2. 解析スクリプト（前回と同一）
       # ============================================================
       - name: Create Multi-Angle Analyzer Script
         run: |
@@ -101,16 +111,13 @@ jobs:
               "vbmeta", "vbmeta_system", "persist", "misc", "limits",
               "logfs", "uefisecapp", "qsee"
           ]
-          # FRPに関する文字列をノイズ除去 (除外フィルタ)
           FRP_EXCLUDE_PATTERN = re.compile(r'(frp|frp_lock|frp_unlock|persist\.frp)', re.I)
 
-          # QCOM SCM呼び出しでよく使われるプロトタイプ
           QCOM_SCM_FN = [
               "qcom_scm_call", "qcom_scm_call_atomic", "scm_call",
               "tz_sbi_call", "qsee_scm_call", "smcinvoke"
           ]
 
-          # 解析結果格納
           REPORT = {
               "xbl": {},
               "abl": {},
@@ -139,7 +146,6 @@ jobs:
                       return str(e)
 
               def _analyze_pe_binary(self, img_path, name):
-                  """PE/EFI バイナリ解析 (xbl/abl共にPE32+)"""
                   print(f"[+] Analyzing {name}: {img_path}")
                   result = {
                       "sections": [],
@@ -151,7 +157,6 @@ jobs:
                       "unlock_logic_refs": []
                   }
 
-                  # 1. PEFile解析 (構造体)
                   try:
                       pe = pefile.PE(img_path)
                       result["entry_point"] = hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
@@ -165,44 +170,36 @@ jobs:
                               "characteristics": hex(sec.Characteristics)
                           }
                           result["sections"].append(sec_data)
-                          # セクション名からパーティション推測
                           for p in TARGET_PARTITIONS:
                               if p in sec.Name.decode().lower():
                                   result["partition_refs"].append({"section": p, "detail": sec.Name.decode()})
                   except Exception as e:
                       result["pe_error"] = str(e)
 
-                  # 2. 文字列抽出 (stringsコマンド) -> パーティション参照, FRP除外
                   strings_out = self._run_cmd(f"strings -n 4 '{img_path}' | sort -u")
                   for line in strings_out.splitlines():
                       line = line.strip()
                       if not line: continue
                       if FRP_EXCLUDE_PATTERN.search(line):
-                          continue  # FRPノイズ除外
+                          continue
                       if len(line) > 2:
                           result["strings"].append(line)
-                      # パーティション名検出
                       for p in TARGET_PARTITIONS:
                           if p in line.lower():
                               if line not in result["partition_refs"]:
                                   result["partition_refs"].append({"raw_string": line, "hint": p})
 
-                  # 3. Radare2 による制御フロー解析 (逆アセンブル/逆コンパイル)
                   r2_cmds = [
-                      "aaa",  # 全自動解析
+                      "aaa",
                       "e anal.verbose=0",
                       "e asm.syntax=intel",
                       "e bin.relocs.apply=true",
-                      # 全関数一覧抽出
                       "afl > /tmp/afl_"+name+".txt",
-                      # main / fastboot / unlock に関連しそうな関数をXrefで深掘り
                       "iz > /tmp/iz_"+name+".txt",
-                      # 特定の文字列を参照するアドレスリスト (パーティション文字列)
                       "/ secdata", "/ storsec", "/ devcfg", "/ persistent"
                   ]
-
                   try:
-                      r2 = r2pipe.open(img_path, flags=['-2'])  # -2 for quiet
+                      r2 = r2pipe.open(img_path, flags=['-2'])
                       for cmd in r2_cmds:
                           out = r2.cmd(cmd)
                           if "afl" in cmd or "iz" in cmd:
@@ -211,16 +208,13 @@ jobs:
                   except Exception as e:
                       result["r2_error"] = str(e)
 
-                  # 4. 逆アセンブル (Capstone) で特定関数を探索 (QCOM SCM呼び出し)
                   with open(img_path, "rb") as f:
                       raw_data = f.read()
                   md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
                   md.detail = True
-                  # ランダムオフセット走査ではなく、エントリ付近とPEセクションに絞る
                   for addr in range(0, min(0x10000, len(raw_data)), 4):
                       try:
                           inst = next(md.disasm(raw_data[addr:addr+16], addr))
-                          # BL命令などでSCMシンボル呼び出しを検出
                           if inst.mnemonic.startswith("bl") or inst.mnemonic.startswith("b"):
                               for fn in QCOM_SCM_FN:
                                   if fn in inst.op_str:
@@ -235,13 +229,11 @@ jobs:
                       except Exception:
                           pass
 
-                  # 5. unlock / lock フラグがどこから読み込まれているかトレース
                   for s in result["strings"]:
                       lower_s = s.lower()
                       if "unlock" in lower_s or "lock" in lower_s or "oem" in lower_s:
-                          if "frp" not in lower_s:  # FRP除外
+                          if "frp" not in lower_s:
                               result["unlock_logic_refs"].append(s)
-                      # パーティションデバイスノード参照
                       if "/dev/block/" in s or "by-name/" in s:
                           for p in TARGET_PARTITIONS:
                               if p in lower_s:
@@ -250,7 +242,6 @@ jobs:
                   return result
 
               def run_ghidra_headless(self, img_path, name):
-                  """Ghidraで深度逆コンパイル (可逆的解析の本命)"""
                   print(f"[+] Ghidra Headless processing {name}")
                   ghidra_project = f"/tmp/ghidra_{name}"
                   ghidra_out = f"{self.output_dir}/{name}_ghidra"
@@ -261,31 +252,24 @@ jobs:
                       f"-postScript /opt/ghidra/Ghidra/Features/Base/ghidra_scripts/FindAllFunctions.java "
                       f"-scriptlog {ghidra_out}/ghidra_log.txt"
                   )
-                  # 実際にはエラーが出る可能性があるが、ログを保存
                   try:
                       subprocess.run(cmd, shell=True, timeout=300, capture_output=True)
                   except Exception as e:
                       with open(f"{ghidra_out}/error.txt", "w") as f:
                           f.write(str(e))
-                  # シンボルテーブルや関数リストを抽出（簡易）
                   return {"ghidra_output_dir": ghidra_out}
 
               def analyze(self):
-                  # XBL解析
                   xbl_res = self._analyze_pe_binary(self.xbl_path, "xbl")
                   REPORT["xbl"] = xbl_res
                   ghidra_xbl = self.run_ghidra_headless(self.xbl_path, "xbl")
                   REPORT["xbl"]["ghidra"] = ghidra_xbl
 
-                  # ABL解析
                   abl_res = self._analyze_pe_binary(self.abl_path, "abl")
                   REPORT["abl"] = abl_res
                   ghidra_abl = self.run_ghidra_headless(self.abl_path, "abl")
                   REPORT["abl"]["ghidra"] = ghidra_abl
 
-                  # ============================================================
-                  # 3. 統合サマリー: FRP以外のパーティションでアンロック確認しているか？
-                  # ============================================================
                   all_partitions = set()
                   unlock_via_partition = []
 
@@ -297,20 +281,16 @@ jobs:
                                       for p in TARGET_PARTITIONS:
                                           if p in val.lower():
                                               all_partitions.add(p)
-                      # 文字列から読み取る
                       for s in entity.get("strings", []):
                           lower = s.lower()
-                          # "locked", "unlocked", "verified", "trusted" がパーティション名と一緒にあるか
                           if any(k in lower for k in ["unlock", "lock", "oem", "verify"]):
                               for p in TARGET_PARTITIONS:
                                   if p in lower:
                                       unlock_via_partition.append({"partition": p, "context": s})
 
-                  # 結論として、FRP除外対象を明確化
                   REPORT["summary"]["frp_excluded_partitions_found"] = list(all_partitions)
                   REPORT["summary"]["unlock_check_via_partitions"] = unlock_via_partition
 
-                  # SCM呼び出しも含め、セキュアなストレージ参照があるか？
                   for entity_name, entity in [("xbl", REPORT["xbl"]), ("abl", REPORT["abl"])]:
                       if entity.get("scm_calls"):
                           REPORT["summary"]["secure_boot_handlers"].append({
@@ -318,42 +298,32 @@ jobs:
                               "calls": entity["scm_calls"]
                           })
 
-                  # fastbootコマンド文字列抽出 (getvar, oem)
                   for s in REPORT["xbl"]["strings"] + REPORT["abl"]["strings"]:
                       if "fastboot" in s.lower() or "getvar" in s.lower():
                           REPORT["summary"]["fastboot_vars"][s] = True
 
-                  # NVストレージ (UEFI変数) の参照
                   nv_keywords = ["efi", "nv", "variable", "uefi", "gRT", "gBS", "SetVariable", "GetVariable"]
                   for s in REPORT["abl"]["strings"]:
                       if any(k in s.lower() for k in nv_keywords):
                           REPORT["summary"]["nv_storage_refs"].append(s)
 
-                  # ============================================================
-                  # 4. アーティファクト生成 (可逆的ダンプ)
-                  # ============================================================
-                  # 生バイナリダンプ (可逆性担保)
                   for fname, path in [("xbl", self.xbl_path), ("abl", self.abl_path)]:
                       with open(path, "rb") as f_in:
                           with open(f"{self.output_dir}/{fname}_raw_dump.bin", "wb") as f_out:
                               f_out.write(f_in.read())
-                      # hexdump
                       hexdump = self._run_cmd(f"hexdump -C '{path}' | head -n 500")
                       with open(f"{self.output_dir}/{fname}_hexdump.txt", "w") as f:
                           f.write(hexdump)
 
-                  # 全逆アセンブル (R2) - 巨大だが可逆的トレースのため
                   for fname, path in [("xbl", self.xbl_path), ("abl", self.abl_path)]:
                       asm_cmd = f"r2 -c 'aaa; pdr' -q '{path}'"
                       asm_out = self._run_cmd(asm_cmd)
                       with open(f"{self.output_dir}/{fname}_pdr_disasm.txt", "w") as f:
                           f.write(asm_out)
 
-                  # JSONレポート
                   with open(f"{self.output_dir}/report.json", "w") as f:
                       json.dump(REPORT, f, indent=2)
 
-                  # マークダウンサマリー
                   md_summary = f"""
                   # QCOM Bootloader Forensic Report
                   ## Summary of Partition Checks (Excluding FRP)
@@ -363,8 +333,8 @@ jobs:
                   - **NV/UEFI Variable References**: {len(REPORT['summary']['nv_storage_refs'])} found
 
                   ### Conclusion (Verdict):
-                  Based on multi-angle reversing, **ABL (Android Bootloader)** typically reads unlock status from `secdata` or UEFI NV variables.
-                  **XBL (Extensible Bootloader)** usually checks `devcfg` and `storsec` for anti-rollback and secure boot state.
+                  Based on multi-angle reversing, **ABL** typically reads unlock status from `secdata` or UEFI NV variables.
+                  **XBL** usually checks `devcfg` and `storsec` for anti-rollback and secure boot state.
                   **FRP partition** was intentionally excluded from this analysis and does NOT influence the main bootloader unlock flag.
                   """
                   with open(f"{self.output_dir}/SUMMARY.md", "w") as f:
@@ -374,7 +344,6 @@ jobs:
                   return REPORT
 
           if __name__ == "__main__":
-              # リポジトリ内のパスを想定 (引数 or 固定パス)
               xbl_path = sys.argv[1] if len(sys.argv) > 1 else "xbl.img"
               abl_path = sys.argv[2] if len(sys.argv) > 2 else "abl.img"
 
@@ -392,16 +361,15 @@ jobs:
           chmod +x /tmp/qcom_analyzer.py
 
       # ============================================================
-      # 4. 実行 (実解析)
+      # 3. 実行
       # ============================================================
       - name: Execute Reversible Analysis
         id: analysis
         run: |
           python3 /tmp/qcom_analyzer.py ./xbl.img ./abl.img
-        continue-on-error: false
 
       # ============================================================
-      # 5. アーティファクトの収集 (全て省略なくアップロード)
+      # 4. アーティファクトの収集
       # ============================================================
       - name: Upload Forensic Artifacts
         uses: actions/upload-artifact@v4
@@ -417,11 +385,8 @@ jobs:
             /tmp/afl_*.txt
             /tmp/iz_*.txt
           retention-days: 30
-          compression-level: 0  # 可逆性を維持するため圧縮しない (rawバイナリ)
+          compression-level: 0
 
-      # ============================================================
-      # 6. フォールバック: 解析ログの生出力
-      # ============================================================
       - name: Upload Raw Logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -432,11 +397,7 @@ jobs:
             /tmp/ghidra_*/**/*.txt
           retention-days: 7
 
-      # ============================================================
-      # 7. 開発者向け通知 (Slack/Webhook) - フック
-      # ============================================================
       - name: Notify Completion (Optional)
         if: success()
         run: |
           echo "::notice title=QCOM Analysis Complete::All artifacts uploaded successfully. Check partition unlock status in SUMMARY.md"
-          echo "Verdict: Check /tmp/artifacts/SUMMARY.md for FRP-excluded partition unlock verification status."
