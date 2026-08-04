@@ -10,7 +10,6 @@ on:
 
 env:
   AVBTOOL_BRANCH: 'android12-release'
-  LPUNPACK_REPO: 'https://github.com/LonelyFool/lpunpack_and_lpmake'
 
 jobs:
   analyze:
@@ -29,18 +28,13 @@ jobs:
       - name: Prepare environment
         run: |
           sudo apt update
-          sudo apt -y install python3 python3-pip xxd curl unzip git android-sdk-libsparse-utils
-          mkdir -p work/download work/extracted work/super_unpacked work/logs
+          sudo apt -y install python3 python3-pip xxd curl unzip git
+          mkdir -p work/download work/extracted work/logs
 
       - name: Clone avbtool (AVB 1.2.0 / android12-release)
         run: |
           git clone --depth 1 --branch ${{ env.AVBTOOL_BRANCH }} \
             https://android.googlesource.com/platform/external/avb avb
-
-      - name: Clone lpunpack_and_lpmake
-        run: |
-          git clone --depth 1 ${{ env.LPUNPACK_REPO }} lpunpack_and_lpmake
-          find lpunpack_and_lpmake -iname "lpunpack" -exec chmod +x {} \;
 
       - name: Download firmware ZIP
         working-directory: work/download
@@ -53,33 +47,9 @@ jobs:
           unzip -o work/download/firmware.zip -d work/extracted
           find work/extracted -maxdepth 4 -type f -iname "*.img" | sort
 
-      - name: Locate and unpack super.img
+      - name: Thorough AVB analysis for target partitions
         run: |
-          SUPER_IMG=$(find work/extracted -iname "super.img" | head -1)
-          if [ -z "$SUPER_IMG" ]; then
-            echo "super.img not found in firmware ZIP"
-            exit 0
-          fi
-          echo "Found super.img: $SUPER_IMG"
-          MAGIC=$(xxd -p -l 4 "$SUPER_IMG")
-          if [ "$MAGIC" == "3aff26ed" ]; then
-            echo "super.img is sparse, converting to raw..."
-            simg2img "$SUPER_IMG" work/super_unpacked/super.raw.img
-            SUPER_RAW="work/super_unpacked/super.raw.img"
-          else
-            SUPER_RAW="$SUPER_IMG"
-          fi
-          LPUNPACK_BIN=$(find lpunpack_and_lpmake -iname "lpunpack" -type f | head -1)
-          if [ -z "$LPUNPACK_BIN" ]; then
-            echo "lpunpack binary not found"
-            exit 0
-          fi
-          "$LPUNPACK_BIN" "$SUPER_RAW" work/super_unpacked || true
-          find work/super_unpacked -type f -iname "*.img" | sort
-
-      - name: Analyze all partitions
-        run: |
-          PARTITIONS="vendor_boot init_boot boot system product vendor vendor_dlkm odm_dlkm odm vbmeta vbmeta_system vbmeta_vendor"
+          PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
           {
             echo "=== AVB Full Analysis Summary ==="
             echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -87,52 +57,78 @@ jobs:
           } > work/logs/all_summary.log
 
           for NAME in $PARTITIONS; do
-            IMG_PATH=$(find work/extracted -maxdepth 6 -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
-            if [ -z "$IMG_PATH" ]; then
-              IMG_PATH=$(find work/super_unpacked -maxdepth 2 -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
-            fi
-
+            IMG_PATH=$(find work/extracted -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
             LOG_FILE="work/logs/${NAME}_info.log"
+            VERIFY_LOG="work/logs/${NAME}_verify.log"
+            EXTRACT_LOG="work/logs/${NAME}_extract.log"
 
             if [ -z "$IMG_PATH" ]; then
               echo "${NAME}.img not found" > "$LOG_FILE"
+              echo "${NAME}.img not found" > "$VERIFY_LOG"
+              echo "${NAME}.img not found" > "$EXTRACT_LOG"
             else
               echo "Analyzing: $IMG_PATH"
-              {
-                echo "=== $NAME ($IMG_PATH) ==="
-                python3 avb/avbtool.py info_image --image "$IMG_PATH" 2>&1
-              } > "$LOG_FILE" || true
-            fi
 
-            {
-              echo "----- $NAME -----"
-              cat "$LOG_FILE"
-              echo ""
-            } >> work/logs/all_summary.log
+              # 1) info_image:  vbmeta 形式の場合のみ実行（エラー時はスキップ）
+              if python3 avb/avbtool.py info_image --image "$IMG_PATH" > "$LOG_FILE" 2>&1; then
+                INFO_OK=true
+              else
+                if grep -q "does not look like a vbmeta image" "$LOG_FILE"; then
+                  echo "Skipping info_image: not a vbmeta image (expected for dtbo, etc.)" > "$LOG_FILE"
+                  INFO_OK=false
+                else
+                  INFO_OK=false  # 他のエラーはそのまま残す
+                fi
+              fi
+
+              # 2) verify_image: フッタ付きイメージの検証・情報表示
+              {
+                echo "=== verify_image ==="
+                python3 avb/avbtool.py verify_image --image "$IMG_PATH" 2>&1
+              } > "$VERIFY_LOG" || true
+
+              # 3) extract_vbmeta: フッタを抽出し、抽出後は info_image で解析
+              {
+                echo "=== extract_vbmeta ==="
+                python3 avb/avbtool.py extract_vbmeta --image "$IMG_PATH" --output work/logs/${NAME}_vbmeta.blob 2>&1
+                if [ -f "work/logs/${NAME}_vbmeta.blob" ]; then
+                  echo "vbmeta footer extracted (size: $(stat -c%s work/logs/${NAME}_vbmeta.blob) bytes)"
+                  echo "--- info_image on extracted vbmeta ---"
+                  python3 avb/avbtool.py info_image --image work/logs/${NAME}_vbmeta.blob 2>&1
+                else
+                  echo "No vbmeta footer found or extraction failed"
+                fi
+              } > "$EXTRACT_LOG" || true
+
+              # サマリログに追記（info は成功時のみ、それ以外は verify と extract を中心に）
+              {
+                echo "----- $NAME -----"
+                if [ "$INFO_OK" = true ]; then
+                  echo "=== info_image ==="
+                  cat "$LOG_FILE"
+                  echo ""
+                else
+                  echo "=== info_image skipped (not a vbmeta image) ==="
+                  echo ""
+                fi
+                echo "=== verify_image ==="
+                cat "$VERIFY_LOG"
+                echo ""
+                echo "=== extract_vbmeta ==="
+                cat "$EXTRACT_LOG"
+                echo ""
+              } >> work/logs/all_summary.log
+            fi
           done
 
           cat work/logs/all_summary.log
-
-      - name: Analyze super.img itself
-        run: |
-          SUPER_IMG=$(find work/extracted -iname "super.img" | head -1)
-          LOG_FILE="work/logs/super_info.log"
-          if [ -z "$SUPER_IMG" ]; then
-            echo "super.img not found" > "$LOG_FILE"
-          else
-            {
-              echo "=== super ($SUPER_IMG) ==="
-              python3 avb/avbtool.py info_image --image "$SUPER_IMG" 2>&1
-            } > "$LOG_FILE" || true
-          fi
-          cat "$LOG_FILE"
 
       - name: Extract public key and chain summary
         run: |
           {
             echo "=== Public Key / Chain Partition Summary ==="
-            for LOG in work/logs/*_info.log; do
-              NAME=$(basename "$LOG" _info.log)
+            for LOG in work/logs/*_verify.log; do
+              NAME=$(basename "$LOG" _verify.log)
               echo ""
               echo "### $NAME ###"
               grep -E "Public key|Algorithm|Rollback Index|Release String|Chain Partition|Partition Name|Flags" "$LOG" || echo "no data"
@@ -144,8 +140,8 @@ jobs:
         run: |
           {
             echo "=== Descriptor Summary (all partitions) ==="
-            for LOG in work/logs/*_info.log; do
-              NAME=$(basename "$LOG" _info.log)
+            for LOG in work/logs/*_verify.log; do
+              NAME=$(basename "$LOG" _verify.log)
               echo ""
               echo "### $NAME ###"
               grep -E "Descriptor|Hash Algorithm|Image Size|Tree Size|FEC num roots|FEC size|Root Digest|Digest|Salt" "$LOG" || echo "no data"
@@ -153,10 +149,11 @@ jobs:
           } > work/logs/descriptor_summary_all.log
           cat work/logs/descriptor_summary_all.log
 
-      - name: Hexdump headers
+      - name: Hexdump headers of each partition
         run: |
-          for NAME in vendor_boot init_boot boot system product vendor vendor_dlkm odm_dlkm odm super vbmeta vbmeta_system vbmeta_vendor; do
-            IMG_PATH=$(find work/extracted work/super_unpacked -maxdepth 6 -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
+          PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
+          for NAME in $PARTITIONS; do
+            IMG_PATH=$(find work/extracted -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
             if [ -n "$IMG_PATH" ]; then
               xxd "$IMG_PATH" | head -30 > "work/logs/${NAME}_hexdump.log"
             fi
