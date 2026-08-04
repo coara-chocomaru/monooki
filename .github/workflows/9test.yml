@@ -47,9 +47,8 @@ jobs:
           unzip -o work/download/firmware.zip -d work/extracted
           find work/extracted -maxdepth 4 -type f -iname "*.img" | sort
 
-      - name: Analyze target partitions
+      - name: Thorough AVB analysis for target partitions
         run: |
-          # 解析対象パーティション（拡張子なしのベース名）
           PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
           {
             echo "=== AVB Full Analysis Summary ==="
@@ -58,37 +57,78 @@ jobs:
           } > work/logs/all_summary.log
 
           for NAME in $PARTITIONS; do
-            # 大文字小文字を区別せず、ZIP内の任意のディレクトリから対象ファイルを検索
             IMG_PATH=$(find work/extracted -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
             LOG_FILE="work/logs/${NAME}_info.log"
+            VERIFY_LOG="work/logs/${NAME}_verify.log"
+            EXTRACT_LOG="work/logs/${NAME}_extract.log"
 
             if [ -z "$IMG_PATH" ]; then
-              echo "${NAME}.img が見つかりませんでした" > "$LOG_FILE"
+              echo "${NAME}.img not found" > "$LOG_FILE"
+              echo "${NAME}.img not found" > "$VERIFY_LOG"
+              echo "${NAME}.img not found" > "$EXTRACT_LOG"
             else
-              echo "解析中: $IMG_PATH"
-              {
-                echo "=== $NAME ($IMG_PATH) ==="
-                # avbtool info_image で詳細情報を出力
-                python3 avb/avbtool.py info_image --image "$IMG_PATH" 2>&1
-              } > "$LOG_FILE" || true
-            fi
+              echo "Analyzing: $IMG_PATH"
 
-            {
-              echo "----- $NAME -----"
-              cat "$LOG_FILE"
-              echo ""
-            } >> work/logs/all_summary.log
+              # 1) info_image:  vbmeta 形式の場合のみ実行（エラー時はスキップ）
+              if python3 avb/avbtool.py info_image --image "$IMG_PATH" > "$LOG_FILE" 2>&1; then
+                INFO_OK=true
+              else
+                if grep -q "does not look like a vbmeta image" "$LOG_FILE"; then
+                  echo "Skipping info_image: not a vbmeta image (expected for dtbo, etc.)" > "$LOG_FILE"
+                  INFO_OK=false
+                else
+                  INFO_OK=false  # 他のエラーはそのまま残す
+                fi
+              fi
+
+              # 2) verify_image: フッタ付きイメージの検証・情報表示
+              {
+                echo "=== verify_image ==="
+                python3 avb/avbtool.py verify_image --image "$IMG_PATH" 2>&1
+              } > "$VERIFY_LOG" || true
+
+              # 3) extract_vbmeta_image: フッタを抽出し、抽出後は info_image で解析
+              {
+                echo "=== extract_vbmeta_image ==="
+                python3 avb/avbtool.py extract_vbmeta_image --image "$IMG_PATH" --output work/logs/${NAME}_vbmeta.blob 2>&1
+                if [ -f "work/logs/${NAME}_vbmeta.blob" ]; then
+                  echo "vbmeta footer extracted (size: $(stat -c%s work/logs/${NAME}_vbmeta.blob) bytes)"
+                  echo "--- info_image on extracted vbmeta ---"
+                  python3 avb/avbtool.py info_image --image work/logs/${NAME}_vbmeta.blob 2>&1
+                else
+                  echo "No vbmeta footer found or extraction failed"
+                fi
+              } > "$EXTRACT_LOG" || true
+
+              # サマリログに追記（info は成功時のみ、それ以外は verify と extract を中心に）
+              {
+                echo "----- $NAME -----"
+                if [ "$INFO_OK" = true ]; then
+                  echo "=== info_image ==="
+                  cat "$LOG_FILE"
+                  echo ""
+                else
+                  echo "=== info_image skipped (not a vbmeta image) ==="
+                  echo ""
+                fi
+                echo "=== verify_image ==="
+                cat "$VERIFY_LOG"
+                echo ""
+                echo "=== extract_vbmeta_image ==="
+                cat "$EXTRACT_LOG"
+                echo ""
+              } >> work/logs/all_summary.log
+            fi
           done
 
-          # 全結果を表示（デバッグ用）
           cat work/logs/all_summary.log
 
       - name: Extract public key and chain summary
         run: |
           {
             echo "=== Public Key / Chain Partition Summary ==="
-            for LOG in work/logs/*_info.log; do
-              NAME=$(basename "$LOG" _info.log)
+            for LOG in work/logs/*_verify.log; do
+              NAME=$(basename "$LOG" _verify.log)
               echo ""
               echo "### $NAME ###"
               grep -E "Public key|Algorithm|Rollback Index|Release String|Chain Partition|Partition Name|Flags" "$LOG" || echo "no data"
@@ -100,8 +140,8 @@ jobs:
         run: |
           {
             echo "=== Descriptor Summary (all partitions) ==="
-            for LOG in work/logs/*_info.log; do
-              NAME=$(basename "$LOG" _info.log)
+            for LOG in work/logs/*_verify.log; do
+              NAME=$(basename "$LOG" _verify.log)
               echo ""
               echo "### $NAME ###"
               grep -E "Descriptor|Hash Algorithm|Image Size|Tree Size|FEC num roots|FEC size|Root Digest|Digest|Salt" "$LOG" || echo "no data"
