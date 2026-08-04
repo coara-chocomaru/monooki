@@ -1,0 +1,132 @@
+name: VBMeta Analyze Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_zip_url:
+        description: 'ファームウェアZIPの直接ダウンロードURL'
+        required: true
+        type: string
+
+env:
+  AVBTOOL_BRANCH: 'android12-release'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Display Run Parameters
+        run: |
+          echo "::group::Inputs"
+          echo "Firmware ZIP URL: ${{ inputs.firmware_zip_url }}"
+          echo "avbtool branch: ${{ env.AVBTOOL_BRANCH }}"
+          echo "::endgroup::"
+
+      - name: Prepare environment
+        run: |
+          sudo apt update
+          sudo apt -y install python3 python3-pip xxd curl unzip git
+          mkdir -p work/download work/extracted work/logs
+
+      - name: Clone avbtool (AVB 1.2.0 / android12-release)
+        run: |
+          git clone --depth 1 --branch ${{ env.AVBTOOL_BRANCH }} \
+            https://android.googlesource.com/platform/external/avb avb
+
+      - name: Download firmware ZIP
+        working-directory: work/download
+        run: |
+          curl -L -o firmware.zip "${{ inputs.firmware_zip_url }}"
+          ls -la
+
+      - name: Extract firmware ZIP
+        run: |
+          unzip -o work/download/firmware.zip -d work/extracted
+          find work/extracted -maxdepth 4 -type f -iname "*.img" | sort
+
+      - name: Analyze target partitions
+        run: |
+          # 解析対象パーティション（拡張子なしのベース名）
+          PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
+          {
+            echo "=== AVB Full Analysis Summary ==="
+            echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+          } > work/logs/all_summary.log
+
+          for NAME in $PARTITIONS; do
+            # 大文字小文字を区別せず、ZIP内の任意のディレクトリから対象ファイルを検索
+            IMG_PATH=$(find work/extracted -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
+            LOG_FILE="work/logs/${NAME}_info.log"
+
+            if [ -z "$IMG_PATH" ]; then
+              echo "${NAME}.img が見つかりませんでした" > "$LOG_FILE"
+            else
+              echo "解析中: $IMG_PATH"
+              {
+                echo "=== $NAME ($IMG_PATH) ==="
+                # avbtool info_image で詳細情報を出力
+                python3 avb/avbtool.py info_image --image "$IMG_PATH" 2>&1
+              } > "$LOG_FILE" || true
+            fi
+
+            {
+              echo "----- $NAME -----"
+              cat "$LOG_FILE"
+              echo ""
+            } >> work/logs/all_summary.log
+          done
+
+          # 全結果を表示（デバッグ用）
+          cat work/logs/all_summary.log
+
+      - name: Extract public key and chain summary
+        run: |
+          {
+            echo "=== Public Key / Chain Partition Summary ==="
+            for LOG in work/logs/*_info.log; do
+              NAME=$(basename "$LOG" _info.log)
+              echo ""
+              echo "### $NAME ###"
+              grep -E "Public key|Algorithm|Rollback Index|Release String|Chain Partition|Partition Name|Flags" "$LOG" || echo "no data"
+            done
+          } > work/logs/pubkey_chain_summary.log
+          cat work/logs/pubkey_chain_summary.log
+
+      - name: Extract descriptor summary
+        run: |
+          {
+            echo "=== Descriptor Summary (all partitions) ==="
+            for LOG in work/logs/*_info.log; do
+              NAME=$(basename "$LOG" _info.log)
+              echo ""
+              echo "### $NAME ###"
+              grep -E "Descriptor|Hash Algorithm|Image Size|Tree Size|FEC num roots|FEC size|Root Digest|Digest|Salt" "$LOG" || echo "no data"
+            done
+          } > work/logs/descriptor_summary_all.log
+          cat work/logs/descriptor_summary_all.log
+
+      - name: Hexdump headers of each partition
+        run: |
+          PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
+          for NAME in $PARTITIONS; do
+            IMG_PATH=$(find work/extracted -type f \( -iname "${NAME}.img" -o -iname "${NAME}_a.img" \) | head -1)
+            if [ -n "$IMG_PATH" ]; then
+              xxd "$IMG_PATH" | head -30 > "work/logs/${NAME}_hexdump.log"
+            fi
+          done
+          ls -la work/logs
+
+      - name: Zip logs
+        run: |
+          cd work
+          zip -r vbmeta_analysis_logs.zip logs/
+
+      - name: Upload logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbmeta-analysis-logs
+          path: work/vbmeta_analysis_logs.zip
