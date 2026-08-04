@@ -1,0 +1,279 @@
+name: VBMeta Rebuild Testkeys
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_zip_url:
+        description: 'ファームウェアZIPの直接ダウンロードURL'
+        required: true
+        type: string
+
+env:
+  AVBTOOL_BRANCH: 'android12-release'
+
+  # boot / dtbo / vendor_boot / odm で共通の salt
+  SHARED_SALT: '4fd7de30eaf41a87ded88161e2fb830963d4b25179b1ab1de24955f22c845de8'
+
+  # vendor のみ別 salt
+  VENDOR_SALT: 'd2545b1cb8eb408723fecc5a2fd62291e3c90737e1c868d50b15bb1b2a8b94e6'
+
+  BOOT_FINGERPRINT: 'DOCOMO/SH-51C/SH-51C:14/UKQ1.231108.001/38JP_3_340:user/release-keys'
+  VENDOR_FINGERPRINT: 'DOCOMO/SH-51C/SH-51C:14/UKQ1.231108.001/38JP_3_340:user/release-keys'
+  ODM_FINGERPRINT: 'DOCOMO/SH-51C/SH-51C:14/UKQ1.231108.001/38JP_3_340:user/release-keys'
+  DTBO_FINGERPRINT: 'DOCOMO/SH-51C/SH-51C:14/UKQ1.231108.001/38JP_3_340:user/release-keys'
+  VENDOR_BOOT_FINGERPRINT: 'DOCOMO/SH-51C/SH-51C:14/UKQ1.231108.001/38JP_3_340:user/release-keys'
+
+  OS_VERSION: '11'
+  SECURITY_PATCH: '2025-11-01'
+
+  # vbmeta の公開鍵 SHA1
+  EXPECTED_VBMETA_PUBKEY_SHA1: 'f8038985df33309988ccdb8d0e992c7715834f94'
+  EXPECTED_ROOT_VBMETA_PUBKEY_SHA1: 'cdbb77177f731920bbe0a0f94f84d9038ae0617d'
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare environment
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt update
+          sudo apt -y install \
+            curl unzip git zip xxd \
+            python3 python3-pip python3-cryptography python3-pycryptodome
+
+      - name: Clone avbtool (AVB 1.2.0)
+        run: |
+          git clone --depth 1 --branch "${AVBTOOL_BRANCH}" \
+            https://android.googlesource.com/platform/external/avb avb
+
+      - name: Prepare workdirs
+        run: |
+          mkdir -p work/download work/extracted work/signed work/logs
+
+      - name: Download firmware ZIP
+        working-directory: work/download
+        run: |
+          curl -L -o firmware.zip "${{ inputs.firmware_zip_url }}"
+          ls -la
+
+      - name: Extract firmware ZIP
+        run: |
+          unzip -o work/download/firmware.zip -d work/extracted
+          echo "=== extracted images ==="
+          find work/extracted -type f -iname "*.img" | sort
+
+      - name: Locate images
+        id: imgs
+        run: |
+          set -euo pipefail
+
+          find_img() {
+            local name="$1"
+            find work/extracted -type f \( -iname "${name}.img" -o -iname "${name}_a.img" \) | head -n 1
+          }
+
+          BOOT_IMG="$(find_img boot)"
+          DTBO_IMG="$(find_img dtbo)"
+          VENDOR_BOOT_IMG="$(find_img vendor_boot)"
+          ODM_IMG="$(find_img odm)"
+          VENDOR_IMG="$(find_img vendor)"
+          VBMETA_SYSTEM_IMG="$(find_img vbmeta_system)"
+
+          for pair in \
+            "boot:$BOOT_IMG" \
+            "dtbo:$DTBO_IMG" \
+            "vendor_boot:$VENDOR_BOOT_IMG" \
+            "odm:$ODM_IMG" \
+            "vendor:$VENDOR_IMG" \
+            "vbmeta_system:$VBMETA_SYSTEM_IMG"
+          do
+            key="${pair%%:*}"
+            val="${pair#*:}"
+            if [ -z "$val" ]; then
+              echo "::error::${key}.img not found"
+              exit 1
+            fi
+            echo "${key}_img=$val" >> "$GITHUB_OUTPUT"
+            echo "${key} => $val"
+          done
+
+      - name: Sign boot / dtbo / vendor_boot / odm / vendor
+        run: |
+          set -euo pipefail
+
+          AVB="python3 avb/avbtool.py"
+          SIGNED="work/signed"
+          LOGS="work/logs"
+
+          BOOT_SRC="${{ steps.imgs.outputs.boot_img }}"
+          DTBO_SRC="${{ steps.imgs.outputs.dtbo_img }}"
+          VENDOR_BOOT_SRC="${{ steps.imgs.outputs.vendor_boot_img }}"
+          ODM_SRC="${{ steps.imgs.outputs.odm_img }}"
+          VENDOR_SRC="${{ steps.imgs.outputs.vendor_img }}"
+          VBMETA_SYSTEM_SRC="${{ steps.imgs.outputs.vbmeta_system_img }}"
+
+          sign_hash() {
+            local src="$1"
+            local dst="$2"
+            local part="$3"
+            local salt="$4"
+            shift 4
+
+            cp "$src" "$dst"
+            $AVB erase_footer --image "$dst" 2>/dev/null || true
+
+            local cmd=(
+              $AVB add_hash_footer
+              --image "$dst"
+              --partition_name "$part"
+              --partition_size "$(stat -c%s "$src")"
+              --hash_algorithm sha256
+              --algorithm NONE
+              --salt "$salt"
+            )
+
+            while [ "$#" -gt 0 ]; do
+              cmd+=(--prop "$1")
+              shift
+            done
+
+            "${cmd[@]}"
+          }
+
+          sign_hashtree() {
+            local src="$1"
+            local dst="$2"
+            local part="$3"
+            local salt="$4"
+            shift 4
+
+            cp "$src" "$dst"
+            $AVB erase_footer --image "$dst" 2>/dev/null || true
+
+            local cmd=(
+              $AVB add_hashtree_footer
+              --image "$dst"
+              --partition_name "$part"
+              --partition_size "$(stat -c%s "$src")"
+              --hash_algorithm sha256
+              --algorithm NONE
+              --salt "$salt"
+              --fec_num_roots 2
+            )
+
+            while [ "$#" -gt 0 ]; do
+              cmd+=(--prop "$1")
+              shift
+            done
+
+            "${cmd[@]}"
+          }
+
+          sign_hash \
+            "$BOOT_SRC" "$SIGNED/boot.img" boot "$SHARED_SALT" \
+            "com.android.build.boot.fingerprint:${BOOT_FINGERPRINT}" \
+            "com.android.build.boot.os_version:${OS_VERSION}" \
+            "com.android.build.boot.security_patch:${SECURITY_PATCH}"
+
+          sign_hash \
+            "$DTBO_SRC" "$SIGNED/dtbo.img" dtbo "$SHARED_SALT" \
+            "com.android.build.dtbo.fingerprint:${DTBO_FINGERPRINT}"
+
+          sign_hash \
+            "$VENDOR_BOOT_SRC" "$SIGNED/vendor_boot.img" vendor_boot "$SHARED_SALT" \
+            "com.android.build.vendor_boot.fingerprint:${VENDOR_BOOT_FINGERPRINT}"
+
+          sign_hashtree \
+            "$ODM_SRC" "$SIGNED/odm.img" odm "$SHARED_SALT" \
+            "com.android.build.odm.fingerprint:${ODM_FINGERPRINT}" \
+            "com.android.build.odm.os_version:${OS_VERSION}"
+
+          sign_hashtree \
+            "$VENDOR_SRC" "$SIGNED/vendor.img" vendor "$VENDOR_SALT" \
+            "com.android.build.vendor.fingerprint:${VENDOR_FINGERPRINT}" \
+            "com.android.build.vendor.os_version:${OS_VERSION}" \
+            "com.android.build.vendor.security_patch:${SECURITY_PATCH}"
+
+          # vbmeta_system は今回はそのまま同梱
+          cp "$VBMETA_SYSTEM_SRC" "$SIGNED/vbmeta_system.img"
+
+      - name: Build vbmeta.img
+        run: |
+          set -euo pipefail
+          AVB="python3 avb/avbtool.py"
+          SIGNED="work/signed"
+
+          $AVB make_vbmeta_image \
+            --output "$SIGNED/vbmeta.img" \
+            --key keys/vbmeta.pem \
+            --algorithm SHA256_RSA4096 \
+            --chain_partition vbmeta_system:2:keys/vbmeta_system.avbpubkey \
+            --include_descriptors_from_image "$SIGNED/boot.img" \
+            --include_descriptors_from_image "$SIGNED/dtbo.img" \
+            --include_descriptors_from_image "$SIGNED/vendor_boot.img" \
+            --include_descriptors_from_image "$SIGNED/odm.img" \
+            --include_descriptors_from_image "$SIGNED/vendor.img"
+
+      - name: Verify generated images
+        run: |
+          set -euo pipefail
+          AVB="python3 avb/avbtool.py"
+          SIGNED="work/signed"
+
+          for img in boot dtbo vendor_boot odm vendor vbmeta; do
+            echo "===== ${img}.img ====="
+            $AVB info_image --image "$SIGNED/${img}.img" | tee "work/logs/${img}.info"
+            echo
+          done
+
+          grep -qF "Algorithm:                NONE" work/logs/boot.info
+          grep -qF "Partition Name:        boot" work/logs/boot.info
+          grep -qF "Salt:                  ${SHARED_SALT}" work/logs/boot.info
+          grep -qF "com.android.build.boot.fingerprint -> '${BOOT_FINGERPRINT}'" work/logs/boot.info
+          grep -qF "com.android.build.boot.os_version -> '${OS_VERSION}'" work/logs/boot.info
+          grep -qF "com.android.build.boot.security_patch -> '${SECURITY_PATCH}'" work/logs/boot.info
+
+          grep -qF "Algorithm:                SHA256_RSA4096" work/logs/vbmeta.info
+          grep -qF "Public key (sha1):        ${EXPECTED_ROOT_VBMETA_PUBKEY_SHA1}" work/logs/vbmeta.info
+          grep -qF "Chain Partition descriptor:" work/logs/vbmeta.info
+          grep -qF "Partition Name:          vbmeta_system" work/logs/vbmeta.info
+
+      - name: Hexdump outputs
+        run: |
+          set -euo pipefail
+          for img in work/signed/*.img; do
+            base="$(basename "$img" .img)"
+            xxd "$img" | head -30 > "work/logs/${base}_hexdump.log"
+          done
+
+      - name: Create bundle
+        run: |
+          set -euo pipefail
+          cd work
+          zip -r vbmeta_rebuild_bundle.zip signed logs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbmeta-rebuild-bundle
+          path: work/vbmeta_rebuild_bundle.zip
+
+      - name: Upload raw images
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbmeta-rebuilt-images
+          path: |
+            work/signed/boot.img
+            work/signed/dtbo.img
+            work/signed/vendor_boot.img
+            work/signed/odm.img
+            work/signed/vendor.img
+            work/signed/vbmeta_system.img
+            work/signed/vbmeta.img
