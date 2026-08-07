@@ -1,4 +1,4 @@
-name: Patch ION Carveout Size and Rebuild boot.img (DTS method)
+name: Patch ION Carveout Size (Binary Edit) and Rebuild boot.img
 
 on:
   workflow_dispatch:
@@ -66,7 +66,6 @@ jobs:
             echo "No DTB found" >&2
             exit 1
           fi
-          # The extracted DTB is 01_dtbdump_PXA1928.dtb (131KB)
           cp ../dtb_work/extracted/01_dtbdump_PXA1928.dtb ../dtb_work/original.dtb
           echo "DTB extracted successfully"
 
@@ -80,36 +79,143 @@ jobs:
             exit 1
           fi
 
-      - name: Decompile DTB to DTS (no sort, no symbols)
+      - name: Patch ion-size using Python (binary direct edit)
         run: |
           cd work/dtb_work
-          dtc -I dtb -O dts -o original.dts original.dtb
+          cat > patch_ion.py << 'PY'
+          import struct, sys, os
 
-      - name: Patch ion-size in DTS
-        run: |
-          cd work/dtb_work
-          new_size="${{ inputs.ion_size_hex }}"
-          new_size_clean="${new_size#0x}"
-          echo "New ion-size: $new_size_clean"
-          # Use sed to replace the value
-          sed -i "s/marvell,ion-size = <0x[0-9a-fA-F]*>/marvell,ion-size = <$new_size_clean>/" original.dts
-          # Verify
-          grep "marvell,ion-size" original.dts
+          FDT_MAGIC = 0xD00DFEED
+          FDT_BEGIN_NODE = 0x1
+          FDT_END_NODE = 0x2
+          FDT_PROP = 0x3
+          FDT_NOP = 0x4
+          FDT_END = 0x9
 
-      - name: Recompile patched DTS to DTB (no sort, no symbols)
-        run: |
-          cd work/dtb_work
-          dtc -I dts -O dtb -o patched.dtb original.dts
+          def be32(data, off):
+              return struct.unpack_from('>I', data, off)[0]
+
+          def be32_set(data, off, val):
+              struct.pack_into('>I', data, off, val)
+
+          def align4(n):
+              return (n + 3) & ~3
+
+          def find_property_offset(data, node_path, prop_name):
+              if len(data) < 40:
+                  raise ValueError("DTB too small")
+              magic = be32(data, 0)
+              if magic != FDT_MAGIC:
+                  raise ValueError("Invalid DTB magic")
+              off_struct = be32(data, 8)
+              off_strings = be32(data, 12)
+              size_struct = be32(data, 36)
+              size_strings = be32(data, 32)
+              strings = data[off_strings:off_strings+size_strings]
+
+              p = off_struct
+              path_parts = node_path.strip('/').split('/')
+              current_path = ""
+              stack = []
+              target_path = node_path
+              found_node = False
+              prop_offset = None
+              prop_len = None
+
+              while p < off_struct + size_struct:
+                  token = be32(data, p)
+                  p += 4
+                  if token == FDT_BEGIN_NODE:
+                      end = data.find(b'\x00', p)
+                      if end < 0:
+                          break
+                      name = data[p:end].decode('ascii')
+                      p = align4(end + 1)
+                      if current_path == "":
+                          current_path = "/" + name
+                      else:
+                          if current_path == "/":
+                              current_path = "/" + name
+                          else:
+                              current_path = current_path + "/" + name
+                      stack.append(name)
+                      if current_path == target_path:
+                          # このノード内のプロパティを探索
+                          while p < off_struct + size_struct:
+                              token2 = be32(data, p)
+                              p += 4
+                              if token2 == FDT_PROP:
+                                  plen = be32(data, p)
+                                  pname_off = be32(data, p+4)
+                                  p += 8
+                                  pname_end = strings.find(b'\x00', pname_off)
+                                  pname = strings[pname_off:pname_end].decode('ascii')
+                                  if pname == prop_name:
+                                      prop_offset = p
+                                      prop_len = plen
+                                      return prop_offset, prop_len
+                                  p = align4(p + plen)
+                              elif token2 == FDT_END_NODE:
+                                  break
+                              elif token2 == FDT_NOP:
+                                  continue
+                              else:
+                                  # 他のトークンは無視（例: FDT_END）
+                                  pass
+                          # 見つからなかった
+                          return None, None
+                  elif token == FDT_END_NODE:
+                      if stack:
+                          stack.pop()
+                          if current_path.rfind('/') > 0:
+                              current_path = current_path[:current_path.rfind('/')]
+                          else:
+                              current_path = ""
+                  elif token == FDT_PROP:
+                      plen = be32(data, p)
+                      p += 8
+                      p = align4(p + plen)
+                  elif token == FDT_NOP:
+                      continue
+                  elif token == FDT_END:
+                      break
+              return None, None
+
+          def patch_ion_size(dtb_path, new_size_hex):
+              new_size = int(new_size_hex, 16)
+              with open(dtb_path, 'rb') as f:
+                  data = bytearray(f.read())
+              node_path = "/ion/heap1"
+              prop_name = "marvell,ion-size"
+              offset, length = find_property_offset(data, node_path, prop_name)
+              if offset is None:
+                  raise ValueError(f"Property {prop_name} not found in {node_path}")
+              if length != 4:
+                  raise ValueError(f"Property length is {length}, expected 4")
+              # 値を書き換え
+              be32_set(data, offset, new_size)
+              # チェックサムは再計算しない（多くのブートローダーはチェックしない）
+              with open(dtb_path, 'wb') as f:
+                  f.write(data)
+              print(f"Patched {prop_name} to 0x{new_size:08x} at offset 0x{offset:x}")
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 3:
+                  print("Usage: patch_ion.py <dtb_file> <new_size_hex>")
+                  sys.exit(1)
+              patch_ion_size(sys.argv[1], sys.argv[2])
+          PY
+
+          python3 patch_ion.py original.dtb "${{ inputs.ion_size_hex }}"
+          # Verify size unchanged
           orig_size=$(stat -c%s original.dtb)
-          new_size=$(stat -c%s patched.dtb)
+          new_size=$(stat -c%s original.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
-          # Check that size didn't shrink dramatically
-          if [ $new_size -lt $((orig_size / 2)) ]; then
-            echo "ERROR: Patched DTB is less than half size of original" >&2
+          if [ "$orig_size" -ne "$new_size" ]; then
+            echo "ERROR: DTB size changed!" >&2
             exit 1
           fi
-          # Also verify it contains the new value
-          dtc -I dtb -O dts patched.dtb | grep "marvell,ion-size"
+          cp original.dtb patched.dtb
 
       - name: Repack boot.img using Python
         run: |
@@ -168,22 +274,20 @@ jobs:
           mkdir -p work/out
           cp work/input/new_boot.img work/out/
           cp work/dtb_work/original.dtb work/out/
-          cp work/dtb_work/original.dts work/out/
           cp work/dtb_work/patched.dtb work/out/
-          cp work/dtb_work/patched.dts work/out/
           cat > work/out/README.txt << EOF
-          Patched boot.img (DTS method, no fdtput)
-          =========================================
+          Patched boot.img (Binary Direct Edit)
+          ======================================
           Original boot.img: ${{ inputs.img_url }}
           Patched ION carveout size to: ${{ inputs.ion_size_hex }}
           Date: $(date -u)
 
           Files:
           - new_boot.img      : Patched boot image (ready to flash)
-          - original.dtb/dts  : Original Device Tree
-          - patched.dtb/dts   : Patched Device Tree
+          - original.dtb      : Original Device Tree (unchanged)
+          - patched.dtb       : Patched Device Tree (binary edited)
 
-          Note: DTB was decompiled, patched, and recompiled without sorting.
+          Note: DTB was patched directly without decompile/recompile.
           Flash with: fastboot flash boot new_boot.img
           EOF
 
