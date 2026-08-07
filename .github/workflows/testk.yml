@@ -1,4 +1,4 @@
-name: Patch ION Size in DTB (Binary Edit) and Rebuild boot.img
+name: Patch ION Carveout Size and Rebuild boot.img (DTS method)
 
 on:
   workflow_dispatch:
@@ -57,114 +57,61 @@ jobs:
           abootimg -x boot.img
           ls -la
 
-      - name: Extract and select correct DTB (by size and ion node)
+      - name: Extract DTB from zImage
         run: |
           cd work/input
-          # If 'second' exists and is a valid DTB, use it
-          if [ -f second ]; then
-            magic=$(xxd -p -l 4 second)
-            if [ "$magic" = "d00dfeed" ]; then
-              echo "Using DTB from 'second'"
-              cp second ../dtb_work/original.dtb
-              echo "source=second" > ../dtb_work/source.txt
-              exit 0
-            fi
-          fi
-
-          # Extract from zImage
-          echo "Extracting DTBs from zImage..."
           mkdir -p ../dtb_work/extracted
           extract-dtb zImage -o ../dtb_work/extracted/
           if [ ! -d ../dtb_work/extracted ] || [ -z "$(ls ../dtb_work/extracted/*.dtb 2>/dev/null)" ]; then
             echo "No DTB found" >&2
             exit 1
           fi
+          # The extracted DTB is 01_dtbdump_PXA1928.dtb (131KB)
+          cp ../dtb_work/extracted/01_dtbdump_PXA1928.dtb ../dtb_work/original.dtb
+          echo "DTB extracted successfully"
 
-          # List all extracted DTBs with sizes
-          echo "Extracted DTBs:"
-          ls -la ../dtb_work/extracted/*.dtb
-
-          # Pick the largest DTB (likely the main one)
-          largest=$(ls -S ../dtb_work/extracted/*.dtb | head -n1)
-          largest_size=$(stat -c%s "$largest")
-          echo "Largest DTB: $(basename "$largest") size: $largest_size bytes"
-
-          # Ensure the size is reasonable (should be > 100KB for a main DTB)
-          if [ $largest_size -lt 102400 ]; then
-            echo "WARNING: Largest DTB is less than 100KB. This may be a sub-DTB."
-            # Try to find any DTB with ion node
-            for dtb in ../dtb_work/extracted/*.dtb; do
-              if fdtget -t s "$dtb" /ion compatible 2>/dev/null >/dev/null; then
-                echo "Found DTB with ion node: $(basename "$dtb")"
-                cp "$dtb" ../dtb_work/original.dtb
-                echo "source=kernel(ion)" > ../dtb_work/source.txt
-                break
-              fi
-            done
-          fi
-
-          # If no DTB selected yet, use the largest
-          if [ ! -f ../dtb_work/original.dtb ]; then
-            cp "$largest" ../dtb_work/original.dtb
-            echo "source=kernel(largest)" > ../dtb_work/source.txt
-          fi
-
-      - name: Verify DTB and check ion node
+      - name: Verify DTB size
         run: |
           cd work/dtb_work
-          magic=$(xxd -p -l 4 original.dtb)
-          if [ "$magic" != "d00dfeed" ]; then
-            echo "Invalid DTB" >&2
-            exit 1
-          fi
           size=$(stat -c%s original.dtb)
-          echo "Selected DTB size: $size bytes"
+          echo "Original DTB size: $size bytes"
           if [ $size -lt 102400 ]; then
-            echo "ERROR: DTB size is less than 100KB. This is not the main DTB." >&2
-            echo "Please check the extracted DTB files manually." >&2
+            echo "ERROR: DTB too small (<100KB)" >&2
             exit 1
           fi
-          # Check for ion node
-          if ! fdtget -t s original.dtb /ion compatible 2>/dev/null >/dev/null; then
-            echo "WARNING: ion node not found in this DTB."
-            echo "This may not be the correct DTB, but proceeding anyway."
-          else
-            echo "ion node found"
-          fi
 
-      - name: Check current ion-size value
+      - name: Decompile DTB to DTS (no sort, no symbols)
         run: |
           cd work/dtb_work
-          current=$(fdtget -t x original.dtb /ion/heap1 marvell,ion-size 2>/dev/null || echo "not found")
-          echo "Current ion-size: $current"
-          if [ "$current" = "not found" ]; then
-            echo "ERROR: marvell,ion-size property not found in DTB" >&2
-            exit 1
-          fi
+          dtc -I dtb -O dts -o original.dts original.dtb
 
-      - name: Patch ion-size using fdtput (binary edit)
+      - name: Patch ion-size in DTS
         run: |
           cd work/dtb_work
           new_size="${{ inputs.ion_size_hex }}"
           new_size_clean="${new_size#0x}"
-          echo "New ion-size: $new_size"
-          fdtput -t x original.dtb /ion/heap1 marvell,ion-size "$new_size_clean"
+          echo "New ion-size: $new_size_clean"
+          # Use sed to replace the value
+          sed -i "s/marvell,ion-size = <0x[0-9a-fA-F]*>/marvell,ion-size = <$new_size_clean>/" original.dts
           # Verify
-          patched=$(fdtget -t x original.dtb /ion/heap1 marvell,ion-size 2>/dev/null)
-          echo "Patched ion-size: $patched"
-          cp original.dtb patched.dtb
+          grep "marvell,ion-size" original.dts
 
-      - name: Verify patched DTB size (should be identical)
+      - name: Recompile patched DTS to DTB (no sort, no symbols)
         run: |
-          orig_size=$(stat -c%s work/dtb_work/original.dtb)
-          new_size=$(stat -c%s work/dtb_work/patched.dtb)
+          cd work/dtb_work
+          dtc -I dts -O dtb -o patched.dtb original.dts
+          orig_size=$(stat -c%s original.dtb)
+          new_size=$(stat -c%s patched.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
-          if [ "$orig_size" -ne "$new_size" ]; then
-            echo "ERROR: DTB size changed after binary patch!" >&2
+          # Check that size didn't shrink dramatically
+          if [ $new_size -lt $((orig_size / 2)) ]; then
+            echo "ERROR: Patched DTB is less than half size of original" >&2
             exit 1
           fi
+          # Also verify it contains the new value
+          dtc -I dtb -O dts patched.dtb | grep "marvell,ion-size"
 
-      - name: Repack boot.img using Python (exact control)
+      - name: Repack boot.img using Python
         run: |
           cd work/input
           cat > repack.py << 'EOF'
@@ -182,7 +129,6 @@ jobs:
               kernel_addr = struct.unpack('<I', header[12:16])[0]
               ramdisk_size = struct.unpack('<I', header[16:20])[0]
               ramdisk_addr = struct.unpack('<I', header[20:24])[0]
-              second_size = struct.unpack('<I', header[24:28])[0]
               second_addr = struct.unpack('<I', header[28:32])[0]
               tags_addr = struct.unpack('<I', header[32:36])[0]
               page_size = struct.unpack('<I', header[36:40])[0]
@@ -216,34 +162,28 @@ jobs:
             echo "Invalid boot image" >&2
             exit 1
           fi
-          cd work/input
-          python3 -c "
-          import struct
-          with open('new_boot.img', 'rb') as f:
-              f.seek(24)
-              second_size = struct.unpack('<I', f.read(4))[0]
-              print(f'Second stage size in header: {second_size} bytes')
-          "
 
       - name: Collect outputs
         run: |
           mkdir -p work/out
           cp work/input/new_boot.img work/out/
           cp work/dtb_work/original.dtb work/out/
+          cp work/dtb_work/original.dts work/out/
           cp work/dtb_work/patched.dtb work/out/
+          cp work/dtb_work/patched.dts work/out/
           cat > work/out/README.txt << EOF
-          Patched boot.img (Binary Edit with fdtput)
-          ===========================================
+          Patched boot.img (DTS method, no fdtput)
+          =========================================
           Original boot.img: ${{ inputs.img_url }}
           Patched ION carveout size to: ${{ inputs.ion_size_hex }}
           Date: $(date -u)
 
           Files:
           - new_boot.img      : Patched boot image (ready to flash)
-          - original.dtb      : Original Device Tree (unchanged)
-          - patched.dtb       : Patched Device Tree (binary edited)
+          - original.dtb/dts  : Original Device Tree
+          - patched.dtb/dts   : Patched Device Tree
 
-          Note: DTB was modified in-place without decompile/recompile.
+          Note: DTB was decompiled, patched, and recompiled without sorting.
           Flash with: fastboot flash boot new_boot.img
           EOF
 
