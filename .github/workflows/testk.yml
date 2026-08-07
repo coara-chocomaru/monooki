@@ -31,6 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             device-tree-compiler \
+            abootimg \
             python3 \
             python3-pip \
             curl \
@@ -50,7 +51,7 @@ jobs:
           curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.img_url }}" -o work/input/boot.img
           file work/input/boot.img
 
-      - name: Unpack boot.img with abootimg (just to get components)
+      - name: Unpack boot.img with abootimg
         run: |
           cd work/input
           abootimg -x boot.img
@@ -134,11 +135,16 @@ jobs:
       - name: Recompile patched DTS to DTB (no sort, no symbols)
         run: |
           dtc -I dts -O dtb -o work/dtb_work/patched.dtb work/dtb_work/original.dts
+          # Also generate a DTS for verification
+          dtc -I dtb -O dts -o work/dtb_work/patched.dts work/dtb_work/patched.dtb
           orig_size=$(stat -c%s work/dtb_work/original.dtb)
           new_size=$(stat -c%s work/dtb_work/patched.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
-          # Verify the patched DTB is valid
-          dtc -I dtb -O dts -o work/dtb_work/patched_check.dts work/dtb_work/patched.dtb
+          # If size difference is too large (e.g., >10KB), warn
+          diff=$((new_size - orig_size))
+          if [ ${diff#-} -gt 10240 ]; then
+            echo "WARNING: DTB size changed significantly (diff: $diff bytes). Check if correct DTB was selected."
+          fi
 
       - name: Repack boot.img using Python (exact control)
         run: |
@@ -168,8 +174,7 @@ jobs:
               # Read components
               kernel_data = orig_data[HEADER_SIZE:HEADER_SIZE+kernel_size]
               ramdisk_data = orig_data[HEADER_SIZE+kernel_size:HEADER_SIZE+kernel_size+ramdisk_size]
-              # second stage might be zero size; we'll replace with patched DTB
-              # Keep the original second addr
+              # second stage data (if any) - we will replace with patched DTB
           # Read patched DTB
           with open('../dtb_work/patched.dtb', 'rb') as f:
               second_data = f.read()
@@ -177,9 +182,9 @@ jobs:
 
           # Prepare new header, copy most fields
           new_header = bytearray(header)
-          # Update sizes
+          # Update second stage size
           struct.pack_into('<I', new_header, 24, second_size_new)
-          # The rest (addresses, page size, cmdline) remain as original
+          # Keep all addresses, page size, etc. unchanged
           # Write new boot.img
           with open('new_boot.img', 'wb') as f:
               f.write(new_header)
@@ -216,7 +221,9 @@ jobs:
         run: |
           mkdir -p work/out
           cp work/input/new_boot.img work/out/
-          cp work/input/bootimg.cfg work/out/
+          cp work/input/bootimg.cfg work/out/ 2>/dev/null || true
+          cp work/input/zImage work/out/ 2>/dev/null || true
+          cp work/input/initrd.img work/out/ 2>/dev/null || true
           cp work/dtb_work/original.dtb work/out/
           cp work/dtb_work/original.dts work/out/
           cp work/dtb_work/patched.dtb work/out/
@@ -232,7 +239,8 @@ jobs:
           - new_boot.img      : Patched boot image (ready to flash)
           - original.dtb/dts  : Original Device Tree
           - patched.dtb/dts   : Patched Device Tree (ion-size changed)
-          - bootimg.cfg       : abootimg config used for extraction only
+          - bootimg.cfg       : abootimg config (if present)
+          - zImage / initrd   : Extracted components (if present)
 
           Note: Repacked manually to ensure correct sizes.
           Flash with: fastboot flash boot new_boot.img
