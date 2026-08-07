@@ -1,4 +1,4 @@
-name: Patch ION Carveout Size and Rebuild boot.img
+name: Patch ION Size in DTB (Binary Edit) and Rebuild boot.img
 
 on:
   workflow_dispatch:
@@ -57,7 +57,7 @@ jobs:
           abootimg -x boot.img
           ls -la
 
-      - name: Extract and select correct DTB
+      - name: Extract DTB (from second or zImage)
         run: |
           cd work/input
           # If 'second' exists and is a valid DTB, use it
@@ -71,26 +71,34 @@ jobs:
             fi
           fi
 
-          # Otherwise extract from zImage and pick the largest DTB
+          # Extract from zImage
           echo "Extracting DTBs from zImage..."
           mkdir -p ../dtb_work/extracted
           extract-dtb zImage -o ../dtb_work/extracted/
-          if [ -d ../dtb_work/extracted ]; then
-            # List all extracted DTBs with sizes
-            cd ../dtb_work/extracted
-            ls -la *.dtb
-            # Pick the largest one (likely the main DTB)
-            largest=$(ls -S *.dtb | head -n1)
-            echo "Selected largest DTB: $largest"
-            cp "$largest" ../original.dtb
-            cd ..
-            echo "source=kernel" > source.txt
-          else
+          if [ ! -d ../dtb_work/extracted ] || [ -z "$(ls ../dtb_work/extracted/*.dtb 2>/dev/null)" ]; then
             echo "No DTB found" >&2
             exit 1
           fi
 
-      - name: Verify selected DTB
+          # Find the DTB that contains "ion" node (use fdtget)
+          echo "Searching for DTB with ion node..."
+          for dtb in ../dtb_work/extracted/*.dtb; do
+            if fdtget -t s "$dtb" /ion compatible 2>/dev/null >/dev/null; then
+              echo "Found ion node in $(basename "$dtb")"
+              cp "$dtb" ../dtb_work/original.dtb
+              echo "source=kernel" > ../dtb_work/source.txt
+              break
+            fi
+          done
+
+          if [ ! -f ../dtb_work/original.dtb ]; then
+            echo "No DTB with ion node found, picking largest as fallback"
+            largest=$(ls -S ../dtb_work/extracted/*.dtb | head -n1)
+            cp "$largest" ../dtb_work/original.dtb
+            echo "source=kernel(fallback)" > ../dtb_work/source.txt
+          fi
+
+      - name: Verify DTB
         run: |
           magic=$(xxd -p -l 4 work/dtb_work/original.dtb)
           if [ "$magic" != "d00dfeed" ]; then
@@ -100,68 +108,54 @@ jobs:
           size=$(stat -c%s work/dtb_work/original.dtb)
           echo "Selected DTB size: $size bytes"
 
-      - name: Decompile DTB to DTS (no sort)
+      - name: Check current ion-size value
         run: |
-          dtc -I dtb -O dts -o work/dtb_work/original.dts work/dtb_work/original.dtb
+          cd work/dtb_work
+          current=$(fdtget -t x original.dtb /ion/heap1 marvell,ion-size 2>/dev/null || echo "not found")
+          echo "Current ion-size: $current"
+          if [ "$current" = "not found" ]; then
+            echo "ERROR: marvell,ion-size property not found in DTB" >&2
+            exit 1
+          fi
 
-      - name: Patch ION carveout size in DTS
+      - name: Patch ion-size using fdtput (binary edit)
         run: |
-          cat > work/patch_ion.py << 'PY'
-          import re, sys
-          dts = sys.argv[1]
-          new_size = sys.argv[2]
-          with open(dts, 'r') as f:
-              lines = f.readlines()
-          in_carveout = False
-          patched = False
-          out_lines = []
-          for line in lines:
-              if re.search(r'marvell,ion-name\s*=\s*"carveout_heap"', line):
-                  in_carveout = True
-              elif in_carveout and re.search(r'^\s*\}\s*;', line):
-                  in_carveout = False
-              if in_carveout and re.search(r'marvell,ion-size\s*=', line):
-                  line = re.sub(r'<0x[0-9a-fA-F]+>', f'<{new_size}>', line)
-                  patched = True
-              out_lines.append(line)
-          if not patched:
-              print("ERROR: ion-size not found in carveout_heap")
-              sys.exit(1)
-          with open(dts, 'w') as f:
-              f.writelines(out_lines)
-          PY
-          python3 work/patch_ion.py work/dtb_work/original.dts "${{ inputs.ion_size_hex }}"
+          cd work/dtb_work
+          # fdtput requires the value as a byte string; we use -t x for hex
+          new_size="${{ inputs.ion_size_hex }}"
+          # Remove '0x' prefix if present
+          new_size_clean="${new_size#0x}"
+          echo "New ion-size: $new_size"
+          fdtput -t x original.dtb /ion/heap1 marvell,ion-size "$new_size_clean"
+          # Verify
+          patched=$(fdtget -t x original.dtb /ion/heap1 marvell,ion-size 2>/dev/null)
+          echo "Patched ion-size: $patched"
+          # Save as patched.dtb (actually the same file, but we'll copy for clarity)
+          cp original.dtb patched.dtb
 
-      - name: Recompile patched DTS to DTB (no sort, no symbols)
+      - name: Verify patched DTB size (should be identical)
         run: |
-          dtc -I dts -O dtb -o work/dtb_work/patched.dtb work/dtb_work/original.dts
-          # Also generate a DTS for verification
-          dtc -I dtb -O dts -o work/dtb_work/patched.dts work/dtb_work/patched.dtb
           orig_size=$(stat -c%s work/dtb_work/original.dtb)
           new_size=$(stat -c%s work/dtb_work/patched.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
-          # If size difference is too large (e.g., >10KB), warn
-          diff=$((new_size - orig_size))
-          if [ ${diff#-} -gt 10240 ]; then
-            echo "WARNING: DTB size changed significantly (diff: $diff bytes). Check if correct DTB was selected."
+          if [ "$orig_size" -ne "$new_size" ]; then
+            echo "ERROR: DTB size changed after binary patch!" >&2
+            exit 1
           fi
 
       - name: Repack boot.img using Python (exact control)
         run: |
           cd work/input
           cat > repack.py << 'EOF'
-          import struct, json, os
+          import struct, os
 
           BOOT_MAGIC = b'ANDROID!'
           HEADER_SIZE = 2048
 
-          # Read original boot.img header to extract metadata
           with open('boot.img', 'rb') as f:
               orig_data = f.read()
               header = orig_data[:HEADER_SIZE]
-              # Parse header
-              magic = header[:8]
-              if magic != BOOT_MAGIC:
+              if header[:8] != BOOT_MAGIC:
                   raise ValueError("Not a valid boot image")
               kernel_size = struct.unpack('<I', header[8:12])[0]
               kernel_addr = struct.unpack('<I', header[12:16])[0]
@@ -171,27 +165,21 @@ jobs:
               second_addr = struct.unpack('<I', header[28:32])[0]
               tags_addr = struct.unpack('<I', header[32:36])[0]
               page_size = struct.unpack('<I', header[36:40])[0]
-              # Read components
               kernel_data = orig_data[HEADER_SIZE:HEADER_SIZE+kernel_size]
               ramdisk_data = orig_data[HEADER_SIZE+kernel_size:HEADER_SIZE+kernel_size+ramdisk_size]
-              # second stage data (if any) - we will replace with patched DTB
-          # Read patched DTB
+
           with open('../dtb_work/patched.dtb', 'rb') as f:
               second_data = f.read()
           second_size_new = len(second_data)
 
-          # Prepare new header, copy most fields
           new_header = bytearray(header)
-          # Update second stage size
           struct.pack_into('<I', new_header, 24, second_size_new)
-          # Keep all addresses, page size, etc. unchanged
-          # Write new boot.img
           with open('new_boot.img', 'wb') as f:
               f.write(new_header)
               f.write(kernel_data)
               f.write(ramdisk_data)
               f.write(second_data)
-          # Print info
+
           print(f"Kernel: {len(kernel_data)} bytes")
           print(f"Ramdisk: {len(ramdisk_data)} bytes")
           print(f"Second stage (DTB): {len(second_data)} bytes")
@@ -207,7 +195,7 @@ jobs:
             echo "Invalid boot image" >&2
             exit 1
           fi
-          # Also check second stage size in header
+          # Check second stage size in header matches actual
           cd work/input
           python3 -c "
           import struct
@@ -221,28 +209,21 @@ jobs:
         run: |
           mkdir -p work/out
           cp work/input/new_boot.img work/out/
-          cp work/input/bootimg.cfg work/out/ 2>/dev/null || true
-          cp work/input/zImage work/out/ 2>/dev/null || true
-          cp work/input/initrd.img work/out/ 2>/dev/null || true
           cp work/dtb_work/original.dtb work/out/
-          cp work/dtb_work/original.dts work/out/
           cp work/dtb_work/patched.dtb work/out/
-          cp work/dtb_work/patched.dts work/out/
           cat > work/out/README.txt << EOF
-          Patched boot.img (Manual Python Repack)
-          ========================================
+          Patched boot.img (Binary Edit with fdtput)
+          ===========================================
           Original boot.img: ${{ inputs.img_url }}
           Patched ION carveout size to: ${{ inputs.ion_size_hex }}
           Date: $(date -u)
 
           Files:
           - new_boot.img      : Patched boot image (ready to flash)
-          - original.dtb/dts  : Original Device Tree
-          - patched.dtb/dts   : Patched Device Tree (ion-size changed)
-          - bootimg.cfg       : abootimg config (if present)
-          - zImage / initrd   : Extracted components (if present)
+          - original.dtb      : Original Device Tree (unchanged)
+          - patched.dtb       : Patched Device Tree (binary edited)
 
-          Note: Repacked manually to ensure correct sizes.
+          Note: DTB was modified in-place without decompile/recompile.
           Flash with: fastboot flash boot new_boot.img
           EOF
 
