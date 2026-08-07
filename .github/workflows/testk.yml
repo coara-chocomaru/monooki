@@ -89,9 +89,8 @@ jobs:
             exit 1
           fi
 
-      - name: Decompile DTB to DTS (no sort)
+      - name: Decompile original DTB to DTS
         run: |
-          # -s オプションを使わず、そのまま逆コンパイル
           dtc -I dtb -O dts -o work/dtb_work/original.dts work/dtb_work/original.dtb
 
       - name: Patch ION carveout size in DTS
@@ -124,28 +123,23 @@ jobs:
 
       - name: Recompile patched DTS to DTB (no sort, no symbols)
         run: |
-          # -s を使わず、-@ (シンボル生成) も無効にする
           dtc -I dts -O dtb -o work/dtb_work/patched.dtb work/dtb_work/original.dts
-          # サイズ確認（ソートなしなので若干大きくなる可能性あり）
           orig_size=$(stat -c%s work/dtb_work/original.dtb)
           new_size=$(stat -c%s work/dtb_work/patched.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
 
-      - name: Verify patched DTB
+      - name: Decompile patched DTB to DTS (for verification and output)
         run: |
-          # パッチ後のDTBが有効かチェック
-          dtc -I dtb -O dts -o work/dtb_work/patched_check.dts work/dtb_work/patched.dtb
-          grep "carveout_heap" work/dtb_work/patched_check.dts -A5 || echo "WARNING: carveout_heap not found"
+          dtc -I dtb -O dts -o work/dtb_work/patched.dts work/dtb_work/patched.dtb
+          grep "carveout_heap" work/dtb_work/patched.dts -A5 || echo "WARNING: carveout_heap not found"
 
       - name: Rebuild boot.img with abootimg (override size limit)
         run: |
           cd work/input
-          # 元の boot.img サイズに 1MB のマージンを追加
           orig_boot_size=$(stat -c%s boot.img)
           new_boot_size=$((orig_boot_size + 0x100000))
           echo "Original boot.img size: $orig_boot_size bytes, new limit: $new_boot_size"
 
-          # Re-create using abootimg with custom bootsize
           if [ -f initrd.img ]; then
             abootimg --create new_boot.img \
               -f bootimg.cfg \
@@ -161,7 +155,6 @@ jobs:
               -c "bootsize=$new_boot_size"
           fi
 
-          # 検証
           file new_boot.img
           abootimg -i new_boot.img
 
