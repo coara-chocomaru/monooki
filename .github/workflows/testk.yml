@@ -1,4 +1,4 @@
-name: Extract DTB, Patch ION Size, Rebuild boot.img
+name: Extract DTB, Patch ION Size, Rebuild boot.img (No Sort)
 
 on:
   workflow_dispatch:
@@ -39,15 +39,12 @@ jobs:
             zip \
             unzip \
             xxd
-
-      - name: Install extract-dtb
-        run: |
           pip3 install extract-dtb
 
       - name: Prepare workspace
         run: |
           rm -rf work
-          mkdir -p work/input work/extracted work/dtb_work work/out
+          mkdir -p work/input work/dtb_work work/out
 
       - name: Download boot image
         run: |
@@ -60,163 +57,139 @@ jobs:
           abootimg -x boot.img
           ls -la
 
-      - name: Identify DTB source
-        id: dtb_source
+      - name: Extract DTB from 'second' or zImage
         run: |
           cd work/input
-          # Check if 'second' is a DTB
           if [ -f second ]; then
-            file_type=$(file -b second)
-            if echo "$file_type" | grep -qi "Device Tree Blob"; then
+            magic=$(xxd -p -l 4 second)
+            if [ "$magic" = "d00dfeed" ]; then
               echo "DTB found in 'second'"
-              echo "source=second" >> $GITHUB_OUTPUT
               cp second ../dtb_work/original.dtb
               exit 0
             fi
           fi
 
-          # If not, extract from zImage
+          # Extract from zImage
           echo "Extracting DTB from zImage..."
           mkdir -p ../dtb_work/extracted
           extract-dtb zImage -o ../dtb_work/extracted/
-          if [ -d ../dtb_work/extracted ] && [ "$(ls -A ../dtb_work/extracted 2>/dev/null)" ]; then
-            echo "source=zimage" >> $GITHUB_OUTPUT
-            # Take the first extracted dtb (usually the main one)
+          if [ -d ../dtb_work/extracted ] && [ "$(ls -A ../dtb_work/extracted)" ]; then
             first_dtb=$(ls ../dtb_work/extracted/*.dtb | head -n1)
             cp "$first_dtb" ../dtb_work/original.dtb
           else
-            echo "No DTB found anywhere!" >&2
+            echo "No DTB found" >&2
             exit 1
           fi
 
       - name: Verify DTB magic
         run: |
-          if [ ! -f work/dtb_work/original.dtb ]; then
-            echo "original.dtb missing" >&2
-            exit 1
-          fi
           magic=$(xxd -p -l 4 work/dtb_work/original.dtb)
           if [ "$magic" != "d00dfeed" ]; then
-            echo "Invalid DTB magic: $magic" >&2
+            echo "Invalid DTB" >&2
             exit 1
           fi
-          echo "DTB magic OK"
 
-      - name: Decompile DTB to DTS
+      - name: Decompile DTB to DTS (no sort)
         run: |
+          # -s オプションを使わず、そのまま逆コンパイル
           dtc -I dtb -O dts -o work/dtb_work/original.dts work/dtb_work/original.dtb
 
       - name: Patch ION carveout size in DTS
         run: |
           cat > work/patch_ion.py << 'PY'
-          import re
-          import sys
-
-          dts_path = sys.argv[1]
-          new_size = sys.argv[2]  # e.g., "0x2000000"
-
-          with open(dts_path, 'r') as f:
+          import re, sys
+          dts = sys.argv[1]
+          new_size = sys.argv[2]
+          with open(dts, 'r') as f:
               lines = f.readlines()
-
-          # Find the carveout_heap node and change its ion-size
           in_carveout = False
           patched = False
           out_lines = []
-
           for line in lines:
               if re.search(r'marvell,ion-name\s*=\s*"carveout_heap"', line):
                   in_carveout = True
               elif in_carveout and re.search(r'^\s*\}\s*;', line):
                   in_carveout = False
-
               if in_carveout and re.search(r'marvell,ion-size\s*=', line):
-                  # Replace with new size
-                  new_line = re.sub(r'<0x[0-9a-fA-F]+>', f'<{new_size}>', line)
-                  if new_line != line:
-                      patched = True
-                      print(f"Patched: {line.strip()} -> {new_line.strip()}")
-                  out_lines.append(new_line)
-              else:
-                  out_lines.append(line)
-
+                  line = re.sub(r'<0x[0-9a-fA-F]+>', f'<{new_size}>', line)
+                  patched = True
+              out_lines.append(line)
           if not patched:
-              print("WARNING: marvell,ion-size not found in carveout_heap. Did you specify correct node?")
+              print("ERROR: ion-size not found in carveout_heap")
               sys.exit(1)
-
-          with open(dts_path, 'w') as f:
+          with open(dts, 'w') as f:
               f.writelines(out_lines)
           PY
-
           python3 work/patch_ion.py work/dtb_work/original.dts "${{ inputs.ion_size_hex }}"
 
-      - name: Recompile patched DTS to DTB
+      - name: Recompile patched DTS to DTB (no sort, no symbols)
         run: |
+          # -s を使わず、-@ (シンボル生成) も無効にする
           dtc -I dts -O dtb -o work/dtb_work/patched.dtb work/dtb_work/original.dts
+          # サイズ確認（ソートなしなので若干大きくなる可能性あり）
+          orig_size=$(stat -c%s work/dtb_work/original.dtb)
+          new_size=$(stat -c%s work/dtb_work/patched.dtb)
+          echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
 
       - name: Verify patched DTB
         run: |
-          dtc -I dtb -O dts -o work/dtb_work/patched.dts work/dtb_work/patched.dtb
-          grep -A5 "carveout_heap" work/dtb_work/patched.dts || echo "carveout_heap not found?"
+          # パッチ後のDTBが有効かチェック
+          dtc -I dtb -O dts -o work/dtb_work/patched_check.dts work/dtb_work/patched.dtb
+          grep "carveout_heap" work/dtb_work/patched_check.dts -A5 || echo "WARNING: carveout_heap not found"
 
-      - name: Rebuild boot.img
+      - name: Rebuild boot.img with abootimg (override size limit)
         run: |
           cd work/input
-          # Prepare new second file (patched DTB)
-          cp ../dtb_work/patched.dtb ./new_second
+          # 元の boot.img サイズに 1MB のマージンを追加
+          orig_boot_size=$(stat -c%s boot.img)
+          new_boot_size=$((orig_boot_size + 0x100000))
+          echo "Original boot.img size: $orig_boot_size bytes, new limit: $new_boot_size"
 
-          # If original had a second, replace; if not, add it anyway
-          if [ -f second ]; then
-            echo "Replacing existing second"
-          else
-            echo "Adding second (DTB) where none existed"
-          fi
-
-          # Re-create boot.img using the same kernel, ramdisk, and new second
-          # If initrd.img doesn't exist, omit -r
+          # Re-create using abootimg with custom bootsize
           if [ -f initrd.img ]; then
-            abootimg --create new_boot.img -f bootimg.cfg -k zImage -r initrd.img -s new_second
+            abootimg --create new_boot.img \
+              -f bootimg.cfg \
+              -k zImage \
+              -r initrd.img \
+              -s ../dtb_work/patched.dtb \
+              -c "bootsize=$new_boot_size"
           else
-            abootimg --create new_boot.img -f bootimg.cfg -k zImage -s new_second
+            abootimg --create new_boot.img \
+              -f bootimg.cfg \
+              -k zImage \
+              -s ../dtb_work/patched.dtb \
+              -c "bootsize=$new_boot_size"
           fi
 
-          # Verify new boot.img
+          # 検証
           file new_boot.img
           abootimg -i new_boot.img
 
-      - name: Generate report and README
-        run: |
-          cat > work/out/README.txt << EOF
-          Patched boot.img
-          =================
-          Original boot.img: ${{ inputs.img_url }}
-          Patched ION carveout size to: ${{ inputs.ion_size_hex }}
-          Date: $(date -u)
-
-          Files included:
-          - new_boot.img            : Patched boot image
-          - original.dtb            : Original DTB extracted
-          - original.dts            : Original DTS (decompiled)
-          - patched.dtb             : Patched DTB (with new ion-size)
-          - patched.dts             : Patched DTS (for verification)
-          - bootimg.cfg             : Boot image configuration used
-          - zImage / initrd.img     : Extracted components (for reference)
-          EOF
-
-      - name: Collect output artifacts
+      - name: Collect outputs
         run: |
           mkdir -p work/out
           cp work/input/new_boot.img work/out/
           cp work/input/bootimg.cfg work/out/
-          cp work/input/zImage work/out/ || true
-          cp work/input/initrd.img work/out/ || true
           cp work/dtb_work/original.dtb work/out/
           cp work/dtb_work/original.dts work/out/
           cp work/dtb_work/patched.dtb work/out/
           cp work/dtb_work/patched.dts work/out/
-          # Also include any extra extracted dtbs from zImage
-          if [ -d work/dtb_work/extracted ]; then
-            cp work/dtb_work/extracted/*.dtb work/out/ || true
-          fi
+          cat > work/out/README.txt << EOF
+          Patched boot.img (No Sort, abootimg)
+          =====================================
+          Original boot.img: ${{ inputs.img_url }}
+          Patched ION carveout size to: ${{ inputs.ion_size_hex }}
+          Date: $(date -u)
+
+          Files:
+          - new_boot.img      : Patched boot image (ready to flash)
+          - original.dtb/dts  : Original Device Tree
+          - patched.dtb/dts   : Patched Device Tree (ion-size changed)
+          - bootimg.cfg       : abootimg config used
+
+          Note: -s (sort) was NOT used to avoid possible breakage.
+          Flash with: fastboot flash boot new_boot.img
+          EOF
 
       - name: Package ZIP
         run: |
