@@ -57,7 +57,7 @@ jobs:
           abootimg -x boot.img
           ls -la
 
-      - name: Extract DTB (from second or zImage)
+      - name: Extract and select correct DTB (by size and ion node)
         run: |
           cd work/input
           # If 'second' exists and is a valid DTB, use it
@@ -80,33 +80,57 @@ jobs:
             exit 1
           fi
 
-          # Find the DTB that contains "ion" node (use fdtget)
-          echo "Searching for DTB with ion node..."
-          for dtb in ../dtb_work/extracted/*.dtb; do
-            if fdtget -t s "$dtb" /ion compatible 2>/dev/null >/dev/null; then
-              echo "Found ion node in $(basename "$dtb")"
-              cp "$dtb" ../dtb_work/original.dtb
-              echo "source=kernel" > ../dtb_work/source.txt
-              break
-            fi
-          done
+          # List all extracted DTBs with sizes
+          echo "Extracted DTBs:"
+          ls -la ../dtb_work/extracted/*.dtb
 
-          if [ ! -f ../dtb_work/original.dtb ]; then
-            echo "No DTB with ion node found, picking largest as fallback"
-            largest=$(ls -S ../dtb_work/extracted/*.dtb | head -n1)
-            cp "$largest" ../dtb_work/original.dtb
-            echo "source=kernel(fallback)" > ../dtb_work/source.txt
+          # Pick the largest DTB (likely the main one)
+          largest=$(ls -S ../dtb_work/extracted/*.dtb | head -n1)
+          largest_size=$(stat -c%s "$largest")
+          echo "Largest DTB: $(basename "$largest") size: $largest_size bytes"
+
+          # Ensure the size is reasonable (should be > 100KB for a main DTB)
+          if [ $largest_size -lt 102400 ]; then
+            echo "WARNING: Largest DTB is less than 100KB. This may be a sub-DTB."
+            # Try to find any DTB with ion node
+            for dtb in ../dtb_work/extracted/*.dtb; do
+              if fdtget -t s "$dtb" /ion compatible 2>/dev/null >/dev/null; then
+                echo "Found DTB with ion node: $(basename "$dtb")"
+                cp "$dtb" ../dtb_work/original.dtb
+                echo "source=kernel(ion)" > ../dtb_work/source.txt
+                break
+              fi
+            done
           fi
 
-      - name: Verify DTB
+          # If no DTB selected yet, use the largest
+          if [ ! -f ../dtb_work/original.dtb ]; then
+            cp "$largest" ../dtb_work/original.dtb
+            echo "source=kernel(largest)" > ../dtb_work/source.txt
+          fi
+
+      - name: Verify DTB and check ion node
         run: |
-          magic=$(xxd -p -l 4 work/dtb_work/original.dtb)
+          cd work/dtb_work
+          magic=$(xxd -p -l 4 original.dtb)
           if [ "$magic" != "d00dfeed" ]; then
             echo "Invalid DTB" >&2
             exit 1
           fi
-          size=$(stat -c%s work/dtb_work/original.dtb)
+          size=$(stat -c%s original.dtb)
           echo "Selected DTB size: $size bytes"
+          if [ $size -lt 102400 ]; then
+            echo "ERROR: DTB size is less than 100KB. This is not the main DTB." >&2
+            echo "Please check the extracted DTB files manually." >&2
+            exit 1
+          fi
+          # Check for ion node
+          if ! fdtget -t s original.dtb /ion compatible 2>/dev/null >/dev/null; then
+            echo "WARNING: ion node not found in this DTB."
+            echo "This may not be the correct DTB, but proceeding anyway."
+          else
+            echo "ion node found"
+          fi
 
       - name: Check current ion-size value
         run: |
@@ -121,16 +145,13 @@ jobs:
       - name: Patch ion-size using fdtput (binary edit)
         run: |
           cd work/dtb_work
-          # fdtput requires the value as a byte string; we use -t x for hex
           new_size="${{ inputs.ion_size_hex }}"
-          # Remove '0x' prefix if present
           new_size_clean="${new_size#0x}"
           echo "New ion-size: $new_size"
           fdtput -t x original.dtb /ion/heap1 marvell,ion-size "$new_size_clean"
           # Verify
           patched=$(fdtget -t x original.dtb /ion/heap1 marvell,ion-size 2>/dev/null)
           echo "Patched ion-size: $patched"
-          # Save as patched.dtb (actually the same file, but we'll copy for clarity)
           cp original.dtb patched.dtb
 
       - name: Verify patched DTB size (should be identical)
@@ -195,7 +216,6 @@ jobs:
             echo "Invalid boot image" >&2
             exit 1
           fi
-          # Check second stage size in header matches actual
           cd work/input
           python3 -c "
           import struct
