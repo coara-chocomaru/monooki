@@ -1,4 +1,4 @@
-name: Extract DTB, Patch ION Size, Rebuild boot.img (No Sort)
+name: Patch ION Carveout Size and Rebuild boot.img
 
 on:
   workflow_dispatch:
@@ -31,7 +31,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             device-tree-compiler \
-            abootimg \
             python3 \
             python3-pip \
             curl \
@@ -51,45 +50,56 @@ jobs:
           curl -L --fail --retry 5 --retry-delay 2 "${{ inputs.img_url }}" -o work/input/boot.img
           file work/input/boot.img
 
-      - name: Unpack boot.img with abootimg
+      - name: Unpack boot.img with abootimg (just to get components)
         run: |
           cd work/input
           abootimg -x boot.img
           ls -la
 
-      - name: Extract DTB from 'second' or zImage
+      - name: Extract and select correct DTB
         run: |
           cd work/input
+          # If 'second' exists and is a valid DTB, use it
           if [ -f second ]; then
             magic=$(xxd -p -l 4 second)
             if [ "$magic" = "d00dfeed" ]; then
-              echo "DTB found in 'second'"
+              echo "Using DTB from 'second'"
               cp second ../dtb_work/original.dtb
+              echo "source=second" > ../dtb_work/source.txt
               exit 0
             fi
           fi
 
-          # Extract from zImage
-          echo "Extracting DTB from zImage..."
+          # Otherwise extract from zImage and pick the largest DTB
+          echo "Extracting DTBs from zImage..."
           mkdir -p ../dtb_work/extracted
           extract-dtb zImage -o ../dtb_work/extracted/
-          if [ -d ../dtb_work/extracted ] && [ "$(ls -A ../dtb_work/extracted)" ]; then
-            first_dtb=$(ls ../dtb_work/extracted/*.dtb | head -n1)
-            cp "$first_dtb" ../dtb_work/original.dtb
+          if [ -d ../dtb_work/extracted ]; then
+            # List all extracted DTBs with sizes
+            cd ../dtb_work/extracted
+            ls -la *.dtb
+            # Pick the largest one (likely the main DTB)
+            largest=$(ls -S *.dtb | head -n1)
+            echo "Selected largest DTB: $largest"
+            cp "$largest" ../original.dtb
+            cd ..
+            echo "source=kernel" > source.txt
           else
             echo "No DTB found" >&2
             exit 1
           fi
 
-      - name: Verify DTB magic
+      - name: Verify selected DTB
         run: |
           magic=$(xxd -p -l 4 work/dtb_work/original.dtb)
           if [ "$magic" != "d00dfeed" ]; then
             echo "Invalid DTB" >&2
             exit 1
           fi
+          size=$(stat -c%s work/dtb_work/original.dtb)
+          echo "Selected DTB size: $size bytes"
 
-      - name: Decompile original DTB to DTS
+      - name: Decompile DTB to DTS (no sort)
         run: |
           dtc -I dtb -O dts -o work/dtb_work/original.dts work/dtb_work/original.dtb
 
@@ -127,36 +137,80 @@ jobs:
           orig_size=$(stat -c%s work/dtb_work/original.dtb)
           new_size=$(stat -c%s work/dtb_work/patched.dtb)
           echo "Original DTB: $orig_size bytes, Patched: $new_size bytes"
+          # Verify the patched DTB is valid
+          dtc -I dtb -O dts -o work/dtb_work/patched_check.dts work/dtb_work/patched.dtb
 
-      - name: Decompile patched DTB to DTS (for verification and output)
-        run: |
-          dtc -I dtb -O dts -o work/dtb_work/patched.dts work/dtb_work/patched.dtb
-          grep "carveout_heap" work/dtb_work/patched.dts -A5 || echo "WARNING: carveout_heap not found"
-
-      - name: Rebuild boot.img with abootimg (override size limit)
+      - name: Repack boot.img using Python (exact control)
         run: |
           cd work/input
-          orig_boot_size=$(stat -c%s boot.img)
-          new_boot_size=$((orig_boot_size + 0x100000))
-          echo "Original boot.img size: $orig_boot_size bytes, new limit: $new_boot_size"
+          cat > repack.py << 'EOF'
+          import struct, json, os
 
-          if [ -f initrd.img ]; then
-            abootimg --create new_boot.img \
-              -f bootimg.cfg \
-              -k zImage \
-              -r initrd.img \
-              -s ../dtb_work/patched.dtb \
-              -c "bootsize=$new_boot_size"
-          else
-            abootimg --create new_boot.img \
-              -f bootimg.cfg \
-              -k zImage \
-              -s ../dtb_work/patched.dtb \
-              -c "bootsize=$new_boot_size"
+          BOOT_MAGIC = b'ANDROID!'
+          HEADER_SIZE = 2048
+
+          # Read original boot.img header to extract metadata
+          with open('boot.img', 'rb') as f:
+              orig_data = f.read()
+              header = orig_data[:HEADER_SIZE]
+              # Parse header
+              magic = header[:8]
+              if magic != BOOT_MAGIC:
+                  raise ValueError("Not a valid boot image")
+              kernel_size = struct.unpack('<I', header[8:12])[0]
+              kernel_addr = struct.unpack('<I', header[12:16])[0]
+              ramdisk_size = struct.unpack('<I', header[16:20])[0]
+              ramdisk_addr = struct.unpack('<I', header[20:24])[0]
+              second_size = struct.unpack('<I', header[24:28])[0]
+              second_addr = struct.unpack('<I', header[28:32])[0]
+              tags_addr = struct.unpack('<I', header[32:36])[0]
+              page_size = struct.unpack('<I', header[36:40])[0]
+              # Read components
+              kernel_data = orig_data[HEADER_SIZE:HEADER_SIZE+kernel_size]
+              ramdisk_data = orig_data[HEADER_SIZE+kernel_size:HEADER_SIZE+kernel_size+ramdisk_size]
+              # second stage might be zero size; we'll replace with patched DTB
+              # Keep the original second addr
+          # Read patched DTB
+          with open('../dtb_work/patched.dtb', 'rb') as f:
+              second_data = f.read()
+          second_size_new = len(second_data)
+
+          # Prepare new header, copy most fields
+          new_header = bytearray(header)
+          # Update sizes
+          struct.pack_into('<I', new_header, 24, second_size_new)
+          # The rest (addresses, page size, cmdline) remain as original
+          # Write new boot.img
+          with open('new_boot.img', 'wb') as f:
+              f.write(new_header)
+              f.write(kernel_data)
+              f.write(ramdisk_data)
+              f.write(second_data)
+          # Print info
+          print(f"Kernel: {len(kernel_data)} bytes")
+          print(f"Ramdisk: {len(ramdisk_data)} bytes")
+          print(f"Second stage (DTB): {len(second_data)} bytes")
+          print(f"New boot.img size: {os.path.getsize('new_boot.img')} bytes")
+          EOF
+          python3 repack.py
+
+      - name: Verify new boot.img
+        run: |
+          file work/input/new_boot.img
+          magic=$(xxd -p -l 8 work/input/new_boot.img)
+          if [ "$magic" != "414e44524f494421" ]; then
+            echo "Invalid boot image" >&2
+            exit 1
           fi
-
-          file new_boot.img
-          abootimg -i new_boot.img
+          # Also check second stage size in header
+          cd work/input
+          python3 -c "
+          import struct
+          with open('new_boot.img', 'rb') as f:
+              f.seek(24)
+              second_size = struct.unpack('<I', f.read(4))[0]
+              print(f'Second stage size in header: {second_size} bytes')
+          "
 
       - name: Collect outputs
         run: |
@@ -168,8 +222,8 @@ jobs:
           cp work/dtb_work/patched.dtb work/out/
           cp work/dtb_work/patched.dts work/out/
           cat > work/out/README.txt << EOF
-          Patched boot.img (No Sort, abootimg)
-          =====================================
+          Patched boot.img (Manual Python Repack)
+          ========================================
           Original boot.img: ${{ inputs.img_url }}
           Patched ION carveout size to: ${{ inputs.ion_size_hex }}
           Date: $(date -u)
@@ -178,9 +232,9 @@ jobs:
           - new_boot.img      : Patched boot image (ready to flash)
           - original.dtb/dts  : Original Device Tree
           - patched.dtb/dts   : Patched Device Tree (ion-size changed)
-          - bootimg.cfg       : abootimg config used
+          - bootimg.cfg       : abootimg config used for extraction only
 
-          Note: -s (sort) was NOT used to avoid possible breakage.
+          Note: Repacked manually to ensure correct sizes.
           Flash with: fastboot flash boot new_boot.img
           EOF
 
