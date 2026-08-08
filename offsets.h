@@ -1,5 +1,5 @@
-#ifndef OFFSET_H
-#define OFFSET_H
+#ifndef TARGET_CONFIG_H
+#define TARGET_CONFIG_H
 
 /* ── Image base & KASLR ─────────────────────────────────────────────── */
 #define KIMAGE_TEXT_BASE        0xffffff8008080000ULL
