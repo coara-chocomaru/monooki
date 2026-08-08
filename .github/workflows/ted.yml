@@ -25,26 +25,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 自分のリポジトリをチェックアウト（kallsyms.txt を配置する場所）
+      # 1. 自分のリポジトリをチェックアウト（kallsyms.txt を配置する場所）
       - name: 自分のリポジトリをチェックアウト
         uses: actions/checkout@v4
 
-      # PoCリポジトリを別ディレクトリにクローン
+      # 2. PoCリポジトリを別ディレクトリにクローン（x-spy/popsicle を使用）
       - name: PoCリポジトリをクローン
         uses: actions/checkout@v4
         with:
-          repository: Bartixxx32/CVE-2026-43499-OnePlus15
-          ref: master
+          repository: x-spy/CVE-2026-43499-popsicle
+          ref: main
           path: exploit
 
-      # 依存パッケージのインストール
+      # 3. 依存パッケージのインストール
       - name: 依存パッケージをインストール
         run: |
           sudo apt-get update
           sudo apt-get install -y make wget unzip python3 python3-pip llvm lld
           pip3 install pyelftools
 
-      # Android NDK r29 のダウンロード＆セットアップ
+      # 4. Android NDK r29 のダウンロード＆セットアップ
       - name: Android NDK r29 をダウンロード
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
@@ -54,8 +54,9 @@ jobs:
           fi
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
           echo "NDK_ROOT=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
+          echo "$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      # NDK ツールチェーンに実行権限を付与
+      # 5. NDK ツールチェーンに実行権限を付与
       - name: NDK ツールチェーンに実行権限を付与
         run: |
           NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -71,14 +72,14 @@ jobs:
             fi
           fi
 
-      # boot.img をダウンロード
+      # 6. boot.img をダウンロード
       - name: boot.img をダウンロード
         run: |
           cd exploit
           wget -q -O boot.img "${{ github.event.inputs.boot_img_url }}"
           ls -la boot.img
 
-      # xbl_config.img をダウンロード（指定があれば）
+      # 7. xbl_config.img をダウンロード（指定があれば）
       - name: xbl_config.img をダウンロード
         if: github.event.inputs.xbl_config_url != ''
         run: |
@@ -86,101 +87,43 @@ jobs:
           wget -q -O xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
           ls -la xbl_config.img
 
-      # ★★★ kallsyms.txt をコピーし、内容を確認 ★★★
-      - name: kallsyms.txt を配置して確認
+      # 8. kallsyms.txt を配置（自分のリポジトリからコピー）
+      - name: kallsyms.txt を配置
         run: |
           if [ ! -f kallsyms.txt ]; then
             echo "エラー: kallsyms.txt がリポジトリのルートにありません。"
             exit 1
           fi
           cp kallsyms.txt exploit/kallsyms.txt
-          cd exploit
-          echo "=== kallsyms.txt の先頭20行 ==="
-          head -20 kallsyms.txt
-          echo "=== kallsyms.txt の行数 ==="
-          wc -l kallsyms.txt
-          echo "=== 'memstart' を含む行 ==="
-          grep -i "memstart" kallsyms.txt || echo "見つかりません"
-          echo "=== '_text' を含む行 ==="
-          grep -i "_text" kallsyms.txt | head -5 || echo "見つかりません"
-          echo "=== '_stext' を含む行 ==="
-          grep -i "_stext" kallsyms.txt | head -5 || echo "見つかりません"
+          echo "kallsyms.txt をコピーしました"
+          head -5 exploit/kallsyms.txt
 
-      # ★★★ kallsyms.txt からオフセットを抽出して profile.json を生成 ★★★
-      - name: profile.json を生成（kallsymsから抽出）
+      # 9. extract_target.py を使用して target.h を生成
+      - name: target.h を生成（extract_target.py）
         run: |
           cd exploit
-          echo "kallsyms.txt からオフセットを抽出します..."
-          
-          # 物理オフセット（デフォルト値、後で上書き可能）
-          PHYS_OFFSET="0x80000000"
-          
-          # カーネルロードアドレスを抽出（複数のパターンを試行）
-          KERNEL_LOAD=""
-          
-          # パターン1: memstart_addr
-          if [ -z "$KERNEL_LOAD" ]; then
-            KERNEL_LOAD=$(grep " memstart_addr$" kallsyms.txt | awk '{print $1}')
-            [ -n "$KERNEL_LOAD" ] && echo "memstart_addr = $KERNEL_LOAD"
-          fi
-          
-          # パターン2: _text
-          if [ -z "$KERNEL_LOAD" ]; then
-            KERNEL_LOAD=$(grep " _text$" kallsyms.txt | awk '{print $1}')
-            [ -n "$KERNEL_LOAD" ] && echo "_text = $KERNEL_LOAD"
-          fi
-          
-          # パターン3: _stext
-          if [ -z "$KERNEL_LOAD" ]; then
-            KERNEL_LOAD=$(grep " _stext$" kallsyms.txt | awk '{print $1}')
-            [ -n "$KERNEL_LOAD" ] && echo "_stext = $KERNEL_LOAD"
-          fi
-          
-          # パターン4: 先頭のアドレス（一番小さいアドレスを取得）
-          if [ -z "$KERNEL_LOAD" ]; then
-            # 先頭の行からアドレスを取得（16進数でソートして最小値を探す）
-            KERNEL_LOAD=$(grep -E "^[0-9a-f]+ " kallsyms.txt | awk '{print $1}' | sort -n | head -1)
-            [ -n "$KERNEL_LOAD" ] && echo "先頭アドレス = $KERNEL_LOAD"
-          fi
-          
-          if [ -z "$KERNEL_LOAD" ]; then
-            echo "エラー: カーネルロードアドレスを抽出できませんでした。"
-            echo "kallsyms.txt のフォーマットを確認してください。"
-            exit 1
-          fi
-          
-          # アドレスが '0x' で始まっていなければ付加
-          if [[ ! "$KERNEL_LOAD" =~ ^0x ]]; then
-            KERNEL_LOAD="0x$KERNEL_LOAD"
-          fi
-          
-          echo "抽出されたカーネルロードアドレス: $KERNEL_LOAD"
-          
-          # profile.json を生成
-          cat > profile.json << EOF
-           {
-            "p0_phys_offset": "$PHYS_OFFSET",
-            "p0_kernel_phys_load": "$KERNEL_LOAD"
-            }
-            EOF
-          
-          echo "=== profile.json の内容 ==="
-          cat profile.json
-          
-      - name: target.h を生成（generate_target.py）
-        run: |
-          cd exploit
-          if [ -f generate_target.py ]; then
-            python3 generate_target.py \
-              --boot boot.img \
-              --profile profile.json \
-              -o source/src/target.h
+          if [ -f tools/extract_target.py ]; then
+            echo "tools/extract_target.py を使用します"
+            if [ -f xbl_config.img ]; then
+              python3 tools/extract_target.py \
+                boot.img \
+                --xbl-config xbl_config.img \
+                --kallsyms kallsyms.txt \
+                --format c \
+                --out source/src/target.h
+            else
+              python3 tools/extract_target.py \
+                boot.img \
+                --kallsyms kallsyms.txt \
+                --format c \
+                --out source/src/target.h
+            fi
           else
-            echo "エラー: generate_target.py が見つかりません。"
+            echo "エラー: tools/extract_target.py が見つかりません。"
             exit 1
           fi
 
-      # target.h の内容を確認
+      # 10. target.h の内容を確認（デバッグ用）
       - name: target.h を確認
         run: |
           cd exploit
@@ -192,14 +135,14 @@ jobs:
             exit 1
           fi
 
-      # preload.so をコンパイル
+      # 11. preload.so をコンパイル
       - name: preload.so をコンパイル
         run: |
           cd exploit
           export ANDROID_API="${{ github.event.inputs.api_level }}"
           make -C source clean preload
 
-      # ビルド成果物をアップロード
+      # 12. ビルド成果物をアップロード
       - name: preload.so をアップロード
         uses: actions/upload-artifact@v4
         with:
