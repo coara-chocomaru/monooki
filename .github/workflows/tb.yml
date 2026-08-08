@@ -1,11 +1,10 @@
-# .github/workflows/build-preload.yml
-name: Build preload.so
+name: Build preload.so (NebuSec/CyberMeowfia)
 
 on:
   workflow_dispatch:
     inputs:
       api_level:
-        description: 'Android APIレベル（デフォルト: 28 = Android 9）'
+        description: 'Android APIレベル'
         required: false
         type: number
         default: 28
@@ -18,10 +17,10 @@ jobs:
       - name: 自分のリポジトリをチェックアウト
         uses: actions/checkout@v4
 
-      - name: PoCリポジトリをクローン
+      - name: PoCリポジトリをクローン（NebuSec/CyberMeowfia）
         uses: actions/checkout@v4
         with:
-          repository: x-spy/CVE-2026-43499-popsicle
+          repository: NebuSec/CyberMeowfia
           ref: main
           path: exploit
 
@@ -65,7 +64,6 @@ jobs:
           fi
           cp target.h exploit/source/src/target.h
           echo "✅ target.h を配置しました。"
-          head -10 exploit/source/src/target.h
 
       - name: preload.so をコンパイル
         run: |
