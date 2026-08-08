@@ -10,7 +10,7 @@ on:
         type: string
         default: 'https://example.com/path/to/boot.img'
       xbl_config_url:
-        description: 'xbl_config.img の直接ダウンロードURL（高通デバイスの場合必要）'
+        description: 'xbl_config.img の直接ダウンロードURL（高通デバイスの場合必要、無ければ空）'
         required: false
         type: string
         default: ''
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. リポジトリのクローン（x-spy/popsicle をベースに、kallsyms対応済みのフォークを使用）
+      # 1. リポジトリのクローン（kallsyms対応済みのフォークを使用）
       - name: リポジトリをクローン
         uses: actions/checkout@v4
         with:
@@ -38,19 +38,40 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y make wget unzip python3 python3-pip llvm lld
+          pip3 install pyelftools
 
-      # 3. Android NDK r29 のダウンロード＆セットアップ
+      # 3. Android NDK r29 のダウンロード＆セットアップ（パスを確実に）
       - name: Android NDK r29 をダウンロード
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
           unzip -q android-ndk-r29-linux.zip -d $HOME
+          # 展開後のディレクトリ名が android-ndk-r29 なのでリネーム
+          if [ -d "$HOME/android-ndk-r29" ]; then
+            mv $HOME/android-ndk-r29 $HOME/android-ndk-r29-linux
+          fi
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
           echo "NDK_ROOT=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
 
-      # 4. NDK ツールチェーンに実行権限を付与
+      # 4. NDK ツールチェーンに実行権限を付与（存在確認付き）
       - name: NDK ツールチェーンに実行権限を付与
         run: |
-          chmod -R +x $HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin/
+          NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ -d "$NDK_BIN" ]; then
+            chmod -R +x "$NDK_BIN"
+            echo "NDK bin ディレクトリに権限を付与しました: $NDK_BIN"
+          else
+            echo "警告: NDK bin ディレクトリが見つかりません。パスを確認します。"
+            find $HOME/android-ndk-r29-linux -name "bin" -type d 2>/dev/null || true
+            # 代替パスを試す（古い構造）
+            ALT_NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86/bin"
+            if [ -d "$ALT_NDK_BIN" ]; then
+              chmod -R +x "$ALT_NDK_BIN"
+              echo "代替パスに権限を付与しました: $ALT_NDK_BIN"
+            else
+              echo "エラー: NDK ツールチェーンが見つかりません。"
+              exit 1
+            fi
+          fi
 
       # 5. boot.img をダウンロード
       - name: boot.img をダウンロード
@@ -58,8 +79,9 @@ jobs:
           cd exploit
           wget -q -O boot.img "${{ github.event.inputs.boot_img_url }}"
           ls -la boot.img
+          file boot.img
 
-      # 6. xbl_config.img をダウンロード（オプション）
+      # 6. xbl_config.img をダウンロード（指定があれば）
       - name: xbl_config.img をダウンロード
         if: github.event.inputs.xbl_config_url != ''
         run: |
@@ -67,23 +89,23 @@ jobs:
           wget -q -O xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
           ls -la xbl_config.img
 
-      # 7. kallsyms.txt を配置（リポジトリルートに配置済みであることを前提）
+      # 7. kallsyms.txt をリポジトリルートからコピー
       - name: kallsyms.txt を配置
         run: |
-          # リポジトリのルートにある kallsyms.txt を exploit ディレクトリにコピー
           if [ -f kallsyms.txt ]; then
             cp kallsyms.txt exploit/kallsyms.txt
             echo "kallsyms.txt をコピーしました"
+            head -5 exploit/kallsyms.txt
           else
-            echo "警告: kallsyms.txt が見つかりません。リポジトリのルートに配置してください。"
+            echo "エラー: kallsyms.txt がリポジトリのルートにありません。"
             exit 1
           fi
 
-      # 8. extract_target.py で target.h を生成（kallsyms利用）
-      - name: target.h を生成（extract_target.py）
+      # 8. target.h を生成（extract_target.py または generate_target.py）
+      - name: target.h を生成
         run: |
           cd exploit
-          # tools/extract_target.py が存在するか確認
+          # extract_target.py が存在するか確認
           if [ -f tools/extract_target.py ]; then
             echo "tools/extract_target.py を使用します"
             if [ -f xbl_config.img ]; then
@@ -101,15 +123,34 @@ jobs:
                 --out source/src/target.h
             fi
           else
-            # extract_target.py が無い場合は generate_target.py を試す
-            echo "tools/extract_target.py が見つかりません。generate_target.py を試します"
-            # まず profile.json をダミーで作成（kallsymsから抽出した値で上書きされることを期待）
+            echo "tools/extract_target.py がありません。generate_target.py を試します"
+            # ダミーの profile.json を作成（kallsyms からオフセットを抽出するため）
             echo '{"p0_phys_offset": "0x80000000", "p0_kernel_phys_load": "0xc7800000"}' > profile.json
-            python3 generate_target.py \
-              --boot boot.img \
-              --profile profile.json \
-              --kallsyms kallsyms.txt \
-              -o source/src/target.h
+            # generate_target.py が --kallsyms オプションをサポートしているか確認
+            if python3 generate_target.py --help | grep -q -- --kallsyms; then
+              python3 generate_target.py \
+                --boot boot.img \
+                --profile profile.json \
+                --kallsyms kallsyms.txt \
+                -o source/src/target.h
+            else
+              # サポートしていない場合は、kallsyms から手動でオフセット抽出（簡易版）
+              echo "generate_target.py は --kallsyms をサポートしていません。"
+              echo "kallsyms.txt から memstart_addr を抽出します。"
+              MEMSTART=$(grep " memstart_addr$" kallsyms.txt | awk '{print $1}')
+              if [ -n "$MEMSTART" ]; then
+                echo "memstart_addr = $MEMSTART"
+                # profile.json を更新
+                echo "{\"p0_phys_offset\": \"0x80000000\", \"p0_kernel_phys_load\": \"$MEMSTART\"}" > profile.json
+                python3 generate_target.py \
+                  --boot boot.img \
+                  --profile profile.json \
+                  -o source/src/target.h
+              else
+                echo "memstart_addr が見つかりません。手動で profile.json を設定してください。"
+                exit 1
+              fi
+            fi
           fi
 
       # 9. target.h の内容を確認（デバッグ用）
@@ -117,17 +158,19 @@ jobs:
         run: |
           cd exploit
           if [ -f source/src/target.h ]; then
-            echo "target.h の内容:"
+            echo "target.h が生成されました。先頭50行:"
             head -50 source/src/target.h
           else
             echo "エラー: target.h が生成されていません"
             exit 1
           fi
 
-      # 10. preload.so をコンパイル
+      # 10. preload.so をコンパイル（APIレベル指定付き）
       - name: preload.so をコンパイル
         run: |
           cd exploit
+          # Android 9 向けに API レベル 28 を指定
+          export ANDROID_API="${{ github.event.inputs.api_level }}"
           make -C source clean preload
 
       # 11. ビルド成果物をアップロード
