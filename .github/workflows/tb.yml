@@ -1,0 +1,103 @@
+# .github/workflows/build-preload.yml
+name: Build preload.so (using offsets.h)
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'boot.img の直接ダウンロードURL（ビルドには使いませんが、念のため取得）'
+        required: false
+        type: string
+        default: ''
+      api_level:
+        description: 'Android APIレベル（デフォルト: 28 = Android 9）'
+        required: false
+        type: number
+        default: 28
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 自分のリポジトリをチェックアウト（offsets.h を配置する場所）
+      - name: 自分のリポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      # 2. PoCリポジトリをクローン（x-spy/popsicle を使用）
+      - name: PoCリポジトリをクローン
+        uses: actions/checkout@v4
+        with:
+          repository: x-spy/CVE-2026-43499-popsicle
+          ref: main
+          path: exploit
+
+      # 3. 依存パッケージのインストール（NDK とビルドツール）
+      - name: 依存パッケージをインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make wget unzip python3 python3-pip llvm lld
+          pip3 install pyelftools
+
+      # 4. Android NDK r29 のダウンロード＆セットアップ
+      - name: Android NDK r29 をダウンロード
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q android-ndk-r29-linux.zip -d $HOME
+          if [ -d "$HOME/android-ndk-r29" ]; then
+            mv $HOME/android-ndk-r29 $HOME/android-ndk-r29-linux
+          fi
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
+          echo "NDK_ROOT=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
+          echo "$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      # 5. NDK ツールチェーンに実行権限を付与
+      - name: NDK ツールチェーンに実行権限を付与
+        run: |
+          NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ -d "$NDK_BIN" ]; then
+            chmod -R +x "$NDK_BIN"
+          else
+            ALT_NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86/bin"
+            if [ -d "$ALT_NDK_BIN" ]; then
+              chmod -R +x "$ALT_NDK_BIN"
+            else
+              echo "エラー: NDK ツールチェーンが見つかりません。"
+              exit 1
+            fi
+          fi
+
+      # 6. （オプション）boot.img をダウンロード（ビルドには使いません）
+      - name: boot.img をダウンロード（オプション）
+        if: github.event.inputs.boot_img_url != ''
+        run: |
+          cd exploit
+          wget -q -O boot.img "${{ github.event.inputs.boot_img_url }}"
+          ls -la boot.img
+
+      # 7. オフセットファイルを配置（offsets.h → source/src/target.h）
+      - name: オフセットファイルを配置
+        run: |
+          if [ ! -f offsets.h ]; then
+            echo "エラー: offsets.h がリポジトリのルートにありません。"
+            exit 1
+          fi
+          cp offsets.h exploit/source/src/target.h
+          echo "offsets.h を source/src/target.h にコピーしました"
+          # 念のため内容を確認
+          head -20 exploit/source/src/target.h
+
+      # 8. preload.so をコンパイル
+      - name: preload.so をコンパイル
+        run: |
+          cd exploit
+          export ANDROID_API="${{ github.event.inputs.api_level }}"
+          make -C source clean preload
+
+      # 9. ビルド成果物をアップロード
+      - name: preload.so をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: preload-so
+          path: exploit/source/build/bin/preload.so
+          if-no-files-found: error
