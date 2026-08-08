@@ -1,10 +1,11 @@
-name: Build preload.so (NebuSec/CyberMeowfia)
+# .github/workflows/build-preload.yml
+name: Build preload.so
 
 on:
   workflow_dispatch:
     inputs:
       api_level:
-        description: 'Android APIレベル'
+        description: 'Android APIレベル（デフォルト: 28 = Android 9）'
         required: false
         type: number
         default: 28
@@ -56,12 +57,13 @@ jobs:
             fi
           fi
 
-      - name: target.h を配置
+      - name: target.h を配置（リポジトリルートからコピー）
         run: |
           if [ ! -f target.h ]; then
             echo "エラー: target.h がリポジトリのルートにありません。"
             exit 1
           fi
+          mkdir -p exploit/source/src
           cp target.h exploit/source/src/target.h
           echo "✅ target.h を配置しました。"
 
