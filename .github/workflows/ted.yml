@@ -25,34 +25,37 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. リポジトリのクローン（kallsyms対応済みのフォークを使用）
-      - name: リポジトリをクローン
+      # ★★★ 最初に自分のリポジトリをチェックアウト（これで kallsyms.txt が利用可能）★★★
+      - name: 自分のリポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      # 次に PoC リポジトリを別ディレクトリにクローン
+      - name: PoCリポジトリをクローン
         uses: actions/checkout@v4
         with:
           repository: Bartixxx32/CVE-2026-43499-OnePlus15
           ref: master
           path: exploit
 
-      # 2. 依存パッケージのインストール
+      # 依存パッケージのインストール
       - name: 依存パッケージをインストール
         run: |
           sudo apt-get update
           sudo apt-get install -y make wget unzip python3 python3-pip llvm lld
           pip3 install pyelftools
 
-      # 3. Android NDK r29 のダウンロード＆セットアップ（パスを確実に）
+      # Android NDK r29 のダウンロード＆セットアップ
       - name: Android NDK r29 をダウンロード
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
           unzip -q android-ndk-r29-linux.zip -d $HOME
-          # 展開後のディレクトリ名が android-ndk-r29 なのでリネーム
           if [ -d "$HOME/android-ndk-r29" ]; then
             mv $HOME/android-ndk-r29 $HOME/android-ndk-r29-linux
           fi
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
           echo "NDK_ROOT=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
 
-      # 4. NDK ツールチェーンに実行権限を付与（存在確認付き）
+      # NDK ツールチェーンに実行権限を付与（存在確認付き）
       - name: NDK ツールチェーンに実行権限を付与
         run: |
           NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -60,9 +63,6 @@ jobs:
             chmod -R +x "$NDK_BIN"
             echo "NDK bin ディレクトリに権限を付与しました: $NDK_BIN"
           else
-            echo "警告: NDK bin ディレクトリが見つかりません。パスを確認します。"
-            find $HOME/android-ndk-r29-linux -name "bin" -type d 2>/dev/null || true
-            # 代替パスを試す（古い構造）
             ALT_NDK_BIN="$HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86/bin"
             if [ -d "$ALT_NDK_BIN" ]; then
               chmod -R +x "$ALT_NDK_BIN"
@@ -73,7 +73,7 @@ jobs:
             fi
           fi
 
-      # 5. boot.img をダウンロード
+      # boot.img をダウンロード
       - name: boot.img をダウンロード
         run: |
           cd exploit
@@ -81,7 +81,7 @@ jobs:
           ls -la boot.img
           file boot.img
 
-      # 6. xbl_config.img をダウンロード（指定があれば）
+      # xbl_config.img をダウンロード（指定があれば）
       - name: xbl_config.img をダウンロード
         if: github.event.inputs.xbl_config_url != ''
         run: |
@@ -89,7 +89,7 @@ jobs:
           wget -q -O xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
           ls -la xbl_config.img
 
-      # 7. kallsyms.txt をリポジトリルートからコピー
+      # ★★★ 自分のリポジトリから kallsyms.txt を PoC ディレクトリにコピー ★★★
       - name: kallsyms.txt を配置
         run: |
           if [ -f kallsyms.txt ]; then
@@ -101,11 +101,10 @@ jobs:
             exit 1
           fi
 
-      # 8. target.h を生成（extract_target.py または generate_target.py）
+      # target.h を生成（extract_target.py または generate_target.py）
       - name: target.h を生成
         run: |
           cd exploit
-          # extract_target.py が存在するか確認
           if [ -f tools/extract_target.py ]; then
             echo "tools/extract_target.py を使用します"
             if [ -f xbl_config.img ]; then
@@ -126,7 +125,6 @@ jobs:
             echo "tools/extract_target.py がありません。generate_target.py を試します"
             # ダミーの profile.json を作成（kallsyms からオフセットを抽出するため）
             echo '{"p0_phys_offset": "0x80000000", "p0_kernel_phys_load": "0xc7800000"}' > profile.json
-            # generate_target.py が --kallsyms オプションをサポートしているか確認
             if python3 generate_target.py --help | grep -q -- --kallsyms; then
               python3 generate_target.py \
                 --boot boot.img \
@@ -134,13 +132,11 @@ jobs:
                 --kallsyms kallsyms.txt \
                 -o source/src/target.h
             else
-              # サポートしていない場合は、kallsyms から手動でオフセット抽出（簡易版）
+              # --kallsyms 非対応の場合は kallsyms.txt から memstart_addr を抽出
               echo "generate_target.py は --kallsyms をサポートしていません。"
-              echo "kallsyms.txt から memstart_addr を抽出します。"
               MEMSTART=$(grep " memstart_addr$" kallsyms.txt | awk '{print $1}')
               if [ -n "$MEMSTART" ]; then
                 echo "memstart_addr = $MEMSTART"
-                # profile.json を更新
                 echo "{\"p0_phys_offset\": \"0x80000000\", \"p0_kernel_phys_load\": \"$MEMSTART\"}" > profile.json
                 python3 generate_target.py \
                   --boot boot.img \
@@ -153,7 +149,7 @@ jobs:
             fi
           fi
 
-      # 9. target.h の内容を確認（デバッグ用）
+      # target.h の内容を確認（デバッグ用）
       - name: target.h を確認
         run: |
           cd exploit
@@ -165,15 +161,14 @@ jobs:
             exit 1
           fi
 
-      # 10. preload.so をコンパイル（APIレベル指定付き）
+      # preload.so をコンパイル
       - name: preload.so をコンパイル
         run: |
           cd exploit
-          # Android 9 向けに API レベル 28 を指定
           export ANDROID_API="${{ github.event.inputs.api_level }}"
           make -C source clean preload
 
-      # 11. ビルド成果物をアップロード
+      # ビルド成果物をアップロード
       - name: preload.so をアップロード
         uses: actions/upload-artifact@v4
         with:
