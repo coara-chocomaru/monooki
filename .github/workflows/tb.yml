@@ -1,5 +1,5 @@
 # .github/workflows/build-preload.yml
-name: Build preload.so (offsets.h → target.h with fixes)
+name: Build preload.so
 
 on:
   workflow_dispatch:
@@ -57,56 +57,15 @@ jobs:
             fi
           fi
 
-      # ★★★ offsets.h を target.h に変換 ★★★
-      - name: offsets.h → target.h 変換
+      - name: target.h を配置
         run: |
-          if [ ! -f offsets.h ]; then
-            echo "エラー: offsets.h がリポジトリのルートにありません。"
+          if [ ! -f target.h ]; then
+            echo "エラー: target.h がリポジトリのルートにありません。"
             exit 1
           fi
-
-          # コピー
-          cp offsets.h target.h
-
-          # 1. インクルードガードを変更
-          sed -i 's/#ifndef OFFSET_H/#ifndef TARGET_H/' target.h
-          sed -i 's/#define OFFSET_H/#define TARGET_H/' target.h
-
-          # 2. SLIDE_*_IMAGE マクロを追加（SLIDE_*_OFF を参照）
-          #    - SLIDE_NFULNL_LOGGER_IMAGE
-          #    - SLIDE_LOGGERS_0_1_IMAGE
-          #    - SLIDE_RANDOM_BOOT_ID_DATA_IMAGE
-          #    - SLIDE_SYSCTL_BOOTID_IMAGE
-          #    - SLIDE_INIT_TASK_IMAGE
-          #    - SLIDE_ROOT_TASK_GROUP_IMAGE
-          #    これらは既に OFFSET_H 内で定義済みの SLIDE_*_OFF を使う
-          cat << 'EOF' >> target.h
-
-          /* Additional IMAGE aliases required by PoC */
-          #define SLIDE_NFULNL_LOGGER_IMAGE SLIDE_NFULNL_LOGGER_OFF
-          #define SLIDE_LOGGERS_0_1_IMAGE SLIDE_LOGGERS_0_1_OFF
-          #define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE SLIDE_RANDOM_BOOT_ID_DATA_OFF
-          #define SLIDE_SYSCTL_BOOTID_IMAGE SLIDE_SYSCTL_BOOTID_OFF
-          #define SLIDE_INIT_TASK_IMAGE SLIDE_INIT_TASK_OFF
-          #define SLIDE_ROOT_TASK_GROUP_IMAGE SLIDE_ROOT_TASK_GROUP_OFF
-
-          #endif /* TARGET_H */
-          EOF
-
-          # 3. 念のため TARGET_CONFIG_H が定義されているか確認
-          if ! grep -q "#define TARGET_CONFIG_H" target.h; then
-            echo "エラー: TARGET_CONFIG_H が定義されていません"
-            exit 1
-          fi
-
-          # 4. 生成された target.h の内容を確認
-          echo "===== target.h の先頭30行 ====="
-          head -30 target.h
-          echo "===== 追加した IMAGE 定義 ====="
-          grep -E "SLIDE.*IMAGE" target.h
-
-          # 5. 配置
           cp target.h exploit/source/src/target.h
+          echo "✅ target.h を配置しました。"
+          head -10 exploit/source/src/target.h
 
       - name: preload.so をコンパイル
         run: |
