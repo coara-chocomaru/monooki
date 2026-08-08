@@ -1,0 +1,139 @@
+# .github/workflows/build-preload.yml
+name: CVE-2026-43499 preload.so 自動ビルド (kallsyms利用)
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'boot.img の直接ダウンロードURL'
+        required: true
+        type: string
+        default: 'https://example.com/path/to/boot.img'
+      xbl_config_url:
+        description: 'xbl_config.img の直接ダウンロードURL（高通デバイスの場合必要）'
+        required: false
+        type: string
+        default: ''
+      api_level:
+        description: 'Android APIレベル（デフォルト: 28 = Android 9）'
+        required: false
+        type: number
+        default: 28
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. リポジトリのクローン（x-spy/popsicle をベースに、kallsyms対応済みのフォークを使用）
+      - name: リポジトリをクローン
+        uses: actions/checkout@v4
+        with:
+          repository: Bartixxx32/CVE-2026-43499-OnePlus15
+          ref: master
+          path: exploit
+
+      # 2. 依存パッケージのインストール
+      - name: 依存パッケージをインストール
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make wget unzip python3 python3-pip llvm lld
+
+      # 3. Android NDK r29 のダウンロード＆セットアップ
+      - name: Android NDK r29 をダウンロード
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q android-ndk-r29-linux.zip -d $HOME
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
+          echo "NDK_ROOT=$HOME/android-ndk-r29-linux" >> $GITHUB_ENV
+
+      # 4. NDK ツールチェーンに実行権限を付与
+      - name: NDK ツールチェーンに実行権限を付与
+        run: |
+          chmod -R +x $HOME/android-ndk-r29-linux/toolchains/llvm/prebuilt/linux-x86_64/bin/
+
+      # 5. boot.img をダウンロード
+      - name: boot.img をダウンロード
+        run: |
+          cd exploit
+          wget -q -O boot.img "${{ github.event.inputs.boot_img_url }}"
+          ls -la boot.img
+
+      # 6. xbl_config.img をダウンロード（オプション）
+      - name: xbl_config.img をダウンロード
+        if: github.event.inputs.xbl_config_url != ''
+        run: |
+          cd exploit
+          wget -q -O xbl_config.img "${{ github.event.inputs.xbl_config_url }}"
+          ls -la xbl_config.img
+
+      # 7. kallsyms.txt を配置（リポジトリルートに配置済みであることを前提）
+      - name: kallsyms.txt を配置
+        run: |
+          # リポジトリのルートにある kallsyms.txt を exploit ディレクトリにコピー
+          if [ -f kallsyms.txt ]; then
+            cp kallsyms.txt exploit/kallsyms.txt
+            echo "kallsyms.txt をコピーしました"
+          else
+            echo "警告: kallsyms.txt が見つかりません。リポジトリのルートに配置してください。"
+            exit 1
+          fi
+
+      # 8. extract_target.py で target.h を生成（kallsyms利用）
+      - name: target.h を生成（extract_target.py）
+        run: |
+          cd exploit
+          # tools/extract_target.py が存在するか確認
+          if [ -f tools/extract_target.py ]; then
+            echo "tools/extract_target.py を使用します"
+            if [ -f xbl_config.img ]; then
+              python3 tools/extract_target.py \
+                boot.img \
+                --xbl-config xbl_config.img \
+                --kallsyms kallsyms.txt \
+                --format c \
+                --out source/src/target.h
+            else
+              python3 tools/extract_target.py \
+                boot.img \
+                --kallsyms kallsyms.txt \
+                --format c \
+                --out source/src/target.h
+            fi
+          else
+            # extract_target.py が無い場合は generate_target.py を試す
+            echo "tools/extract_target.py が見つかりません。generate_target.py を試します"
+            # まず profile.json をダミーで作成（kallsymsから抽出した値で上書きされることを期待）
+            echo '{"p0_phys_offset": "0x80000000", "p0_kernel_phys_load": "0xc7800000"}' > profile.json
+            python3 generate_target.py \
+              --boot boot.img \
+              --profile profile.json \
+              --kallsyms kallsyms.txt \
+              -o source/src/target.h
+          fi
+
+      # 9. target.h の内容を確認（デバッグ用）
+      - name: target.h を確認
+        run: |
+          cd exploit
+          if [ -f source/src/target.h ]; then
+            echo "target.h の内容:"
+            head -50 source/src/target.h
+          else
+            echo "エラー: target.h が生成されていません"
+            exit 1
+          fi
+
+      # 10. preload.so をコンパイル
+      - name: preload.so をコンパイル
+        run: |
+          cd exploit
+          make -C source clean preload
+
+      # 11. ビルド成果物をアップロード
+      - name: preload.so をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: preload-so
+          path: exploit/source/build/bin/preload.so
+          if-no-files-found: error
