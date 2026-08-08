@@ -1,18 +1,3 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
-/*
- * KC-T302DT (JUSTSYSTEMS SZJ202) offset.h
- * Firmware: 1.110JS.0151.a (Android Security Patch: 2021-10-01)
- * Kernel:   Linux 4.9.112-perf #1 SMP PREEMPT Thu Sep 22 00:52:58 JST 2022
- * CPU:      APQ8017 (ARM64, 4K pages, VA_BITS=39)
- * Source:   recovery.img extracted from OTA zip
- *           (SZJ202_1.100JS.0142.a_user_to_1.110JS.0151.a_user.zip)
- *
- * NOTE: PSELECT_WAITER_WORD_SHIFT requires runtime measurement on device.
- *       SELINUX_BLOB_SIZES does not exist in kernel 4.9 (use 0 / disable).
- *       boot kernel may differ from recovery kernel - verify on device via
- *       /proc/version before use.
- */
-
 #ifndef OFFSET_H
 #define OFFSET_H
 
