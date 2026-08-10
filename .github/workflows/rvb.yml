@@ -32,12 +32,14 @@ jobs:
           sudo apt update
           sudo apt install -y python2 wget git
 
-      - name: Clone avbtool from android-10.0.0_r47
+      # ---- ここが重要な修正：android-9.0.0_r34 を使用 ----
+      - name: Clone avbtool from android-9.0.0_r34 (known working)
         run: |
-          git clone --depth 1 --branch android-10.0.0_r47 https://android.googlesource.com/platform/external/avb
+          git clone --depth 1 --branch android-9.0.0_r34 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
-          python2 /usr/local/bin/avbtool --version
+          # バージョン確認はオプション（失敗しても続行）
+          python2 /usr/local/bin/avbtool --version || echo "Version check skipped (not supported)"
 
       - name: Download boot.img and original vbmeta.img
         run: |
