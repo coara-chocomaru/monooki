@@ -24,25 +24,34 @@ jobs:
       - name: Checkout repository (for keys/vbmeta.pem)
         uses: actions/checkout@v4
 
-      - name: Setup Python 2.7 (required for avbtool 1.1.0)
-        uses: actions/setup-python@v4
-        with:
-          python-version: '2.7'
+      # --- 新增：从源码编译 Python 2.7 ---
+      - name: Install Python 2.7 from source
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential checkinstall libncurses-dev libssl-dev \
+            libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev \
+            libreadline-dev libdb-dev wget
+          cd /usr/src
+          sudo wget https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          sudo tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          sudo ./configure --prefix=/usr/local/python2.7
+          sudo make
+          sudo make install
+          sudo ln -s /usr/local/python2.7/bin/python2.7 /usr/local/bin/python2
+      # ----------------------------------
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y wget
 
       - name: Install avbtool 1.1.0 from AOSP tag
         run: |
-          # Download avbtool from avb-1.1.0 tag
           wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/tags/avb-1.1.0.tar.gz -O - | tar xzf - avbtool
           chmod +x avbtool
           sudo mv avbtool /usr/local/bin/
-          # Verify version with Python 2.7
-          python --version
-          python /usr/local/bin/avbtool --version
+          # 使用 python2 验证版本
+          python2 /usr/local/bin/avbtool --version
 
       - name: Create working directory
         run: mkdir -p work
@@ -55,13 +64,13 @@ jobs:
 
       - name: Extract all descriptors from original vbmeta
         run: |
-          python /usr/local/bin/avbtool info_image \
+          python2 /usr/local/bin/avbtool info_image \
             --image work/vbmeta.img \
             --output_descriptor_path work/descriptors.txt
 
       - name: Resign vbmeta with new boot.img
         run: |
-          python /usr/local/bin/avbtool make_vbmeta_image \
+          python2 /usr/local/bin/avbtool make_vbmeta_image \
             --include_descriptors_from_image work/descriptors.txt \
             --algorithm SHA256_RSA4096 \
             --key keys/vbmeta.pem \
