@@ -92,8 +92,15 @@ jobs:
               return outpath
 
           def extract_with_binwalk(filepath, outdir):
-              subprocess.check_call(['binwalk', '-Me', '--directory='+outdir, filepath],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              try:
+                  subprocess.check_call(
+                      ['binwalk', '-Me', '--directory='+outdir, filepath],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  )
+              except subprocess.CalledProcessError as e:
+                  # binwalk failed; log the error but continue
+                  print(f"[!] binwalk extraction failed for {filepath} (exit {e.returncode})")
+                  return []
               extracted_files = []
               for root, dirs, files in os.walk(outdir):
                   for f in files:
@@ -105,21 +112,28 @@ jobs:
           def prepare_files(filepath):
               results = []
               temp_dir = tempfile.mkdtemp(prefix='bootloader_')
+              decomp = None
               if is_xz_compressed(filepath):
                   decomp = decompress_xz(filepath)
-                  base = os.path.basename(filepath)
                   sub_files = extract_with_binwalk(decomp, temp_dir)
                   if sub_files:
                       results.extend(sub_files)
                   else:
                       results.append(decomp)
-                  os.remove(decomp) if os.path.exists(decomp) else None
+                  # optionally remove decomp later? We'll keep for analysis
               else:
                   sub_files = extract_with_binwalk(filepath, temp_dir)
                   if sub_files:
                       results.extend(sub_files)
                   else:
                       results.append(filepath)
+              # If no files extracted and decomp exists, use decomp
+              if not results and decomp:
+                  results.append(decomp)
+              # If still empty, fallback to original
+              if not results:
+                  results.append(filepath)
+              # Clean up temporary directory after analysis? We'll leave for debugging.
               return results
 
           def extract_all_strings(r2):
@@ -212,7 +226,6 @@ jobs:
               vendor_matches = []
               oem_cmd_matches = []
               partition_candidates = set()
-              interesting_strings = []
 
               for entry in strings:
                   s = entry.get('string', '')
