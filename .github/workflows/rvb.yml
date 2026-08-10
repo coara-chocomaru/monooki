@@ -1,77 +1,81 @@
-name: Resign vbmeta with new boot.img
+name: Resign vbmeta with new boot (fast)
 
 on:
   workflow_dispatch:
     inputs:
-      boot_url:
-        description: 'URL to download boot.img'
+      boot_img_url:
+        description: 'URL to download the NEW boot.img'
         required: true
         type: string
-      vbmeta_url:
-        description: 'URL to download original vbmeta.img'
+      original_vbmeta_url:
+        description: 'URL to download the ORIGINAL vbmeta.img'
         required: true
         type: string
       output_name:
-        description: 'Output filename for signed vbmeta'
+        description: 'Name of the output vbmeta image'
         required: false
         default: 'vbmeta_signed.img'
         type: string
 
 jobs:
   resign:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository (for keys/vbmeta.pem)
-        uses: actions/checkout@v4
+    runs-on: ubuntu-22.04   # 軽量で安定した環境
+    permissions:
+      contents: read
 
-      # --- 新增：从源码编译 Python 2.7 ---
-      - name: Install Python 2.7 from source
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential checkinstall libncurses-dev libssl-dev \
-            libsqlite3-dev tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev \
-            libreadline-dev libdb-dev wget
-          cd /usr/src
-          sudo wget https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
-          sudo tar xzf Python-2.7.18.tgz
-          cd Python-2.7.18
-          sudo ./configure --prefix=/usr/local/python2.7
-          sudo make
-          sudo make install
-          sudo ln -s /usr/local/python2.7/bin/python2.7 /usr/local/bin/python2
-      # ----------------------------------
+    steps:
+      - name: Checkout repository (to get keys/vbmeta.pem)
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          sudo apt-get install -y wget
+          sudo apt update
+          sudo apt install -y python3 python3-pip wget
 
-      - name: Install avbtool 1.1.0 from AOSP tag
+      - name: Install avbtool (Python 3 compatible, from AOSP main)
         run: |
-          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/tags/avb-1.1.0.tar.gz -O - | tar xzf - avbtool
+          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool
           chmod +x avbtool
           sudo mv avbtool /usr/local/bin/
-          # 使用 python2 验证版本
-          python2 /usr/local/bin/avbtool --version
+          avbtool --version
 
-      - name: Create working directory
-        run: mkdir -p work
-
-      - name: Download boot.img
-        run: wget -q -O work/boot.img "${{ github.event.inputs.boot_url }}"
-
-      - name: Download original vbmeta.img
-        run: wget -q -O work/vbmeta.img "${{ github.event.inputs.vbmeta_url }}"
+      - name: Download boot.img and original vbmeta.img
+        run: |
+          mkdir work
+          wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
+          wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
       - name: Extract all descriptors from original vbmeta
         run: |
-          python2 /usr/local/bin/avbtool info_image \
-            --image work/vbmeta.img \
-            --output_descriptor_path work/descriptors.txt
+          avbtool info_image --image work/vbmeta.img --output_descriptor_path work/descriptors_all.txt
 
-      - name: Resign vbmeta with new boot.img
+      - name: Extract boot partition salt from original vbmeta
+        id: extract_boot_salt
         run: |
-          python2 /usr/local/bin/avbtool make_vbmeta_image \
-            --include_descriptors_from_image work/descriptors.txt \
+          salt=$(avbtool info_image --image work/vbmeta.img | \
+                 awk '/Hash descriptor:/{flag=1} flag && /Partition Name:        boot/{flag2=1} flag2 && /Salt:/{print $2; exit}')
+          echo "BOOT_SALT=${salt}" >> $GITHUB_ENV
+          echo "Extracted boot salt: ${salt}"
+
+      - name: Remove boot hash descriptor from extracted descriptors
+        run: |
+          # Python script to filter out the boot hash descriptor block
+          python3 -c "
+          import sys, re
+          with open('work/descriptors_all.txt', 'r') as f:
+              data = f.read()
+          # Split into descriptor blocks (each starts with indentation and a type)
+          blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', data, flags=re.MULTILINE)
+          # Keep blocks that do NOT contain 'Partition Name:        boot'
+          filtered = [b for b in blocks if not re.search(r'Partition Name:\s+boot', b)]
+          with open('work/descriptors_filtered.txt', 'w') as f:
+              f.write(''.join(filtered))
+          "
+
+      - name: Resign vbmeta with new boot.img and test-key
+        run: |
+          avbtool make_vbmeta_image \
+            --include_descriptors_from_image work/descriptors_filtered.txt \
             --algorithm SHA256_RSA4096 \
             --key keys/vbmeta.pem \
             --rollback_index 0 \
@@ -81,10 +85,14 @@ jobs:
             --calc_hash_image work/boot.img \
               --hash_algorithm sha256 \
               --partition_name boot \
-              --salt 07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b \
+              --salt "${{ env.BOOT_SALT }}" \
             --output work/${{ github.event.inputs.output_name }}
 
-      - name: Upload signed vbmeta as artifact
+      - name: Show info of signed vbmeta (for verification)
+        run: |
+          avbtool info_image --image work/${{ github.event.inputs.output_name }}
+
+      - name: Upload signed vbmeta
         uses: actions/upload-artifact@v4
         with:
           name: signed-vbmeta
