@@ -1,4 +1,4 @@
-name: Resign vbmeta (AOSP official way)
+name: Resign vbmeta (with avbtool Android 11)
 
 on:
   workflow_dispatch:
@@ -23,6 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ---- Python 2.7 のインストール ----
       - name: Build Python 2.7 from source
         run: |
           sudo apt-get update
@@ -36,9 +37,10 @@ jobs:
           cd ..
           sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
 
-      - name: Clone avbtool from android-10.0.0_r47
+      # ---- avbtool を Android 11 のタグから取得 ----
+      - name: Clone avbtool from android-11.0.0_r39
         run: |
-          git clone --depth 1 --branch android-10.0.0_r47 https://android.googlesource.com/platform/external/avb
+          git clone --depth 1 --branch android-11.0.0_r39 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
@@ -50,46 +52,53 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
+      # ---- 元の vbmeta からパラメータを抽出 ----
       - name: Extract original vbmeta parameters
         id: parse
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
-          python2 /usr/local/bin/avbtool info_image --image work/boot.img > work/boot_info.txt
 
           python3 << 'EOF'
           import re, json
 
           with open('work/vbmeta_info.txt', 'r') as f:
-              vbmeta_data = f.read()
+              data = f.read()
 
-          with open('work/boot_info.txt', 'r') as f:
-              boot_data = f.read()
+          algorithm = re.search(r'Algorithm:\s*(\S+)', data).group(1)
+          rollback = re.search(r'Rollback Index:\s*(\d+)', data).group(1)
+          flags = re.search(r'Flags:\s*(\d+)', data).group(1)
 
-          algorithm = re.search(r'Algorithm:\s*(\S+)', vbmeta_data).group(1)
-          rollback = re.search(r'Rollback Index:\s*(\d+)', vbmeta_data).group(1)
-          flags = re.search(r'Flags:\s*(\d+)', vbmeta_data).group(1)
+          props = []
+          for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', data):
+              props.append((m.group(1), m.group(2)))
 
-          boot_hash_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot\b.*?Salt:\s+(\S+)', vbmeta_data)
-          boot_salt = boot_hash_block.group(1)
+          chain = None
+          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+).*?Public key \(sha1\):\s+(\S+)', data, re.DOTALL)
+          if cm:
+              chain = (cm.group(1), cm.group(2), cm.group(3))
 
-          boot_partition_size = re.search(r'Image size:\s*(\d+)\s*bytes', boot_data).group(1)
+          boot_salt = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot\b.*?Salt:\s+(\S+)', data).group(1)
 
           with open('work/params.json', 'w') as f:
               json.dump({
                   'algorithm': algorithm,
                   'rollback': rollback,
                   'flags': flags,
-                  'boot_salt': boot_salt,
-                  'boot_partition_size': boot_partition_size
+                  'props': props,
+                  'chain': chain,
+                  'boot_salt': boot_salt
               }, f)
           EOF
 
-      - name: Prepare new boot.img (hash footer only, no signature)
+      # ---- 新しい boot.img にハッシュフッターを追加 ----
+      - name: Prepare new boot.img (hash footer only)
         run: |
           cp work/boot.img work/boot_new.img
           python2 /usr/local/bin/avbtool erase_footer --image work/boot_new.img 2>/dev/null || true
           BOOT_SALT=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_salt'])")
-          BOOT_PARTITION_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_partition_size'])")
+          # パーティションサイズは元の vbmeta の値を使用（もしくは boot.img のファイルサイズ）
+          # ここでは boot.img のファイルサイズを使用（Magisk でサイズが変わっても対応）
+          BOOT_PARTITION_SIZE=$(stat -c%s work/boot_new.img)
           python2 /usr/local/bin/avbtool add_hash_footer \
             --image work/boot_new.img \
             --partition_name boot \
@@ -98,7 +107,8 @@ jobs:
             --salt $BOOT_SALT \
             --algorithm NONE
 
-      - name: Build vbmeta (vbmeta.img first, then boot_new.img overrides old boot)
+      # ---- vbmeta を再構築（vbmeta.img は使わず、各パーティション個別に指定） ----
+      - name: Build vbmeta
         run: |
           python3 << 'EOF'
           import json, subprocess
@@ -106,18 +116,26 @@ jobs:
           with open('work/params.json', 'r') as f:
               p = json.load(f)
 
-          # vbmeta.img を先に取り込む → プロパティとチェーンを保持
-          # boot_new.img を後から取り込む → 古い boot 記述子を上書き
           cmd = [
               'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
               '--output', 'work/vbmeta_new.img',
               '--key', 'keys/vbmeta.pem',
               '--algorithm', p['algorithm'],
               '--rollback_index', p['rollback'],
-              '--flags', p['flags'],
-              '--include_descriptors_from_image', 'work/vbmeta.img',
-              '--include_descriptors_from_image', 'work/boot_new.img'
+              '--flags', p['flags']
           ]
+
+          # チェーン
+          if p['chain']:
+              cmd.extend(['--chain_partition', '{}:{}:{}'.format(p['chain'][0], p['chain'][1], p['chain'][2])])
+
+          # プロパティ（Android 11 の avbtool は --property をサポートしているはず）
+          for key, value in p['props']:
+              cmd.extend(['--property', '{}:{}'.format(key, value)])
+
+          # 各パーティションの記述子を取り込む（vbmeta.img は使わない）
+          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
+              cmd.extend(['--include_descriptors_from_image', 'work/{}'.format(img)])
 
           subprocess.check_call(cmd)
           print("vbmeta_new.img generated.")
