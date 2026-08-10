@@ -44,7 +44,6 @@ jobs:
           ls -la *.img
 
       - name: Parse original vbmeta
-        id: parse
         run: |
           avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
 
@@ -137,7 +136,7 @@ jobs:
               cmd.extend(['--chain_partition', f"{p['chain'][0]}:{p['chain'][1]}:{p['chain'][2]}"])
 
           for key, value in p['props']:
-              cmd.extend(['--property', f"{key}:{value}"])
+              cmd.extend(['--prop', f"{key}:{value}"])
 
           for algo, name, size, salt, digest, fl in p['hash_desc']:
               cmd.extend(['--hash', algo, name, size, salt, digest, fl])
