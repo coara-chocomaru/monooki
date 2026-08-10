@@ -59,7 +59,7 @@ jobs:
           python2 /usr/local/bin/avbtool add_hash_footer \
             --image work/boot_clean.img \
             --partition_name boot \
-            --partition_size 100663296 \
+            --partition_size 51408896 \
             --hash_algorithm sha256 \
             --salt 07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b \
             --algorithm NONE
