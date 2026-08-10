@@ -27,23 +27,16 @@ jobs:
       - name: Checkout repository (to get keys/vbmeta.pem)
         uses: actions/checkout@v4
 
-      # ---- Python 2.7 のインストール ----
       - name: Install Python 2.7
         run: |
           sudo apt update
-          sudo apt install -y python2 python2-dev wget git
-          # pip2 のインストール（必要に応じて）
-          curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py
-          sudo python2 get-pip.py
-          python2 --version
+          sudo apt install -y python2 wget git
 
-      # ---- avbtool 1.1.0 を git clone で取得（確実） ----
-      - name: Clone avbtool 1.1.0 from AOSP tag
+      - name: Clone avbtool from android-10.0.0_r47
         run: |
-          git clone --depth 1 --branch avb-1.1.0 https://android.googlesource.com/platform/external/avb
+          git clone --depth 1 --branch android-10.0.0_r47 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
-          # 動作確認（Python 2 で実行）
           python2 /usr/local/bin/avbtool --version
 
       - name: Download boot.img and original vbmeta.img
@@ -52,14 +45,12 @@ jobs:
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
-      # ---- 元の vbmeta から全記述子を抽出 ----
       - name: Extract all descriptors from original vbmeta
         run: |
           python2 /usr/local/bin/avbtool info_image \
             --image work/vbmeta.img \
             --output_descriptor_path work/descriptors_all.txt
 
-      # ---- boot の Salt を自動抽出（フォールバック付き） ----
       - name: Extract boot salt from original vbmeta
         id: extract_salt
         run: |
@@ -72,7 +63,6 @@ jobs:
           echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
           echo "Extracted boot salt: $SALT"
 
-      # ---- 記述子から boot のハッシュ記述子を除去 ----
       - name: Remove boot hash descriptor
         run: |
           python2 -c "
@@ -85,7 +75,6 @@ jobs:
               f.write(''.join(filtered))
           "
 
-      # ---- 新しい vbmeta を再構成（boot のみ更新） ----
       - name: Resign vbmeta with new boot.img
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
@@ -102,12 +91,10 @@ jobs:
               --salt "${{ env.BOOT_SALT }}" \
             --output work/${{ github.event.inputs.output_name }}
 
-      # ---- 生成された vbmeta の情報を表示（検証） ----
       - name: Show signed vbmeta info
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/${{ github.event.inputs.output_name }}
 
-      # ---- アーティファクトとしてアップロード ----
       - name: Upload signed vbmeta
         uses: actions/upload-artifact@v4
         with:
