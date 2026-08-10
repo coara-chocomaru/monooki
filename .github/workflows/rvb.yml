@@ -69,7 +69,7 @@ jobs:
           boot_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Salt:\s+(\S+)', data)
           boot_salt = boot_block.group(1) if boot_block else '07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b'
           boot_size = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Image Size:\s+(\d+)', data)
-          boot_size = boot_size.group(1) if boot_size else '51408896'
+          boot_size = boot_size.group(1) if boot_size else '51699712'
 
           with open('work/params.json', 'w') as f:
               json.dump({
