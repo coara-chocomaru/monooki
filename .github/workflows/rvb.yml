@@ -44,7 +44,7 @@ jobs:
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
-      # ---- 获取原始 vbmeta 的完整信息并提取 boot 的 salt ----
+      # ---- 1. 从原始 vbmeta 中提取 boot 分区的 Salt ----
       - name: Get original vbmeta info and extract boot salt
         id: get_info
         run: |
@@ -59,24 +59,33 @@ jobs:
           echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
           echo "Extracted boot salt: $SALT"
 
-      # ---- 从原始 vbmeta 中提取除 boot 以外的所有描述符 ----
-      - name: Extract descriptors except boot
+      # ---- 2. 关键修正: 用 add_hash_footer 生成一个包含新 boot 哈希的临时镜像 ----
+      - name: Create temporary boot image with hash footer
+        run: |
+          cp work/boot.img work/boot_with_footer.img
+          python2 /usr/local/bin/avbtool add_hash_footer \
+            --image work/boot_with_footer.img \
+            --partition_name boot \
+            --partition_size $(stat -c%s work/boot.img) \
+            --hash_algorithm sha256 \
+            --salt "${{ env.BOOT_SALT }}" \
+            --algorithm NONE
+
+      # ---- 3. 从原始 vbmeta 中提取除 boot 外的所有描述符 ----
+      - name: Extract descriptors except boot from original vbmeta
         run: |
           python2 -c "
           import re
           with open('work/vbmeta_info.txt', 'r') as f:
               data = f.read()
-          # 找到 'Descriptors:' 之后的部分
           match = re.search(r'Descriptors:\n(.*)', data, re.DOTALL)
           if not match:
               print('No descriptors found')
               exit(1)
           descriptors_text = match.group(1)
-          # 按描述符类型分割
           blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', descriptors_text, flags=re.MULTILINE)
           filtered = []
           for block in blocks:
-              # 如果是 Hash descriptor 且 Partition Name 为 boot，则跳过
               if re.search(r'^    Hash descriptor:', block, re.MULTILINE) and re.search(r'Partition Name:\s+boot', block):
                   continue
               filtered.append(block)
@@ -84,26 +93,16 @@ jobs:
               f.write(''.join(filtered))
           "
 
-      # ---- 计算新 boot.img 的 SHA256 和大小 ----
-      - name: Compute new boot hash and size
-        id: boot_hash
-        run: |
-          NEW_DIGEST=$(sha256sum work/boot.img | awk '{print $1}')
-          NEW_SIZE=$(stat -c%s work/boot.img)
-          echo "NEW_DIGEST=$NEW_DIGEST" >> $GITHUB_ENV
-          echo "NEW_SIZE=$NEW_SIZE" >> $GITHUB_ENV
-          echo "New boot size: $NEW_SIZE, digest: $NEW_DIGEST"
-
-      # ---- 使用 --hash 添加新的 boot 描述符，并包含其他描述符 ----
+      # ---- 4. 重新生成 vbmeta: 从原始 vbmeta 导入其他描述符，从临时 boot 镜像导入新的 boot 描述符 ----
       - name: Resign vbmeta with new boot.img
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
             --include_descriptors_from_image work/descriptors_filtered.txt \
+            --include_descriptors_from_image work/boot_with_footer.img \
             --algorithm SHA256_RSA4096 \
             --key keys/vbmeta.pem \
             --rollback_index 0 \
             --flags 0 \
-            --hash sha256 boot ${{ env.NEW_SIZE }} ${{ env.BOOT_SALT }} ${{ env.NEW_DIGEST }} 0 \
             --output work/${{ github.event.inputs.output_name }}
 
       - name: Show signed vbmeta info
