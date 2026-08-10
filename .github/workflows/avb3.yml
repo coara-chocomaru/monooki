@@ -1,0 +1,161 @@
+name: Resign vbmeta (with avbtool Android 11)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: '全イメージ (boot, dtbo, vendor_boot, odm, vendor, vbmeta) を含むZIPファイルのURL'
+        required: true
+        type: string
+      output_zip:
+        description: '出力ZIPファイル名'
+        required: false
+        default: 'resigned_images.zip'
+        type: string
+
+jobs:
+  resign:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Python 2.7 from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git unzip zip openssl libssl-dev zlib1g-dev
+          wget -q https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          ./configure --enable-optimizations
+          make -j$(nproc) || true
+          sudo make altinstall
+          cd ..
+          sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
+
+      - name: Clone avbtool from android-11.0.0_r39
+        run: |
+          git clone --depth 1 --branch android-11.0.0_r39 https://android.googlesource.com/platform/external/avb
+          sudo cp avb/avbtool /usr/local/bin/
+          sudo chmod +x /usr/local/bin/avbtool
+
+      - name: Download and extract ZIP
+        run: |
+          mkdir -p work
+          wget -q -O work/images.zip "${{ github.event.inputs.zip_url }}"
+          cd work
+          unzip -q images.zip
+          ls -la *.img
+
+      - name: Extract original vbmeta and boot parameters
+        id: parse
+        run: |
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
+          python2 /usr/local/bin/avbtool info_image --image work/boot.img > work/boot_info.txt
+
+          python3 << 'EOF'
+          import re, json
+
+          with open('work/vbmeta_info.txt', 'r') as f:
+              vbmeta_data = f.read()
+
+          with open('work/boot_info.txt', 'r') as f:
+              boot_data = f.read()
+
+          algorithm = re.search(r'Algorithm:\s*(\S+)', vbmeta_data).group(1)
+          rollback = re.search(r'Rollback Index:\s*(\d+)', vbmeta_data).group(1)
+          flags = re.search(r'Flags:\s*(\d+)', vbmeta_data).group(1)
+
+          props = []
+          for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', vbmeta_data):
+              props.append((m.group(1), m.group(2)))
+
+          chain = None
+          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+)', vbmeta_data, re.DOTALL)
+          if cm:
+              chain = (cm.group(1), cm.group(2))
+
+          boot_partition_size = re.search(r'Image size:\s*(\d+)\s*bytes', boot_data).group(1)
+
+          with open('work/params.json', 'w') as f:
+              json.dump({
+                  'algorithm': algorithm,
+                  'rollback': rollback,
+                  'flags': flags,
+                  'props': props,
+                  'chain': chain,
+                  'boot_partition_size': boot_partition_size
+              }, f)
+          EOF
+
+      - name: Extract chain partition public key
+        run: |
+          python2 /usr/local/bin/avbtool extract_public_key --key keys/vbmeta_system.pem --output work/chain_partition.avbpubkey
+
+      - name: Prepare new boot.img (hash footer only, no signature)
+        run: |
+          cp work/boot.img work/boot_new.img
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot_new.img 2>/dev/null || true
+          BOOT_PARTITION_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_partition_size'])")
+          python2 /usr/local/bin/avbtool add_hash_footer \
+            --image work/boot_new.img \
+            --partition_name boot \
+            --partition_size $BOOT_PARTITION_SIZE \
+            --hash_algorithm sha256 \
+            --algorithm NONE
+
+      - name: Build vbmeta (exact structure, props explicitly added)
+        run: |
+          python3 << 'EOF'
+          import json, subprocess
+
+          with open('work/params.json', 'r') as f:
+              p = json.load(f)
+
+          cmd = [
+              'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
+              '--output', 'work/vbmeta_new.img',
+              '--key', 'keys/vbmeta.pem',
+              '--algorithm', p['algorithm'],
+              '--rollback_index', p['rollback'],
+              '--flags', p['flags']
+          ]
+
+          if p['chain']:
+              cmd.extend(['--chain_partition', '{}:{}:work/chain_partition.avbpubkey'.format(p['chain'][0], p['chain'][1])])
+
+          for key, value in p['props']:
+              cmd.extend(['--prop', '{}:{}'.format(key, value)])
+
+          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
+              cmd.extend(['--include_descriptors_from_image', 'work/{}'.format(img)])
+
+          subprocess.check_call(cmd)
+          print("vbmeta_new.img generated.")
+          EOF
+
+      - name: Show signed vbmeta info
+        run: |
+          echo "=== Signed vbmeta_new.img ==="
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img
+
+      - name: Create output ZIP
+        run: |
+          mkdir -p out
+          cp work/boot_new.img out/boot.img
+          cp work/vbmeta_new.img out/vbmeta.img
+          cd out
+          zip ${{ github.event.inputs.output_zip }} boot.img vbmeta.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: resigned-images
+          path: out/${{ github.event.inputs.output_zip }}
+          if-no-files-found: error
+YAMLEOF
+echo done
+出力
