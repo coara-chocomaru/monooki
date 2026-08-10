@@ -44,23 +44,11 @@ jobs:
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
-      # ============================================================
-      # 重要: info_image の出力を解析して記述子ファイルを生成
-      # ============================================================
-      - name: Extract descriptors from original vbmeta (via stdout parsing)
+      # ---- 获取原始 vbmeta 的完整信息并提取 boot 的 salt ----
+      - name: Get original vbmeta info and extract boot salt
+        id: get_info
         run: |
-          # info_image の出力全体を取得
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
-
-          # "Descriptors:" 以降の行を抽出して記述子ファイルを作成
-          sed -n '/^Descriptors:/,$p' work/vbmeta_info.txt > work/descriptors_all.txt
-
-          echo "=== Extracted descriptors (first 20 lines) ==="
-          head -20 work/descriptors_all.txt
-
-      - name: Extract boot salt from original vbmeta
-        id: extract_salt
-        run: |
           SALT=$(grep -A10 "Hash descriptor:" work/vbmeta_info.txt | \
                  grep -A5 "Partition Name:        boot" | \
                  grep "Salt:" | head -1 | awk '{print $2}')
@@ -71,42 +59,42 @@ jobs:
           echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
           echo "Extracted boot salt: $SALT"
 
-      # ============================================================
-      # 重要: boot の記述子ブロックを除去（sed で範囲削除）
-      # ============================================================
-      - name: Remove boot hash descriptor from descriptors file
+      # ---- 从原始 vbmeta 中提取除 boot 以外的所有描述符 ----
+      - name: Extract descriptors except boot
         run: |
-          # boot の Hash descriptor ブロックを特定して削除
-          # パターン: "Hash descriptor:" から次の "    Hash descriptor:" または
-          # "    Hashtree descriptor:" または "    Chain Partition" または
-          # "    Prop:" までの間を削除（ただし Partition Name: boot を含むものだけ）
           python2 -c "
           import re
-          with open('work/descriptors_all.txt', 'r') as f:
+          with open('work/vbmeta_info.txt', 'r') as f:
               data = f.read()
-
-          # 各記述子ブロックに分割（インデント + タイプで始まる）
-          blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', data, flags=re.MULTILINE)
-
-          # boot の Hash descriptor を除外
+          # 找到 'Descriptors:' 之后的部分
+          match = re.search(r'Descriptors:\n(.*)', data, re.DOTALL)
+          if not match:
+              print('No descriptors found')
+              exit(1)
+          descriptors_text = match.group(1)
+          # 按描述符类型分割
+          blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', descriptors_text, flags=re.MULTILINE)
           filtered = []
           for block in blocks:
-              # 'Partition Name:        boot' を含む Hash descriptor をスキップ
+              # 如果是 Hash descriptor 且 Partition Name 为 boot，则跳过
               if re.search(r'^    Hash descriptor:', block, re.MULTILINE) and re.search(r'Partition Name:\s+boot', block):
-                  print('Removing boot hash descriptor block')
                   continue
               filtered.append(block)
-
           with open('work/descriptors_filtered.txt', 'w') as f:
               f.write(''.join(filtered))
           "
 
-          echo "=== Filtered descriptors (first 20 lines) ==="
-          head -20 work/descriptors_filtered.txt
+      # ---- 计算新 boot.img 的 SHA256 和大小 ----
+      - name: Compute new boot hash and size
+        id: boot_hash
+        run: |
+          NEW_DIGEST=$(sha256sum work/boot.img | awk '{print $1}')
+          NEW_SIZE=$(stat -c%s work/boot.img)
+          echo "NEW_DIGEST=$NEW_DIGEST" >> $GITHUB_ENV
+          echo "NEW_SIZE=$NEW_SIZE" >> $GITHUB_ENV
+          echo "New boot size: $NEW_SIZE, digest: $NEW_DIGEST"
 
-      # ============================================================
-      # 重要: --include_descriptors_from_image で記述子ファイルを指定
-      # ============================================================
+      # ---- 使用 --hash 添加新的 boot 描述符，并包含其他描述符 ----
       - name: Resign vbmeta with new boot.img
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
@@ -114,13 +102,8 @@ jobs:
             --algorithm SHA256_RSA4096 \
             --key keys/vbmeta.pem \
             --rollback_index 0 \
-            --rollback_index_location 0 \
             --flags 0 \
-            --release_string 'avbtool 1.1.0' \
-            --calc_hash_image work/boot.img \
-              --hash_algorithm sha256 \
-              --partition_name boot \
-              --salt "${{ env.BOOT_SALT }}" \
+            --hash sha256 boot ${{ env.NEW_SIZE }} ${{ env.BOOT_SALT }} ${{ env.NEW_DIGEST }} 0 \
             --output work/${{ github.event.inputs.output_name }}
 
       - name: Show signed vbmeta info
