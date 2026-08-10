@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       output_name:
-        description: 'Output filename for signed vbmeta (default: vbmeta_signed.img)'
+        description: 'Output filename for signed vbmeta'
         required: false
         default: 'vbmeta_signed.img'
         type: string
@@ -24,19 +24,16 @@ jobs:
       - name: Checkout repository (for keys/vbmeta.pem)
         uses: actions/checkout@v4
 
-      - name: Install required tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip wget curl
+          sudo apt-get install -y python3 python3-pip wget git
 
-      - name: Download avbtool from AOSP (stable version)
+      - name: Clone avbtool from AOSP
         run: |
-          # Use a known tag to avoid breaking changes
-          AVB_VERSION="2.0.0"  # or use 'master' but tag is safer
-          curl -fsSL -o avbtool \
-            "https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/${AVB_VERSION}/avbtool"
-          chmod +x avbtool
-          sudo mv avbtool /usr/local/bin/
+          git clone --depth 1 https://android.googlesource.com/platform/external/avb
+          sudo cp avb/avbtool /usr/local/bin/
+          chmod +x /usr/local/bin/avbtool
 
       - name: Verify avbtool installation
         run: avbtool --version
@@ -56,7 +53,7 @@ jobs:
             --image work/vbmeta.img \
             --output_descriptor_path work/descriptors.txt
 
-      - name: Resign vbmeta with new boot.img and test-key
+      - name: Resign vbmeta with new boot.img
         run: |
           avbtool make_vbmeta_image \
             --include_descriptors_from_image work/descriptors.txt \
