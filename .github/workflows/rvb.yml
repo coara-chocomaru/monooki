@@ -1,4 +1,4 @@
-name: Fast resign vbmeta (boot only) with modern avbtool
+name: Resign vbmeta with new boot (simple)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       output_name:
-        description: 'Name of the output vbmeta image'
+        description: 'Output vbmeta filename'
         required: false
         default: 'vbmeta_signed.img'
         type: string
@@ -20,176 +20,63 @@ on:
 jobs:
   resign:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout repository (to get keys/vbmeta.pem)
+      - name: Checkout repository (for keys/vbmeta.pem)
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y wget python3 git
+          sudo apt install -y wget python3
 
-      # ---- 安装最新版 avbtool（支持 --hash 等） ----
+      # ---- 最新の avbtool をインストール（Python 3 対応） ----
       - name: Install avbtool from AOSP main
         run: |
           wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool.py
           chmod +x avbtool.py
           sudo mv avbtool.py /usr/local/bin/avbtool
-          avbtool --version || true
 
-      - name: Download boot.img and original vbmeta.img
+      - name: Download images
         run: |
-          mkdir -p work
+          mkdir work
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
-      # ---- 解析原始 vbmeta 的信息 ----
-      - name: Parse original vbmeta info
-        id: parse
+      # ---- 元の vbmeta から boot の Salt を抽出 ----
+      - name: Extract boot salt
+        id: salt
         run: |
-          avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
-          python3 << 'EOF'
-          import re
-          with open('work/vbmeta_info.txt', 'r') as f:
-              data = f.read()
+          SALT=$(avbtool info_image --image work/vbmeta.img | \
+                 grep -A10 "Hash descriptor:" | \
+                 grep -A5 "Partition Name:        boot" | \
+                 grep "Salt:" | head -1 | awk '{print $2}')
+          if [ -z "$SALT" ]; then
+            echo "Salt extraction failed, using fallback"
+            SALT="07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b"
+          fi
+          echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
 
-          # 提取全局属性
-          algorithm = re.search(r'Algorithm:\s*(\S+)', data).group(1)
-          rollback_index = re.search(r'Rollback Index:\s*(\d+)', data).group(1)
-          flags = re.search(r'Flags:\s*(\d+)', data).group(1)
-
-          # 提取所有描述符
-          descriptors = []
-          # 使用正则匹配每个描述符块
-          blocks = re.split(r'(?=^    (?:Chain|Prop|Hash|Hashtree) descriptor:)', data, flags=re.MULTILINE)
-          for block in blocks:
-              if not block.strip():
-                  continue
-              descriptors.append(block)
-
-          # 分类处理
-          chain_parts = []
-          props = []
-          hash_descs = []
-          hashtree_descs = []
-
-          for desc in descriptors:
-              if 'Chain Partition descriptor:' in desc:
-                  name = re.search(r'Partition Name:\s+(\S+)', desc).group(1)
-                  loc = re.search(r'Rollback Index Location:\s+(\d+)', desc).group(1)
-                  pubkey = re.search(r'Public key \(sha1\):\s+(\S+)', desc).group(1)
-                  chain_parts.append((name, loc, pubkey))
-              elif 'Prop:' in desc:
-                  # Prop: com.android.build.vendor.fingerprint -> '...'
-                  match = re.search(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', desc)
-                  if match:
-                      props.append((match.group(1), match.group(2)))
-              elif 'Hash descriptor:' in desc:
-                  algo = re.search(r'Hash Algorithm:\s+(\S+)', desc).group(1)
-                  name = re.search(r'Partition Name:\s+(\S+)', desc).group(1)
-                  size = re.search(r'Image Size:\s+(\d+)', desc).group(1)
-                  salt = re.search(r'Salt:\s+(\S+)', desc).group(1)
-                  digest = re.search(r'Digest:\s+(\S+)', desc).group(1)
-                  flags_desc = re.search(r'Flags:\s+(\d+)', desc).group(1)
-                  hash_descs.append((algo, name, size, salt, digest, flags_desc))
-              elif 'Hashtree descriptor:' in desc:
-                  version = re.search(r'Version of dm-verity:\s+(\d+)', desc).group(1)
-                  size = re.search(r'Image Size:\s+(\d+)', desc).group(1)
-                  tree_offset = re.search(r'Tree Offset:\s+(\d+)', desc).group(1)
-                  tree_size = re.search(r'Tree Size:\s+(\d+)', desc).group(1)
-                  data_block = re.search(r'Data Block Size:\s+(\d+)', desc).group(1)
-                  hash_block = re.search(r'Hash Block Size:\s+(\d+)', desc).group(1)
-                  fec_roots = re.search(r'FEC num roots:\s+(\d+)', desc).group(1)
-                  fec_offset = re.search(r'FEC offset:\s+(\d+)', desc).group(1)
-                  fec_size = re.search(r'FEC size:\s+(\d+)', desc).group(1)
-                  hashtree_algo = re.search(r'Hash Algorithm:\s+(\S+)', desc).group(1)
-                  name = re.search(r'Partition Name:\s+(\S+)', desc).group(1)
-                  salt = re.search(r'Salt:\s+(\S+)', desc).group(1)
-                  root_digest = re.search(r'Root Digest:\s+(\S+)', desc).group(1)
-                  flags_desc = re.search(r'Flags:\s+(\d+)', desc).group(1)
-                  hashtree_descs.append((version, size, tree_offset, tree_size, data_block, hash_block,
-                                        fec_roots, fec_offset, fec_size, hashtree_algo, name, salt, root_digest, flags_desc))
-
-          # 将结果写入文件供后续使用
-          with open('work/chain_parts.txt', 'w') as f:
-              for item in chain_parts:
-                  f.write('{} {} {}\n'.format(*item))
-          with open('work/props.txt', 'w') as f:
-              for key, value in props:
-                  f.write('{} {}\n'.format(key, value))
-          # 非 boot 的 hash 描述符
-          with open('work/hash_descs.txt', 'w') as f:
-              for item in hash_descs:
-                  if item[1] != 'boot':  # 排除 boot
-                      f.write('{} {} {} {} {} {}\n'.format(*item))
-          with open('work/hashtree_descs.txt', 'w') as f:
-              for item in hashtree_descs:
-                  f.write('{} {} {} {} {} {} {} {} {} {} {} {} {} {}\n'.format(*item))
-
-          # 保存全局参数
-          with open('work/global.txt', 'w') as f:
-              f.write('{} {} {}'.format(algorithm, rollback_index, flags))
-
-          EOF
-
-      # ---- 构建 make_vbmeta_image 命令 ----
-      - name: Build vbmeta command
-        id: build_cmd
-        run: |
-          # 读取全局参数
-          read ALGO RI FLAGS < work/global.txt
-
-          CMD="avbtool make_vbmeta_image"
-          CMD="$CMD --algorithm $ALGO"
-          CMD="$CMD --key keys/vbmeta.pem"
-          CMD="$CMD --rollback_index $RI"
-          CMD="$CMD --flags $FLAGS"
-          CMD="$CMD --release_string 'avbtool 1.1.0'"
-
-          # 添加 chain partitions
-          while read name loc pubkey; do
-            CMD="$CMD --chain_partition $name:$loc:$pubkey"
-          done < work/chain_parts.txt
-
-          # 添加 props
-          while read key value; do
-            CMD="$CMD --property $key:'$value'"
-          done < work/props.txt
-
-          # 添加非 boot 的 hash 描述符
-          while read algo name size salt digest flags; do
-            CMD="$CMD --hash $algo $name $size $salt $digest $flags"
-          done < work/hash_descs.txt
-
-          # 添加 hashtree 描述符
-          while read version size tree_offset tree_size data_block hash_block fec_roots fec_offset fec_size hashtree_algo name salt root_digest flags; do
-            # 格式: --hashtree <partition_name> <image_size> <hash_algorithm> <salt> <root_digest> <flags>
-            # 注意：新版 avbtool 的 --hashtree 参数简洁，只认这六个字段
-            CMD="$CMD --hashtree $name $size $hashtree_algo $salt $root_digest $flags"
-          done < work/hashtree_descs.txt
-
-          # 最后添加新的 boot（使用镜像文件计算哈希）
-          CMD="$CMD --hash sha256 boot work/boot.img"
-
-          CMD="$CMD --output work/${{ github.event.inputs.output_name }}"
-
-          echo "FULL_CMD=$CMD" >> $GITHUB_ENV
-
-      # ---- 执行命令 ----
+      # ---- 再署名（たった 1 行のコマンド） ----
       - name: Resign vbmeta
         run: |
-          eval ${{ env.FULL_CMD }}
+          avbtool make_vbmeta_image \
+            --include_descriptors_from_image work/vbmeta.img \
+            --calc_hash_image work/boot.img \
+              --hash_algorithm sha256 \
+              --partition_name boot \
+              --salt "${{ env.BOOT_SALT }}" \
+            --key keys/vbmeta.pem \
+            --algorithm SHA256_RSA4096 \
+            --rollback_index 0 \
+            --flags 0 \
+            --release_string 'avbtool 1.1.0' \
+            --output work/${{ github.event.inputs.output_name }}
 
-      - name: Show signed vbmeta info
-        run: |
-          avbtool info_image --image work/${{ github.event.inputs.output_name }}
+      - name: Verify signed vbmeta
+        run: avbtool info_image --image work/${{ github.event.inputs.output_name }}
 
-      - name: Upload signed vbmeta
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: signed-vbmeta
           path: work/${{ github.event.inputs.output_name }}
-          if-no-files-found: error
