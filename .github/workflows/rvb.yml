@@ -105,7 +105,7 @@ jobs:
           python2 /usr/local/bin/avbtool make_vbmeta_image \
             --include_descriptors_from_image work/vbmeta.img \
             --include_descriptors_from_image work/boot_new.img \
-            --key keys/vbmeta.pem \
+            --key keys/vbmeta.avbpubkey \
             --algorithm SHA256_RSA4096 \
             --rollback_index 0 \
             --flags 0 \
