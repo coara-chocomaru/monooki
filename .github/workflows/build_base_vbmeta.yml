@@ -1,0 +1,127 @@
+name: Build base vbmeta (one-time, no boot descriptor)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'stockの全イメージ (dtbo, vendor_boot, odm, vendor, vbmeta) を含むZIPファイルのURL'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Python 2.7 from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git unzip zip openssl libssl-dev zlib1g-dev
+          wget -q https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          ./configure --enable-optimizations
+          make -j$(nproc) || true
+          sudo make altinstall
+          cd ..
+          sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
+
+      - name: Clone avbtool from android-11.0.0_r39
+        run: |
+          git clone --depth 1 --branch android-11.0.0_r39 https://android.googlesource.com/platform/external/avb
+          sudo cp avb/avbtool /usr/local/bin/
+          sudo chmod +x /usr/local/bin/avbtool
+
+      - name: Download and extract ZIP
+        run: |
+          mkdir -p work
+          wget -q -O work/images.zip "${{ github.event.inputs.zip_url }}"
+          cd work
+          unzip -q images.zip
+          ls -la *.img
+
+      - name: Add footers to unchanged partitions with stock salts
+        run: |
+          cp work/dtbo.img work/dtbo_new.img
+          python2 /usr/local/bin/avbtool add_hash_footer \
+            --image work/dtbo_new.img \
+            --partition_name dtbo \
+            --partition_size 100663296 \
+            --hash_algorithm sha256 \
+            --salt c49a69867ff913ef76e388f0817d79cd83187ca2c5379400af88237598215fd1 \
+            --algorithm NONE
+
+          cp work/vendor_boot.img work/vendor_boot_new.img
+          python2 /usr/local/bin/avbtool add_hash_footer \
+            --image work/vendor_boot_new.img \
+            --partition_name vendor_boot \
+            --partition_size 100663296 \
+            --hash_algorithm sha256 \
+            --salt b49d354861e9a5b139a9244ae906c713a5e76b05dfe39cacd8698d72161144ca \
+            --algorithm NONE
+
+          cp work/odm.img work/odm_new.img
+          python2 /usr/local/bin/avbtool add_hashtree_footer \
+            --image work/odm_new.img \
+            --partition_name odm \
+            --partition_size 100663296 \
+            --hash_algorithm sha1 \
+            --salt 27721961c02cd181661c6da9eb11525f12a5367e8ada781cb577875bc93bde2e \
+            --fec_num_roots 2 \
+            --algorithm NONE
+
+          cp work/vendor.img work/vendor_new.img
+          python2 /usr/local/bin/avbtool add_hashtree_footer \
+            --image work/vendor_new.img \
+            --partition_name vendor \
+            --partition_size 900000000 \
+            --hash_algorithm sha1 \
+            --salt 27721961c02cd181661c6da9eb11525f12a5367e8ada781cb577875bc93bde2e \
+            --fec_num_roots 2 \
+            --algorithm NONE
+
+      - name: Extract vbmeta_system public key
+        run: |
+          python2 /usr/local/bin/avbtool extract_public_key --key keys/vbmeta_system.pem --output work/vbmeta_system.avbpubkey
+
+      - name: Build base_vbmeta.img (no boot descriptor)
+        run: |
+          python2 /usr/local/bin/avbtool make_vbmeta_image \
+            --output work/base_vbmeta.img \
+            --key keys/vbmeta.pem \
+            --algorithm SHA256_RSA4096 \
+            --rollback_index 0 \
+            --flags 0 \
+            --chain_partition vbmeta_system:2:work/vbmeta_system.avbpubkey \
+            --prop com.android.build.vendor.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys \
+            --prop com.android.build.vendor.os_version:11 \
+            --prop com.android.build.vendor.security_patch:2023-12-01 \
+            --prop com.android.build.vendor.security_patch:2023-12-01 \
+            --prop com.android.build.vendor_boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys \
+            --prop com.android.build.boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys \
+            --prop com.android.build.boot.os_version:11 \
+            --prop com.android.build.boot.security_patch:2023-12-01 \
+            --prop com.android.build.boot.security_patch:2023-12-01 \
+            --prop com.android.build.odm.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys \
+            --prop com.android.build.odm.os_version:11 \
+            --prop com.android.build.dtbo.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys \
+            --include_descriptors_from_image work/dtbo_new.img \
+            --include_descriptors_from_image work/vendor_boot_new.img \
+            --include_descriptors_from_image work/odm_new.img \
+            --include_descriptors_from_image work/vendor_new.img
+
+      - name: Show base_vbmeta info
+        run: |
+          python2 /usr/local/bin/avbtool info_image --image work/base_vbmeta.img
+
+      - name: Upload base_vbmeta.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-vbmeta
+          path: work/base_vbmeta.img
+          if-no-files-found: error
