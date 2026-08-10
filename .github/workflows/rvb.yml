@@ -27,13 +27,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip wget git
+          sudo apt-get install -y python3 python3-pip wget
 
-      - name: Clone avbtool from AOSP
+      - name: Install avbtool
         run: |
-          git clone --depth 1 https://android.googlesource.com/platform/external/avb
-          sudo cp avb/avbtool /usr/local/bin/
-          chmod +x /usr/local/bin/avbtool
+          # 直接从AOSP归档中下载avbtool
+          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/android10-dev.tar.gz -O - | tar xzf - avbtool
+          chmod +x avbtool
+          sudo mv avbtool /usr/local/bin/
 
       - name: Verify avbtool installation
         run: avbtool --version
