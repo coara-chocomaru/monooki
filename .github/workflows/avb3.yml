@@ -156,6 +156,3 @@ jobs:
           name: resigned-images
           path: out/${{ github.event.inputs.output_zip }}
           if-no-files-found: error
-YAMLEOF
-echo done
-出力
