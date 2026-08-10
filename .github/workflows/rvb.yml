@@ -1,4 +1,4 @@
-name: Resign vbmeta (exact structure with avbtool 12.1)
+name: Resign vbmeta (exact structure with avbtool 1.1.0)
 
 on:
   workflow_dispatch:
@@ -23,17 +23,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install Python 2 and tools
         run: |
           sudo apt update
-          sudo apt install -y python3 python3-pip wget git unzip openssl
+          sudo apt install -y python2 python2-dev wget git unzip openssl
 
-      - name: Clone avbtool from android-12.1.0_r11
+      - name: Clone avbtool 1.1.0 from AOSP android-9.0.0_r34
         run: |
-          git clone --depth 1 --branch android-12.1.0_r11 https://android.googlesource.com/platform/external/avb
+          git clone --depth 1 --branch android-9.0.0_r34 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
-          avbtool --version
 
       - name: Download and extract ZIP
         run: |
@@ -43,12 +42,13 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
-      - name: Parse original vbmeta
+      - name: Extract props and chain from original vbmeta
+        id: parse
         run: |
-          avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
 
           python3 << 'EOF'
-          import re, json, subprocess
+          import re, json
 
           with open('work/vbmeta_info.txt', 'r') as f:
               data = f.read()
@@ -66,39 +66,8 @@ jobs:
           if cm:
               chain = (cm.group(1), cm.group(2), cm.group(3))
 
-          hash_desc = []
-          blocks = re.split(r'(?=^    Hash descriptor:)', data, flags=re.MULTILINE)
-          for block in blocks:
-              if not block.startswith('    Hash descriptor:'):
-                  continue
-              if 'Partition Name:        boot' in block:
-                  continue
-              algo = re.search(r'Hash Algorithm:\s+(\S+)', block).group(1)
-              name = re.search(r'Partition Name:\s+(\S+)', block).group(1)
-              size = re.search(r'Image Size:\s+(\d+)', block).group(1)
-              salt = re.search(r'Salt:\s+(\S+)', block).group(1)
-              digest = re.search(r'Digest:\s+(\S+)', block).group(1)
-              fl = re.search(r'Flags:\s+(\d+)', block).group(1)
-              hash_desc.append((algo, name, size, salt, digest, fl))
-
-          hashtree_desc = []
-          blocks = re.split(r'(?=^    Hashtree descriptor:)', data, flags=re.MULTILINE)
-          for block in blocks:
-              if not block.startswith('    Hashtree descriptor:'):
-                  continue
-              name = re.search(r'Partition Name:\s+(\S+)', block).group(1)
-              size = re.search(r'Image Size:\s+(\d+)', block).group(1)
-              hashtree_algo = re.search(r'Hash Algorithm:\s+(\S+)', block).group(1)
-              salt = re.search(r'Salt:\s+(\S+)', block).group(1)
-              root = re.search(r'Root Digest:\s+(\S+)', block).group(1)
-              fl = re.search(r'Flags:\s+(\d+)', block).group(1)
-              hashtree_desc.append((name, size, hashtree_algo, salt, root, fl))
-
           boot_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Salt:\s+(\S+)', data)
           boot_salt = boot_block.group(1) if boot_block else '07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b'
-
-          boot_size = subprocess.check_output(['stat', '-c%s', 'work/boot.img']).decode().strip()
-          boot_digest = subprocess.check_output(['sha256sum', 'work/boot.img']).decode().split()[0]
 
           with open('work/params.json', 'w') as f:
               json.dump({
@@ -107,15 +76,26 @@ jobs:
                   'flags': flags,
                   'props': props,
                   'chain': chain,
-                  'hash_desc': hash_desc,
-                  'hashtree_desc': hashtree_desc,
-                  'boot_salt': boot_salt,
-                  'boot_size': boot_size,
-                  'boot_digest': boot_digest
+                  'boot_salt': boot_salt
               }, f)
           EOF
 
-      - name: Build vbmeta command and execute
+      - name: Prepare new boot.img with footer
+        run: |
+          BOOT_SALT=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_salt'])")
+          cp work/boot.img work/boot_clean.img
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img 2>/dev/null || true
+          BOOT_SIZE=$(stat -c%s work/boot_clean.img)
+          python2 /usr/local/bin/avbtool add_hash_footer \
+            --image work/boot_clean.img \
+            --partition_name boot \
+            --partition_size $BOOT_SIZE \
+            --hash_algorithm sha256 \
+            --salt $BOOT_SALT \
+            --algorithm NONE
+          mv work/boot_clean.img work/boot_new.img
+
+      - name: Build vbmeta (no old boot descriptor)
         run: |
           python3 << 'EOF'
           import json, subprocess
@@ -124,7 +104,7 @@ jobs:
               p = json.load(f)
 
           cmd = [
-              'avbtool', 'make_vbmeta_image',
+              'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
               '--output', 'work/vbmeta_signed.img',
               '--key', 'keys/vbmeta.pem',
               '--algorithm', p['algorithm'],
@@ -138,23 +118,20 @@ jobs:
           for key, value in p['props']:
               cmd.extend(['--property', f"{key}:{value}"])
 
-          for algo, name, size, salt, digest, fl in p['hash_desc']:
-              cmd.extend(['--hash', algo, name, size, salt, digest, fl])
+          # Import descriptors from each partition (excluding vbmeta itself)
+          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img']:
+              cmd.extend(['--include_descriptors_from_image', f'work/{img}'])
 
-          for name, size, algo, salt, root, fl in p['hashtree_desc']:
-              cmd.extend(['--hashtree', name, size, algo, salt, root, fl])
-
-          cmd.extend([
-              '--hash', 'sha256', 'boot', p['boot_size'], p['boot_salt'], p['boot_digest'], '0'
-          ])
+          # Finally import the new boot image (no old boot remains)
+          cmd.extend(['--include_descriptors_from_image', 'work/boot_new.img'])
 
           subprocess.check_call(cmd)
           EOF
 
       - name: Show signed vbmeta info
         run: |
-          echo "=== 署名済み vbmeta_signed.img の情報 ==="
-          avbtool info_image --image work/vbmeta_signed.img
+          echo "=== Signed vbmeta_signed.img ==="
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_signed.img
 
       - name: Create output ZIP
         run: |
