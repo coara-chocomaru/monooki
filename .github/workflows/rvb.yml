@@ -1,4 +1,4 @@
-name: Resign vbmeta (exact structure with avbtool 1.1.0)
+name: Resign vbmeta (AOSP official way)
 
 on:
   workflow_dispatch:
@@ -28,9 +28,9 @@ jobs:
           sudo apt update
           sudo apt install -y python2 python2-dev wget git unzip openssl
 
-      - name: Clone avbtool 1.1.0 from AOSP android-9.0.0_r34
+      - name: Clone avbtool from android-10.0.0_r47
         run: |
-          git clone --depth 1 --branch android-9.0.0_r34 https://android.googlesource.com/platform/external/avb
+          git clone --depth 1 --branch android-10.0.0_r47 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
@@ -42,13 +42,13 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
-      - name: Extract props and chain from original vbmeta
+      - name: Extract all needed parameters
         id: parse
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
 
           python3 << 'EOF'
-          import re, json
+          import re, json, subprocess, os
 
           with open('work/vbmeta_info.txt', 'r') as f:
               data = f.read()
@@ -68,6 +68,8 @@ jobs:
 
           boot_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Salt:\s+(\S+)', data)
           boot_salt = boot_block.group(1) if boot_block else '07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b'
+          boot_size = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Image Size:\s+(\d+)', data)
+          boot_size = boot_size.group(1) if boot_size else '51408896'
 
           with open('work/params.json', 'w') as f:
               json.dump({
@@ -76,26 +78,34 @@ jobs:
                   'flags': flags,
                   'props': props,
                   'chain': chain,
-                  'boot_salt': boot_salt
+                  'boot_salt': boot_salt,
+                  'boot_size': boot_size
               }, f)
           EOF
 
-      - name: Prepare new boot.img with footer
+      - name: Prepare new boot.img (hash footer only, no props)
         run: |
           BOOT_SALT=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_salt'])")
+          BOOT_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_size'])")
           cp work/boot.img work/boot_clean.img
-          BOOT_SIZE=$(stat -c%s work/boot_clean.img)
           python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img 2>/dev/null || true
+          # Use the actual size of the patched boot (for partition size, use the partition size from original? 
+          # Actually we need to use the original partition size for the footer, because avbtool add_hash_footer requires partition_size.
+          # We should use the ORIGINAL partition size (boot_size from vbmeta), not the file size.
+          # But if the patched boot is larger than original, it might overflow; we'll use the file size instead.
+          # Since we are not going to flash this boot directly? Actually we will, so we need to match partition size.
+          # Better: use the file size as partition size.
+          FILE_SIZE=$(stat -c%s work/boot_clean.img)
           python2 /usr/local/bin/avbtool add_hash_footer \
             --image work/boot_clean.img \
             --partition_name boot \
-            --partition_size $BOOT_SIZE \
+            --partition_size $FILE_SIZE \
             --hash_algorithm sha256 \
             --salt $BOOT_SALT \
             --algorithm NONE
           mv work/boot_clean.img work/boot_new.img
 
-      - name: Build vbmeta (no old boot descriptor)
+      - name: Build vbmeta (exact structure, props explicitly added)
         run: |
           python3 << 'EOF'
           import json, subprocess
@@ -112,20 +122,23 @@ jobs:
               '--flags', p['flags']
           ]
 
+          # Chain partition
           if p['chain']:
               cmd.extend(['--chain_partition', f"{p['chain'][0]}:{p['chain'][1]}:{p['chain'][2]}"])
 
+          # Props: add explicitly using --property
           for key, value in p['props']:
               cmd.extend(['--property', f"{key}:{value}"])
 
-          # Import descriptors from each partition (excluding vbmeta itself)
-          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img']:
+          # Include descriptors from all partition images (they have no props except boot? 
+          # We are not including vbmeta.img, so no old boot, no duplication.
+          # And we include boot_new.img which has only hash descriptor.
+          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
               cmd.extend(['--include_descriptors_from_image', f'work/{img}'])
 
-          # Finally import the new boot image (no old boot remains)
-          cmd.extend(['--include_descriptors_from_image', 'work/boot_new.img'])
-
+          # Execute
           subprocess.check_call(cmd)
+          print("vbmeta_signed.img generated.")
           EOF
 
       - name: Show signed vbmeta info
