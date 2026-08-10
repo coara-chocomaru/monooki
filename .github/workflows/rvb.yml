@@ -23,10 +23,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Python 2 and tools
+      - name: Build Python 2.7 from source
         run: |
-          sudo apt update
-          sudo apt install -y python2 python2-dev wget git unzip openssl
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git unzip zip openssl libssl-dev zlib1g-dev
+          wget -q https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          ./configure --enable-optimizations
+          make -j$(nproc)
+          sudo make altinstall
+          cd ..
+          sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
 
       - name: Clone avbtool from android-10.0.0_r47
         run: |
@@ -42,34 +50,38 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
-      - name: Extract all needed parameters
+      - name: Extract original vbmeta and boot parameters
         id: parse
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
+          python2 /usr/local/bin/avbtool info_image --image work/boot.img > work/boot_info.txt
 
           python3 << 'EOF'
-          import re, json, subprocess, os
+          import re, json
 
           with open('work/vbmeta_info.txt', 'r') as f:
-              data = f.read()
+              vbmeta_data = f.read()
 
-          algorithm = re.search(r'Algorithm:\s*(\S+)', data).group(1)
-          rollback = re.search(r'Rollback Index:\s*(\d+)', data).group(1)
-          flags = re.search(r'Flags:\s*(\d+)', data).group(1)
+          with open('work/boot_info.txt', 'r') as f:
+              boot_data = f.read()
+
+          algorithm = re.search(r'Algorithm:\s*(\S+)', vbmeta_data).group(1)
+          rollback = re.search(r'Rollback Index:\s*(\d+)', vbmeta_data).group(1)
+          flags = re.search(r'Flags:\s*(\d+)', vbmeta_data).group(1)
 
           props = []
-          for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', data):
+          for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', vbmeta_data):
               props.append((m.group(1), m.group(2)))
 
           chain = None
-          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+).*?Public key \(sha1\):\s+(\S+)', data, re.DOTALL)
+          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+)', vbmeta_data, re.DOTALL)
           if cm:
-              chain = (cm.group(1), cm.group(2), cm.group(3))
+              chain = (cm.group(1), cm.group(2))
 
-          boot_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Salt:\s+(\S+)', data)
-          boot_salt = boot_block.group(1) if boot_block else '07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b'
-          boot_size = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Image Size:\s+(\d+)', data)
-          boot_size = boot_size.group(1) if boot_size else '51699712'
+          boot_hash_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot\b.*?Salt:\s+(\S+)', vbmeta_data)
+          boot_salt = boot_hash_block.group(1)
+
+          boot_partition_size = re.search(r'Image size:\s*(\d+)\s*bytes', boot_data).group(1)
 
           with open('work/params.json', 'w') as f:
               json.dump({
@@ -79,31 +91,27 @@ jobs:
                   'props': props,
                   'chain': chain,
                   'boot_salt': boot_salt,
-                  'boot_size': boot_size
+                  'boot_partition_size': boot_partition_size
               }, f)
           EOF
 
-      - name: Prepare new boot.img (hash footer only, no props)
+      - name: Extract chain partition public key
         run: |
+          python2 /usr/local/bin/avbtool extract_public_key --key keys/vbmeta.pem --output work/chain_partition.avbpubkey
+
+      - name: Prepare new boot.img (hash footer only, no signature)
+        run: |
+          cp work/boot.img work/boot_new.img
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot_new.img 2>/dev/null || true
           BOOT_SALT=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_salt'])")
-          cp work/boot.img work/boot_clean.img
-          python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img 2>/dev/null || true
-          BOOT_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_size'])")
-          # Use the actual size of the patched boot (for partition size, use the partition size from original? 
-          # Actually we need to use the original partition size for the footer, because avbtool add_hash_footer requires partition_size.
-          # We should use the ORIGINAL partition size (boot_size from vbmeta), not the file size.
-          # But if the patched boot is larger than original, it might overflow; we'll use the file size instead.
-          # Since we are not going to flash this boot directly? Actually we will, so we need to match partition size.
-          # Better: use the file size as partition size.
-          FILE_SIZE=$(stat -c%s work/boot_clean.img)
+          BOOT_PARTITION_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_partition_size'])")
           python2 /usr/local/bin/avbtool add_hash_footer \
-            --image work/boot_clean.img \
+            --image work/boot_new.img \
             --partition_name boot \
-            --partition_size $BOOT_SIZE\
+            --partition_size $BOOT_PARTITION_SIZE \
             --hash_algorithm sha256 \
             --salt $BOOT_SALT \
             --algorithm NONE
-          mv work/boot_clean.img work/boot_new.img
 
       - name: Build vbmeta (exact structure, props explicitly added)
         run: |
@@ -115,45 +123,42 @@ jobs:
 
           cmd = [
               'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
-              '--output', 'work/vbmeta_signed.img',
+              '--output', 'work/vbmeta_new.img',
               '--key', 'keys/vbmeta.pem',
               '--algorithm', p['algorithm'],
               '--rollback_index', p['rollback'],
               '--flags', p['flags']
           ]
 
-          # Chain partition
           if p['chain']:
-              cmd.extend(['--chain_partition', f"{p['chain'][0]}:{p['chain'][1]}:{p['chain'][2]}"])
+              cmd.extend(['--chain_partition', '{}:{}:work/chain_partition.avbpubkey'.format(p['chain'][0], p['chain'][1])])
 
-          # Props: add explicitly using --property
           for key, value in p['props']:
-              cmd.extend(['--property', f"{key}:{value}"])
+              cmd.extend(['--property', '{}:{}'.format(key, value)])
 
-          # Include descriptors from all partition images (they have no props except boot? 
-          # We are not including vbmeta.img, so no old boot, no duplication.
-          # And we include boot_new.img which has only hash descriptor.
           for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
-              cmd.extend(['--include_descriptors_from_image', f'work/{img}'])
+              cmd.extend(['--include_descriptors_from_image', 'work/{}'.format(img)])
 
-          # Execute
           subprocess.check_call(cmd)
-          print("vbmeta_signed.img generated.")
+          print("vbmeta_new.img generated.")
           EOF
 
       - name: Show signed vbmeta info
         run: |
-          echo "=== Signed vbmeta_signed.img ==="
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_signed.img
+          echo "=== Signed vbmeta_new.img ==="
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img
 
       - name: Create output ZIP
         run: |
-          cd work
-          zip ${{ github.event.inputs.output_zip }} boot.img vbmeta_signed.img
+          mkdir -p out
+          cp work/boot_new.img out/boot.img
+          cp work/vbmeta_new.img out/vbmeta.img
+          cd out
+          zip ${{ github.event.inputs.output_zip }} boot.img vbmeta.img
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: resigned-images
-          path: work/${{ github.event.inputs.output_zip }}
+          path: out/${{ github.event.inputs.output_zip }}
           if-no-files-found: error
