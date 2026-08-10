@@ -1,0 +1,75 @@
+name: Resign vbmeta with new boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_url:
+        description: 'URL to download boot.img'
+        required: true
+        type: string
+      vbmeta_url:
+        description: 'URL to download original vbmeta.img'
+        required: true
+        type: string
+      output_name:
+        description: 'Output filename for signed vbmeta (default: vbmeta_signed.img)'
+        required: false
+        default: 'vbmeta_signed.img'
+        type: string
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (for keys/vbmeta.pem)
+        uses: actions/checkout@v4
+
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip wget
+          # avbtool is a Python script; download it from AOSP master
+          wget -q https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/master/avbtool
+          chmod +x avbtool
+          sudo mv avbtool /usr/local/bin/
+
+      - name: Verify avbtool installation
+        run: avbtool --version
+
+      - name: Create working directory
+        run: mkdir -p work
+
+      - name: Download boot.img
+        run: wget -q -O work/boot.img "${{ github.event.inputs.boot_url }}"
+
+      - name: Download original vbmeta.img
+        run: wget -q -O work/vbmeta.img "${{ github.event.inputs.vbmeta_url }}"
+
+      - name: Extract all descriptors from original vbmeta
+        run: |
+          avbtool info_image \
+            --image work/vbmeta.img \
+            --output_descriptor_path work/descriptors.txt
+
+      - name: Resign vbmeta with new boot.img and test-key
+        run: |
+          avbtool make_vbmeta_image \
+            --include_descriptors_from_image work/descriptors.txt \
+            --algorithm SHA256_RSA4096 \
+            --key keys/vbmeta.pem \
+            --rollback_index 0 \
+            --rollback_index_location 0 \
+            --flags 0 \
+            --release_string 'avbtool 1.1.0' \
+            --calc_hash_image work/boot.img \
+              --hash_algorithm sha256 \
+              --partition_name boot \
+              --salt 07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b \
+            --output work/${{ github.event.inputs.output_name }}
+
+      - name: Upload signed vbmeta as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-vbmeta
+          path: work/${{ github.event.inputs.output_name }}
+          if-no-files-found: error
