@@ -27,9 +27,14 @@ jobs:
       - name: Install required tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip wget
-          # avbtool is a Python script; download it from AOSP master
-          wget -q https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/master/avbtool
+          sudo apt-get install -y python3 python3-pip wget curl
+
+      - name: Download avbtool from AOSP (stable version)
+        run: |
+          # Use a known tag to avoid breaking changes
+          AVB_VERSION="2.0.0"  # or use 'master' but tag is safer
+          curl -fsSL -o avbtool \
+            "https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/${AVB_VERSION}/avbtool"
           chmod +x avbtool
           sudo mv avbtool /usr/local/bin/
 
