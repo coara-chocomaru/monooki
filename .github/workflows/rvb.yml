@@ -1,4 +1,4 @@
-name: Resign vbmeta with new boot (fast)
+name: Fast resign vbmeta (boot only)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
 
 jobs:
   resign:
-    runs-on: ubuntu-22.04   # 軽量で安定した環境
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
 
@@ -30,13 +30,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y python3 python3-pip wget
+          sudo apt install -y wget python3
 
-      - name: Install avbtool (Python 3 compatible, from AOSP main)
+      # ---- avbtool のインストール (Python 3 対応版) ----
+      - name: Install avbtool from AOSP
         run: |
-          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool
-          chmod +x avbtool
-          sudo mv avbtool /usr/local/bin/
+          # main ブランチのアーカイブから avbtool.py を抽出し、avbtool として配置
+          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool.py
+          chmod +x avbtool.py
+          sudo mv avbtool.py /usr/local/bin/avbtool
           avbtool --version
 
       - name: Download boot.img and original vbmeta.img
@@ -45,34 +47,41 @@ jobs:
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
+      # ---- 元の vbmeta から全記述子を抽出 ----
       - name: Extract all descriptors from original vbmeta
         run: |
           avbtool info_image --image work/vbmeta.img --output_descriptor_path work/descriptors_all.txt
 
-      - name: Extract boot partition salt from original vbmeta
-        id: extract_boot_salt
+      # ---- boot の Salt を自動抽出 ----
+      - name: Extract boot salt from original vbmeta
+        id: extract_salt
         run: |
-          salt=$(avbtool info_image --image work/vbmeta.img | \
+          SALT=$(avbtool info_image --image work/vbmeta.img | \
                  awk '/Hash descriptor:/{flag=1} flag && /Partition Name:        boot/{flag2=1} flag2 && /Salt:/{print $2; exit}')
-          echo "BOOT_SALT=${salt}" >> $GITHUB_ENV
-          echo "Extracted boot salt: ${salt}"
+          if [ -z "$SALT" ]; then
+            echo "Failed to extract boot salt. Using fallback salt."
+            SALT="07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b"
+          fi
+          echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
+          echo "Extracted boot salt: $SALT"
 
-      - name: Remove boot hash descriptor from extracted descriptors
+      # ---- 記述子から boot のハッシュ記述子を除去 ----
+      - name: Remove boot hash descriptor
         run: |
-          # Python script to filter out the boot hash descriptor block
           python3 -c "
-          import sys, re
+          import re
           with open('work/descriptors_all.txt', 'r') as f:
               data = f.read()
-          # Split into descriptor blocks (each starts with indentation and a type)
+          # 各記述子ブロックはインデント＋種類で始まる
           blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', data, flags=re.MULTILINE)
-          # Keep blocks that do NOT contain 'Partition Name:        boot'
+          # Partition Name が boot のブロックを除外
           filtered = [b for b in blocks if not re.search(r'Partition Name:\s+boot', b)]
           with open('work/descriptors_filtered.txt', 'w') as f:
               f.write(''.join(filtered))
           "
 
-      - name: Resign vbmeta with new boot.img and test-key
+      # ---- 新しい vbmeta を再構成（boot のみ更新） ----
+      - name: Resign vbmeta with new boot.img
         run: |
           avbtool make_vbmeta_image \
             --include_descriptors_from_image work/descriptors_filtered.txt \
@@ -88,7 +97,7 @@ jobs:
               --salt "${{ env.BOOT_SALT }}" \
             --output work/${{ github.event.inputs.output_name }}
 
-      - name: Show info of signed vbmeta (for verification)
+      - name: Show signed vbmeta info (verification)
         run: |
           avbtool info_image --image work/${{ github.event.inputs.output_name }}
 
