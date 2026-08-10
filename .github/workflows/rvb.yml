@@ -1,4 +1,4 @@
-name: Fast resign vbmeta (boot only)
+name: Resign vbmeta with full boot structure
 
 on:
   workflow_dispatch:
@@ -11,10 +11,10 @@ on:
         description: '元の vbmeta.img のダウンロードURL'
         required: true
         type: string
-      output_name:
-        description: '出力ファイル名（デフォルト: vbmeta_signed.img）'
+      output_zip:
+        description: '出力ZIPファイル名'
         required: false
-        default: 'vbmeta_signed.img'
+        default: 'resigned_images.zip'
         type: string
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---- Python 2.7 と必要なパッケージのインストール ----
+      # ---- Python 2.7 と必要なツールのインストール ----
       - name: Install Python 2.7 and tools
         run: |
           sudo apt update
@@ -53,7 +53,6 @@ jobs:
         id: extract
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
-          # Salt の抽出
           SALT=$(grep -A10 "Hash descriptor:" work/vbmeta_info.txt | \
                  grep -A5 "Partition Name:        boot" | \
                  grep "Salt:" | head -1 | awk '{print $2}')
@@ -61,7 +60,6 @@ jobs:
             echo "Salt 抽出失敗。フォールバック値を使用します。"
             SALT="07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b"
           fi
-          # サイズの抽出
           SIZE=$(grep -A10 "Hash descriptor:" work/vbmeta_info.txt | \
                  grep -A5 "Partition Name:        boot" | \
                  grep "Image Size:" | head -1 | awk '{print $3}')
@@ -73,40 +71,63 @@ jobs:
           echo "BOOT_SIZE=$SIZE" >> $GITHUB_ENV
           echo "抽出した Salt: $SALT, サイズ: $SIZE"
 
-      # ---- 新しい boot.img にハッシュフッターを追加（署名なし） ----
-      - name: Add hash footer to new boot.img
+      # ---- 新しい boot.img のフッターを消去（既存フッター対策） ----
+      - name: Erase existing footer from new boot.img
         run: |
-          cp work/boot.img work/boot_with_footer.img
-          python2 /usr/local/bin/avbtool erase_footer --image work/boot_with_footer.img 2>/dev/null || true
+          cp work/boot.img work/boot_clean.img
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img || true
+
+      # ---- 新しい boot.img にハッシュフッターと全プロパティを追加 ----
+      - name: Add hash footer and properties to new boot.img
+        run: |
           python2 /usr/local/bin/avbtool add_hash_footer \
-            --image work/boot_with_footer.img \
+            --image work/boot_clean.img \
             --partition_name boot \
-            --partition_size 100663296\
+            --partition_size ${{ env.BOOT_SIZE }} \
             --hash_algorithm sha256 \
             --salt ${{ env.BOOT_SALT }} \
-            --algorithm NONE
+            --algorithm NONE \
+            --prop com.android.build.boot.fingerprint:'Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys' \
+            --prop com.android.build.boot.os_version:'11' \
+            --prop com.android.build.boot.security_patch:'2023-12-01' \
+            --prop com.android.build.boot.security_patch:'2023-12-01'
+          mv work/boot_clean.img work/boot_new.img
 
-      # ---- 元の vbmeta とフッター付き boot を合成して再署名 ----
+      # ---- 生成された boot_new.img の構造を確認 ----
+      - name: Verify boot.img structure
+        run: |
+          echo "=== boot_new.img の情報 ==="
+          python2 /usr/local/bin/avbtool info_image --image work/boot_new.img
+
+      # ---- 元の vbmeta と新しい boot のフッターから記述子を合成して再署名 ----
       - name: Build signed vbmeta
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
             --include_descriptors_from_image work/vbmeta.img \
-            --include_descriptors_from_image work/boot_with_footer.img \
+            --include_descriptors_from_image work/boot_new.img \
             --key keys/vbmeta.pem \
             --algorithm SHA256_RSA4096 \
             --rollback_index 0 \
             --flags 0 \
-            --output work/${{ github.event.inputs.output_name }}
+            --output work/vbmeta_signed.img
 
       # ---- 生成された vbmeta の情報を表示（検証） ----
       - name: Show signed vbmeta info
         run: |
-          python2 /usr/local/bin/avbtool info_image --image work/${{ github.event.inputs.output_name }}
+          echo "=== 署名済み vbmeta_signed.img の情報 ==="
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_signed.img
 
-      # ---- アーティファクトとしてアップロード ----
-      - name: Upload signed vbmeta
+      # ---- boot_new.img を boot.img にリネームして ZIP にまとめる ----
+      - name: Create output ZIP
+        run: |
+          cp work/boot_new.img work/boot.img
+          cd work
+          zip ${{ github.event.inputs.output_zip }} boot.img vbmeta_signed.img
+
+      # ---- ZIP ファイルをアーティファクトとしてアップロード ----
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: signed-vbmeta
-          path: work/${{ github.event.inputs.output_name }}
+          name: resigned-images
+          path: work/${{ github.event.inputs.output_zip }}
           if-no-files-found: error
