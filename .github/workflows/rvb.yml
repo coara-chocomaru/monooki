@@ -23,13 +23,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- ツールのインストール ----------
       - name: Install tools
         run: |
           sudo apt update
           sudo apt install -y python3 python3-pip wget git unzip openssl
 
-      # ---------- avbtool のインストール (AOSP main から取得) ----------
       - name: Install avbtool from AOSP main
         run: |
           wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool.py
@@ -37,7 +35,6 @@ jobs:
           sudo mv avbtool.py /usr/local/bin/avbtool
           avbtool --version || true
 
-      # ---------- ZIP ファイルのダウンロードと展開 ----------
       - name: Download and extract ZIP
         run: |
           mkdir -p work
@@ -46,45 +43,37 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
-      # ---------- 1. 元の vbmeta から全情報を抽出 (Pythonスクリプト) ----------
       - name: Parse original vbmeta
         id: parse
         run: |
           avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
 
           python3 << 'EOF'
-          import re, json
+          import re, json, subprocess
 
           with open('work/vbmeta_info.txt', 'r') as f:
               data = f.read()
 
-          # 1. グローバルパラメータ
           algorithm = re.search(r'Algorithm:\s*(\S+)', data).group(1)
           rollback = re.search(r'Rollback Index:\s*(\d+)', data).group(1)
           flags = re.search(r'Flags:\s*(\d+)', data).group(1)
 
-          # 2. プロパティ (Prop) を抽出 (boot のものは除外しない。全て抽出する)
           props = []
           for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', data):
               props.append((m.group(1), m.group(2)))
 
-          # 3. チェーン・パーティション (Chain Partition) を抽出
           chain = None
-          cm = re.search(
-              r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+).*?Public key \(sha1\):\s+(\S+)',
-              data, re.DOTALL
-          )
+          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+).*?Public key \(sha1\):\s+(\S+)', data, re.DOTALL)
           if cm:
               chain = (cm.group(1), cm.group(2), cm.group(3))
 
-          # 4. ハッシュ記述子 (Hash descriptor) を抽出 (boot は後で更新するため除外)
           hash_desc = []
           blocks = re.split(r'(?=^    Hash descriptor:)', data, flags=re.MULTILINE)
           for block in blocks:
               if not block.startswith('    Hash descriptor:'):
                   continue
               if 'Partition Name:        boot' in block:
-                  continue  # boot は後で新しいものに置き換える
+                  continue
               algo = re.search(r'Hash Algorithm:\s+(\S+)', block).group(1)
               name = re.search(r'Partition Name:\s+(\S+)', block).group(1)
               size = re.search(r'Image Size:\s+(\d+)', block).group(1)
@@ -93,7 +82,6 @@ jobs:
               fl = re.search(r'Flags:\s+(\d+)', block).group(1)
               hash_desc.append((algo, name, size, salt, digest, fl))
 
-          # 5. ハッシュツリー記述子 (Hashtree descriptor) を抽出
           hashtree_desc = []
           blocks = re.split(r'(?=^    Hashtree descriptor:)', data, flags=re.MULTILINE)
           for block in blocks:
@@ -107,16 +95,12 @@ jobs:
               fl = re.search(r'Flags:\s+(\d+)', block).group(1)
               hashtree_desc.append((name, size, hashtree_algo, salt, root, fl))
 
-          # 6. 元の boot の Salt を抽出 (新しい boot のハッシュ計算に使用)
           boot_block = re.search(r'(?s)Hash descriptor:.*?Partition Name:\s+boot.*?Salt:\s+(\S+)', data)
           boot_salt = boot_block.group(1) if boot_block else '07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b'
 
-          # 7. 新しい boot のサイズとハッシュを計算
-          import subprocess
           boot_size = subprocess.check_output(['stat', '-c%s', 'work/boot.img']).decode().strip()
           boot_digest = subprocess.check_output(['sha256sum', 'work/boot.img']).decode().split()[0]
 
-          # 結果をJSONファイルに保存
           with open('work/params.json', 'w') as f:
               json.dump({
                   'algorithm': algorithm,
@@ -132,7 +116,6 @@ jobs:
               }, f)
           EOF
 
-      # ---------- 2. make_vbmeta_image コマンドを生成して実行 ----------
       - name: Build vbmeta command and execute
         run: |
           python3 << 'EOF'
@@ -141,62 +124,42 @@ jobs:
           with open('work/params.json', 'r') as f:
               p = json.load(f)
 
-          # コマンドのベース部分
           cmd = [
               'avbtool', 'make_vbmeta_image',
               '--output', 'work/vbmeta_signed.img',
               '--key', 'keys/vbmeta.pem',
               '--algorithm', p['algorithm'],
               '--rollback_index', p['rollback'],
-              '--flags', p['flags'],
-              '--release_string', 'avbtool 1.1.0'
+              '--flags', p['flags']
           ]
 
-          # チェーン・パーティション (Chain Partition)
           if p['chain']:
               cmd.extend(['--chain_partition', f"{p['chain'][0]}:{p['chain'][1]}:{p['chain'][2]}"])
 
-          # ★★★ 重要: プロパティ (Prop) は --property で明示的に指定 ★★★
-          # これにより、boot イメージのフッターからプロパティが混入するのを防ぐ
           for key, value in p['props']:
               cmd.extend(['--property', f"{key}:{value}"])
 
-          # ハッシュ記述子 (boot 以外) を --hash で指定
           for algo, name, size, salt, digest, fl in p['hash_desc']:
               cmd.extend(['--hash', algo, name, size, salt, digest, fl])
 
-          # ハッシュツリー記述子を --hashtree で指定
           for name, size, algo, salt, root, fl in p['hashtree_desc']:
               cmd.extend(['--hashtree', name, size, algo, salt, root, fl])
 
-          # ★★★ 新しい boot のハッシュ記述子を追加 ★★★
-          # Salt は元のものを使い、サイズとダイジェストは新しい boot.img から計算した値を使用
           cmd.extend([
               '--hash', 'sha256', 'boot', p['boot_size'], p['boot_salt'], p['boot_digest'], '0'
           ])
 
-          # コマンドを表示（デバッグ用）
-          print("実行するコマンド:")
-          print(' '.join(cmd))
-          print("")
-
-          # コマンドを実行
           subprocess.check_call(cmd)
-          print("vbmeta_signed.img を生成しました。")
           EOF
 
-      # ---------- 3. 生成後の検証 ----------
       - name: Show signed vbmeta info
         run: |
           echo "=== 署名済み vbmeta_signed.img の情報 ==="
           avbtool info_image --image work/vbmeta_signed.img
 
-      # ---------- 4. ZIP 出力 ----------
       - name: Create output ZIP
         run: |
           cd work
-          # 元の boot.img を同梱（必要に応じて）
-          cp boot.img boot_original.img
           zip ${{ github.event.inputs.output_zip }} boot.img vbmeta_signed.img
 
       - name: Upload artifacts
