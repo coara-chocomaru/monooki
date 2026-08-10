@@ -27,44 +27,39 @@ jobs:
       - name: Checkout repository (to get keys/vbmeta.pem)
         uses: actions/checkout@v4
 
-      # ---- 关键修复：安装并配置 Python 2.7 环境 ----
+      # ---- Python 2.7 のインストール ----
       - name: Install Python 2.7
         run: |
           sudo apt update
-          # 安装 Python 2.7 及其包管理工具
-          sudo apt install -y python2 python2-dev
-          # 创建 python2 指向 python2.7 的软链接，确保命令可用
-          sudo ln -sf /usr/bin/python2.7 /usr/bin/python2
-          # 安装 pip 2
+          sudo apt install -y python2 python2-dev wget git
+          # pip2 のインストール（必要に応じて）
           curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py
           sudo python2 get-pip.py
-          # 验证 Python 2.7 是否安装成功
           python2 --version
 
-      # ---- 下载并安装 avbtool 1.1.0 ----
-      - name: Install avbtool 1.1.0
+      # ---- avbtool 1.1.0 を git clone で取得（確実） ----
+      - name: Clone avbtool 1.1.0 from AOSP tag
         run: |
-          # 从 AOSP 的 avb-1.1.0 标签下载 avbtool
-          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/tags/avb-1.1.0.tar.gz -O - | tar xzf - avbtool
-          chmod +x avbtool
-          sudo mv avbtool /usr/local/bin/
-          # 关键：使用 python2 来执行并验证版本
+          git clone --depth 1 --branch avb-1.1.0 https://android.googlesource.com/platform/external/avb
+          sudo cp avb/avbtool /usr/local/bin/
+          sudo chmod +x /usr/local/bin/avbtool
+          # 動作確認（Python 2 で実行）
           python2 /usr/local/bin/avbtool --version
 
       - name: Download boot.img and original vbmeta.img
         run: |
-          mkdir work
+          mkdir -p work
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.original_vbmeta_url }}"
 
-      # ---- 从原始 vbmeta 提取所有描述符 ----
+      # ---- 元の vbmeta から全記述子を抽出 ----
       - name: Extract all descriptors from original vbmeta
         run: |
           python2 /usr/local/bin/avbtool info_image \
             --image work/vbmeta.img \
             --output_descriptor_path work/descriptors_all.txt
 
-      # ---- 自动提取 boot 分区的 Salt ----
+      # ---- boot の Salt を自動抽出（フォールバック付き） ----
       - name: Extract boot salt from original vbmeta
         id: extract_salt
         run: |
@@ -77,22 +72,20 @@ jobs:
           echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
           echo "Extracted boot salt: $SALT"
 
-      # ---- 从描述符文件中移除旧的 boot 哈希描述符 ----
+      # ---- 記述子から boot のハッシュ記述子を除去 ----
       - name: Remove boot hash descriptor
         run: |
           python2 -c "
           import re
           with open('work/descriptors_all.txt', 'r') as f:
               data = f.read()
-          # 按描述符类型分割文本块
           blocks = re.split(r'(?=^    (?:Hash|Hashtree|Chain|Prop) descriptor:)', data, flags=re.MULTILINE)
-          # 过滤掉包含 'Partition Name:        boot' 的块
           filtered = [b for b in blocks if not re.search(r'Partition Name:\s+boot', b)]
           with open('work/descriptors_filtered.txt', 'w') as f:
               f.write(''.join(filtered))
           "
 
-      # ---- 使用新的 boot.img 重新生成 vbmeta ----
+      # ---- 新しい vbmeta を再構成（boot のみ更新） ----
       - name: Resign vbmeta with new boot.img
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
@@ -109,12 +102,12 @@ jobs:
               --salt "${{ env.BOOT_SALT }}" \
             --output work/${{ github.event.inputs.output_name }}
 
-      # ---- 验证生成的 vbmeta ----
-      - name: Show signed vbmeta info (verification)
+      # ---- 生成された vbmeta の情報を表示（検証） ----
+      - name: Show signed vbmeta info
         run: |
           python2 /usr/local/bin/avbtool info_image --image work/${{ github.event.inputs.output_name }}
 
-      # ---- 上传最终产物 ----
+      # ---- アーティファクトとしてアップロード ----
       - name: Upload signed vbmeta
         uses: actions/upload-artifact@v4
         with:
