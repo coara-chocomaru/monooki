@@ -84,8 +84,8 @@ jobs:
         run: |
           BOOT_SALT=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_salt'])")
           cp work/boot.img work/boot_clean.img
-          python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img 2>/dev/null || true
           BOOT_SIZE=$(stat -c%s work/boot_clean.img)
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img 2>/dev/null || true
           python2 /usr/local/bin/avbtool add_hash_footer \
             --image work/boot_clean.img \
             --partition_name boot \
