@@ -1,4 +1,4 @@
-name: Resign vbmeta with full boot structure
+name: Resign vbmeta with exact structure (avbtool 1.1.0)
 
 on:
   workflow_dispatch:
@@ -24,107 +24,78 @@ jobs:
       contents: read
 
     steps:
-      # ---- リポジトリのチェックアウト（keys/vbmeta.pem を取得） ----
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---- Python 2.7 と必要なツールのインストール ----
+      # ---------- 環境準備 ----------
       - name: Install Python 2.7 and tools
         run: |
           sudo apt update
-          sudo apt install -y python2 wget git
+          sudo apt install -y python2 wget git openssl
 
-      # ---- avbtool 1.1.0 を AOSP android-9.0.0_r34 からクローン ----
-      - name: Clone avbtool 1.1.0
+      - name: Clone avbtool 1.1.0 from AOSP
         run: |
           git clone --depth 1 --branch android-9.0.0_r34 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
-      # ---- 入力URLから boot.img と vbmeta.img をダウンロード ----
+      # ---------- 入力ファイルのダウンロード ----------
       - name: Download boot.img and vbmeta.img
         run: |
           mkdir -p work
           wget -q -O work/boot.img "${{ github.event.inputs.boot_img_url }}"
           wget -q -O work/vbmeta.img "${{ github.event.inputs.vbmeta_img_url }}"
 
-      # ---- 元の vbmeta から boot の Salt とサイズを抽出 ----
-      - name: Extract boot salt and size from original vbmeta
-        id: extract
-        run: |
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
-          SALT=$(grep -A10 "Hash descriptor:" work/vbmeta_info.txt | \
-                 grep -A5 "Partition Name:        boot" | \
-                 grep "Salt:" | head -1 | awk '{print $2}')
-          if [ -z "$SALT" ]; then
-            echo "Salt 抽出失敗。フォールバック値を使用します。"
-            SALT="07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b"
-          fi
-          SIZE=$(grep -A10 "Hash descriptor:" work/vbmeta_info.txt | \
-                 grep -A5 "Partition Name:        boot" | \
-                 grep "Image Size:" | head -1 | awk '{print $3}')
-          if [ -z "$SIZE" ]; then
-            echo "サイズ抽出失敗。フォールバック値を使用します。"
-            SIZE="51408896"
-          fi
-          echo "BOOT_SALT=$SALT" >> $GITHUB_ENV
-          echo "BOOT_SIZE=$SIZE" >> $GITHUB_ENV
-          echo "抽出した Salt: $SALT, サイズ: $SIZE"
 
-      # ---- 新しい boot.img のフッターを消去（既存フッター対策） ----
+      # ---------- 新しい boot.img のフッターをクリーン ----------
       - name: Erase existing footer from new boot.img
         run: |
           cp work/boot.img work/boot_clean.img
           python2 /usr/local/bin/avbtool erase_footer --image work/boot_clean.img || true
 
-      # ---- 新しい boot.img にハッシュフッターと全プロパティを追加 ----
-      - name: Add hash footer and properties to new boot.img
+      # ---------- 新しい boot.img にハッシュフッターを追加（プロパティなし） ----------
+      - name: Add hash footer to new boot.img
         run: |
           python2 /usr/local/bin/avbtool add_hash_footer \
             --image work/boot_clean.img \
             --partition_name boot \
             --partition_size 100663296 \
             --hash_algorithm sha256 \
-            --salt ${{ env.BOOT_SALT }} \
-            --algorithm NONE \
-            --prop com.android.build.boot.fingerprint:'Rakuten/P780/P780:11/RKQ1.210715.001/263:user/release-keys' \
-            --prop com.android.build.boot.os_version:'11' \
-            --prop com.android.build.boot.security_patch:'2023-12-01' \
-            --prop com.android.build.boot.security_patch:'2023-12-01'
+            --salt 07b334c6199b399511f08ea05c0ea1b37fcac0a226bf82e2a2284e0d7adcd16b \
+            --algorithm NONE
           mv work/boot_clean.img work/boot_new.img
 
-      # ---- 生成された boot_new.img の構造を確認 ----
-      - name: Verify boot.img structure
+      # ---------- 構造確認 ----------
+      - name: Verify boot_new.img structure
         run: |
           echo "=== boot_new.img の情報 ==="
           python2 /usr/local/bin/avbtool info_image --image work/boot_new.img
 
-      # ---- 元の vbmeta と新しい boot のフッターから記述子を合成して再署名 ----
+      # ---------- vbmeta を再構築（全記述子を保持し、boot だけ更新） ----------
       - name: Build signed vbmeta
         run: |
           python2 /usr/local/bin/avbtool make_vbmeta_image \
             --include_descriptors_from_image work/vbmeta.img \
             --include_descriptors_from_image work/boot_new.img \
-            --key keys/vbmeta.avbpubkey \
+            --key keys/vbmeta.pem \
             --algorithm SHA256_RSA4096 \
             --rollback_index 0 \
             --flags 0 \
             --output work/vbmeta_signed.img
 
-      # ---- 生成された vbmeta の情報を表示（検証） ----
+      # ---------- 生成後の検証 ----------
       - name: Show signed vbmeta info
         run: |
           echo "=== 署名済み vbmeta_signed.img の情報 ==="
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta_signed.img
 
-      # ---- boot_new.img を boot.img にリネームして ZIP にまとめる ----
+      # ---------- ZIP 出力 ----------
       - name: Create output ZIP
         run: |
           cp work/boot_new.img work/boot.img
           cd work
           zip ${{ github.event.inputs.output_zip }} boot.img vbmeta_signed.img
 
-      # ---- ZIP ファイルをアーティファクトとしてアップロード ----
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
