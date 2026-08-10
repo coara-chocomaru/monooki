@@ -1,4 +1,4 @@
-name: Resign vbmeta (exact structure, props controlled)
+name: Resign vbmeta (exact structure with avbtool 12.1)
 
 on:
   workflow_dispatch:
@@ -28,12 +28,12 @@ jobs:
           sudo apt update
           sudo apt install -y python3 python3-pip wget git unzip openssl
 
-      - name: Install avbtool from AOSP main
+      - name: Clone avbtool from android-12.1.0_r11
         run: |
-          wget -q https://android.googlesource.com/platform/external/avb/+archive/refs/heads/main.tar.gz -O - | tar xzf - avbtool.py
-          chmod +x avbtool.py
-          sudo mv avbtool.py /usr/local/bin/avbtool
-          avbtool --version || true
+          git clone --depth 1 --branch android-12.1.0_r11 https://android.googlesource.com/platform/external/avb
+          sudo cp avb/avbtool /usr/local/bin/
+          sudo chmod +x /usr/local/bin/avbtool
+          avbtool --version
 
       - name: Download and extract ZIP
         run: |
@@ -136,7 +136,7 @@ jobs:
               cmd.extend(['--chain_partition', f"{p['chain'][0]}:{p['chain'][1]}:{p['chain'][2]}"])
 
           for key, value in p['props']:
-              cmd.extend(['--prop', f"{key}:{value}"])
+              cmd.extend(['--property', f"{key}:{value}"])
 
           for algo, name, size, salt, digest, fl in p['hash_desc']:
               cmd.extend(['--hash', algo, name, size, salt, digest, fl])
