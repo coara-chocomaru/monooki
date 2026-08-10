@@ -25,9 +25,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ============================================================
-      # 1. Radare2 と依存ツールのインストール
-      # ============================================================
       - name: Install Radare2 and Tools
         run: |
           apt-get update -y
@@ -57,9 +54,6 @@ jobs:
           pip3 install --upgrade pip
           pip3 install r2pipe pefile
 
-      # ============================================================
-      # 2. 高度な解析スクリプトの作成
-      # ============================================================
       - name: Create Advanced Analysis Script
         run: |
           cat > /tmp/analyze_bootloader.py << 'EOF'
@@ -67,28 +61,33 @@ jobs:
           import os, sys, json, re
           import r2pipe
 
-          # ターゲットのfastboot関連キーワード
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
               'download', 'continue', 'boot', 'update', 'unlock', 'lock',
               'device_state', 'secure', 'critical', 'slot', 'partition'
           ]
           UNLOCK_KEYWORDS = ['unlock', 'lock', 'oem_unlock', 'device_locked',
-                             'device_unlocked', 'lock_state', 'secure_boot']
+                             'device_unlocked', 'lock_state', 'secure_boot',
+                             'unlock_ability', 'allow_unlock']
+          VENDOR_KEYWORDS = ['tinno', 'gcom', 'rakuten', 'hand5g', 'rakuten_hand',
+                             'p780', 'oem', 'qcom', 'qualcomm']
+          OEM_COMMAND_PATTERNS = [
+              r'oem\s+unlock', r'oem\s+lock', r'oem\s+device-info',
+              r'oem\s+getvar', r'oem\s+setvar', r'fastboot\s+oem',
+              r'androidboot\.unlocked', r'ro\.oem_unlock'
+          ]
 
           def analyze_fastboot(img_path, name):
-              print(f"[+] Analyzing {name} for Fastboot & Unlock...")
+              print(f"[+] Analyzing {name}")
               out_dir = "/tmp/artifacts"
               os.makedirs(out_dir, exist_ok=True)
 
               r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-              r2.cmd('aaaa')  # フル解析
+              r2.cmd('aaaa')
 
-              # 1) 全文字列を取得（JSON形式で）
               strings_json = r2.cmdj('izzj') if hasattr(r2, 'cmdj') else []
               if not strings_json:
                   strings_raw = r2.cmd('izz')
-                  # 簡易パース（実運用ではより堅牢に）
                   strings_json = []
                   for line in strings_raw.splitlines():
                       if line.strip() and '=' in line:
@@ -100,32 +99,32 @@ jobs:
 
               fastboot_matches = []
               unlock_matches = []
+              vendor_matches = []
+              oem_cmd_matches = []
+
               for entry in strings_json:
                   s = entry.get('string', '')
                   addr = entry.get('addr', '')
-                  # 大文字小文字を区別せず検索
                   lower_s = s.lower()
                   for kw in FASTBOOT_KEYWORDS:
                       if kw in lower_s:
-                          fastboot_matches.append({
-                              'addr': addr,
-                              'string': s,
-                              'keyword': kw
-                          })
+                          fastboot_matches.append({'addr': addr, 'string': s, 'keyword': kw})
                           break
                   for ukw in UNLOCK_KEYWORDS:
                       if ukw in lower_s:
-                          unlock_matches.append({
-                              'addr': addr,
-                              'string': s,
-                              'keyword': ukw
-                          })
+                          unlock_matches.append({'addr': addr, 'string': s, 'keyword': ukw})
+                          break
+                  for vkw in VENDOR_KEYWORDS:
+                      if vkw in lower_s:
+                          vendor_matches.append({'addr': addr, 'string': s, 'keyword': vkw})
+                          break
+                  for pat in OEM_COMMAND_PATTERNS:
+                      if re.search(pat, lower_s):
+                          oem_cmd_matches.append({'addr': addr, 'string': s, 'pattern': pat})
                           break
 
-              # 2) 関数一覧を取得
               funcs_json = r2.cmdj('aflj')
               if not funcs_json:
-                  # フォールバック: afl テキストを解析
                   funcs_raw = r2.cmd('afl')
                   funcs_json = []
                   for line in funcs_raw.splitlines():
@@ -138,17 +137,14 @@ jobs:
                                   'size': parts[2] if len(parts)>2 else ''
                               })
 
-              # 3) 各関数の内容をスキャン（Unlock関連に絞る）
               unlock_functions = []
               for f in funcs_json:
                   addr = f.get('addr')
                   name = f.get('name', '')
                   if not addr:
                       continue
-                  # 関数名にunlock/lock関連が含まれるか
                   if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
                       r2.cmd(f's {addr}')
-                      # 逆アセンブル取得
                       pdf = r2.cmd('pdf')
                       unlock_functions.append({
                           'addr': addr,
@@ -156,7 +152,6 @@ jobs:
                           'disasm': pdf
                       })
                   else:
-                      # さらに、その関数内でunlock関連文字列を参照しているか調べる（簡易: 文字列参照先から逆引き）
                       refs = r2.cmdj(f'axtj {addr}') if hasattr(r2, 'cmdj') else []
                       if refs:
                           for ref in refs:
@@ -172,25 +167,22 @@ jobs:
                                   })
                                   break
 
-              # 4) パーティション名の特定（文字列から推測）
               partition_candidates = []
               for s in strings_json:
                   if 'partition' in s['string'].lower():
                       partition_candidates.append(s['string'])
-                  # よくあるパーティション名（aboot, misc, persist, frp, etc）
-                  for p in ['aboot', 'misc', 'persist', 'frp', 'userdata', 'boot']:
+                  for p in ['aboot', 'misc', 'persist', 'frp', 'userdata', 'boot', 'xbl', 'abl']:
                       if p in s['string'].lower():
                           partition_candidates.append(s['string'])
 
-              # 5) レポートの生成
               report_path = f"{out_dir}/{name}_fastboot_report.md"
               with open(report_path, 'w') as f:
-                  f.write(f"# Fastboot Analysis Report for {name}\n\n")
-                  f.write("## Fastboot Commands/Keywords Found\n")
+                  f.write(f"# Bootloader Analysis Report for {name}\n\n")
+                  f.write("## Fastboot Commands/Keywords\n")
                   if fastboot_matches:
                       f.write("| Address | String | Keyword |\n")
                       f.write("|---------|--------|---------|\n")
-                      for m in fastboot_matches[:100]:  # 上限
+                      for m in fastboot_matches[:100]:
                           f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
                   else:
                       f.write("No fastboot-related strings found.\n")
@@ -204,6 +196,24 @@ jobs:
                   else:
                       f.write("No unlock-related strings found.\n")
 
+                  f.write("\n## Vendor-specific Strings (Tinno, GCOM, Rakuten, etc.)\n")
+                  if vendor_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in vendor_matches[:50]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No vendor-specific strings found.\n")
+
+                  f.write("\n## OEM Command Patterns\n")
+                  if oem_cmd_matches:
+                      f.write("| Address | String | Pattern |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in oem_cmd_matches[:50]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['pattern']} |\n")
+                  else:
+                      f.write("No explicit OEM command patterns found.\n")
+
                   f.write("\n## Suspected Functions Handling Unlock\n")
                   if unlock_functions:
                       for uf in unlock_functions[:20]:
@@ -211,7 +221,7 @@ jobs:
                           if 'reason' in uf:
                               f.write(f"Reason: {uf['reason']}\n")
                           f.write("```asm\n")
-                          f.write(uf['disasm'][:2000])  # 最初の2000文字だけ表示
+                          f.write(uf['disasm'][:2000])
                           f.write("\n```\n\n")
                   else:
                       f.write("No unlock-related functions identified.\n")
@@ -221,13 +231,14 @@ jobs:
                       for p in set(partition_candidates):
                           f.write(f"- {p}\n")
                   else:
-                      f.write("No explicit partition names found in strings.\n")
+                      f.write("No explicit partition names found.\n")
 
-              # 6) 生データもJSONで保存
               with open(f"{out_dir}/{name}_fastboot_data.json", 'w') as f:
                   json.dump({
                       'fastboot_matches': fastboot_matches,
                       'unlock_matches': unlock_matches,
+                      'vendor_matches': vendor_matches,
+                      'oem_cmd_matches': oem_cmd_matches,
                       'unlock_functions': [{'addr': uf['addr'], 'name': uf['name']} for uf in unlock_functions],
                       'partition_candidates': list(set(partition_candidates))
                   }, f, indent=2)
@@ -245,18 +256,12 @@ jobs:
           EOF
           chmod +x /tmp/analyze_bootloader.py
 
-      # ============================================================
-      # 3. 解析実行
-      # ============================================================
       - name: Run Advanced Analysis
         run: |
           export PATH="/usr/local/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
           python3 /tmp/analyze_bootloader.py ./xbl.img ./abl.img
 
-      # ============================================================
-      # 4. 成果物のアップロード（従来の逆アセンブル＋解析レポート）
-      # ============================================================
       - name: Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -265,7 +270,7 @@ jobs:
             /tmp/artifacts/*.txt
             /tmp/artifacts/*.md
             /tmp/artifacts/*.json
-            /tmp/artifacts/*.html  # もしあれば
+            /tmp/artifacts/*.html
           retention-days: 30
           compression-level: 0
 
