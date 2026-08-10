@@ -134,7 +134,7 @@ jobs:
               cmd.extend(['--chain_partition', '{}:{}:work/chain_partition.avbpubkey'.format(p['chain'][0], p['chain'][1])])
 
           for key, value in p['props']:
-              cmd.extend(['--property', '{}:{}'.format(key, value)])
+              cmd.extend(['--prop', '{}:{}'.format(key, value)])
 
           for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
               cmd.extend(['--include_descriptors_from_image', 'work/{}'.format(img)])
