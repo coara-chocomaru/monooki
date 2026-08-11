@@ -87,7 +87,7 @@ jobs:
               r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # ---------- 強化されたXZ/LZMA抽出 ----------
+          # ---------- 再帰的XZ/LZMA抽出（エラー無視） ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -117,7 +117,6 @@ jobs:
                       fout.write(data)
                   decompressed = carved_raw + '.decomp'
                   try:
-                      # xz コマンドで試す
                       subprocess.check_call(
                           ['xz', '-d', '-k', '-c', carved_raw],
                           stdout=open(decompressed, 'wb'),
@@ -129,7 +128,6 @@ jobs:
                       else:
                           os.unlink(decompressed) if os.path.exists(decompressed) else None
                   except Exception as e:
-                      # コマンド失敗時は標準 lzma モジュールで再試行
                       try:
                           with open(carved_raw, 'rb') as f:
                               compressed = f.read()
@@ -155,7 +153,6 @@ jobs:
               try:
                   subprocess.check_call(['xz', '-d', '-k', '-c', filepath], stdout=open(outpath, 'wb'))
               except:
-                  # モジュールで再試行
                   with open(filepath, 'rb') as f:
                       compressed = f.read()
                   decomp_data = lzma.decompress(compressed)
@@ -179,7 +176,6 @@ jobs:
                           extracted_files.append(full)
               return extracted_files
 
-          # 再帰的に全てのXZストリームとbinwalkアーカイブを抽出
           def prepare_files(filepath):
               results = []
               temp_dir = tempfile.mkdtemp(prefix='bootloader_')
@@ -212,7 +208,6 @@ jobs:
                           if cf not in processed:
                               to_process.append(cf)
                       results.append(current)
-              # 重複除去
               seen = set()
               unique_results = []
               for f in results:
@@ -284,7 +279,45 @@ jobs:
                   results.append({'key': key_int, 'key_hex': key_bytes.hex(), 'decoded': dec_str})
               return results
 
-          # 全領域（全セクション）に対してXOR探索
+          # ---------- 特定キーによる強制XORデコード (XBL解析結果から抽出) ----------
+          def decode_with_specific_xbl_keys(raw_data):
+              results = []
+              # xbl.img の Emulation Results および fcn.0c249094 から特定したキー
+              specific_keys = [
+                  (0x044B5134, 4, '0x044B5134 (32bit)'),
+                  (0x5134, 2, '0x5134 (16bit)'),
+                  (0x044B, 2, '0x044B (16bit)'),
+                  (0x34, 1, '0x34 (8bit)'),
+                  (0x51, 1, '0x51 (8bit)'),
+                  (0x4B, 1, '0x4B (8bit)'),
+                  (0x04, 1, '0x04 (8bit)'),
+              ]
+              for key, size, label in specific_keys:
+                  decoded_bytes = bytearray()
+                  if size == 1:
+                      decoded_bytes = bytes([b ^ key for b in raw_data])
+                  elif size == 2:
+                      for i in range(0, len(raw_data) - 1, 2):
+                          val = int.from_bytes(raw_data[i:i+2], 'little') ^ key
+                          decoded_bytes += val.to_bytes(2, 'little')
+                  elif size == 4:
+                      for i in range(0, len(raw_data) - 3, 4):
+                          val = int.from_bytes(raw_data[i:i+4], 'little') ^ key
+                          decoded_bytes += val.to_bytes(4, 'little')
+                  try:
+                      dec_str = decoded_bytes.decode('ascii', errors='ignore')
+                      if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go']):
+                          results.append({
+                              'key_label': label,
+                              'key_hex': hex(key),
+                              'size': size,
+                              'decoded': dec_str[:200]
+                          })
+                  except:
+                      pass
+              return results
+
+          # ---------- 全セクションXOR探索 (総当たり) ----------
           def search_all_xor_keys_on_all_regions(r2):
               decoded_entries = []
               sections = r2.cmdj('iSj') or []
@@ -368,18 +401,16 @@ jobs:
                               })
               return tables
 
-          # XORループのエミュレーション（強化）
           def emulate_xor_loop(r2, func_addr):
               try:
                   r2.cmd(f's {func_addr}')
                   r2.cmd('aae')
-                  r2.cmd('aec')  # 簡易ステップ実行
+                  r2.cmd('aec')
                   regs = r2.cmd('dr')
                   return {'function': func_addr, 'registers': regs, 'note': 'Emulation attempted, check disassembly for XOR pattern.'}
               except:
                   return None
 
-          # アンロック関連変数
           def find_unlock_variables(r2):
               symbols = r2.cmdj('isj') or []
               unlock_vars = []
@@ -399,7 +430,6 @@ jobs:
                                   unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
               return unlock_vars
 
-          # 文字列抽出
           def extract_all_strings(r2):
               strings = []
               try:
@@ -433,7 +463,6 @@ jobs:
                               funcs.append({'addr': parts[0], 'name': parts[1], 'size': parts[2]})
               return funcs
 
-          # XORループ検出（強化）
           def find_xor_loops_enhanced(r2):
               xors = []
               for f in get_functions(r2):
@@ -477,6 +506,43 @@ jobs:
               xors = find_xor_loops_enhanced(r2)
               high_entropy_regions = find_high_entropy_regions(r2)
               decoded_from_xor_all = search_all_xor_keys_on_all_regions(r2)
+
+              # ---- 特定XBLキーによる強制デコード ----
+              specific_decoded_entries = []
+              # エミュレーション結果のアドレス（例: 0x0c22dc4a）や、xorsから特定できるアドレスを抽出
+              target_addrs = []
+              if label == "xbl":
+                  # xbl の emulation_results からアドレスを拾う（実際のJSONに依存）
+                  # 簡易的に、strings から "OEM" 関連のアドレスや、データセクションの先頭を試す
+                  for s in strings:
+                      if 'oem' in s.get('string', '').lower():
+                          addr = s.get('addr')
+                          if addr and isinstance(addr, int):
+                              target_addrs.append(addr)
+                  # さらに、xors で見つかった関数の参照先アドレスを追加
+                  for x in xors:
+                      addr = x.get('addr')
+                      if addr:
+                          # 関数の前後のデータを読むため、-0x100 ~ +0x100 をスキャン
+                          for off in range(-0x80, 0x80, 0x10):
+                              target_addrs.append(addr + off)
+
+              for base_addr in target_addrs[:30]:  # 負荷軽減のため上限
+                  try:
+                      data = r2.cmd(f'px 256 @ {base_addr:#x}')
+                      raw = bytes.fromhex(''.join(data.split()))
+                      decs = decode_with_specific_xbl_keys(raw)
+                      for d in decs:
+                          specific_decoded_entries.append({
+                              'addr': base_addr,
+                              'key_label': d['key_label'],
+                              'key_hex': d['key_hex'],
+                              'size': d['size'],
+                              'decoded_string': d['decoded']
+                          })
+                  except:
+                      pass
+
               oem_tables = find_oem_command_table(r2)
               unlock_vars = find_unlock_variables(r2)
               emu_results = []
@@ -607,7 +673,7 @@ jobs:
                   else:
                       f.write("No high-entropy data regions found.\n")
 
-                  f.write("\n## XOR Decoded Strings from All Sections\n")
+                  f.write("\n## XOR Decoded Strings (Brute-force from All Sections)\n")
                   if decoded_from_xor_all:
                       f.write("| Address | Section | Type | Key | Decoded Preview |\n")
                       f.write("|---------|---------|------|-----|-----------------|\n")
@@ -618,7 +684,16 @@ jobs:
                               key_str = f"0x{d['key']:X} (hex: {d.get('key_hex','')})"
                           f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
                   else:
-                      f.write("No decodable strings found via XOR.\n")
+                      f.write("No decodable strings found via brute-force XOR.\n")
+
+                  f.write("\n## XOR Decoded Strings (Specific XBL Keys: 0x044B5134, 0x5134, etc.)\n")
+                  if specific_decoded_entries:
+                      f.write("| Address | Key Label | Size | Decoded Preview |\n")
+                      f.write("|---------|-----------|------|-----------------|\n")
+                      for d in specific_decoded_entries[:50]:
+                          f.write(f"| {d['addr']:#x} | {d['key_label']} | {d['size']}-byte | {d['decoded_string'][:80]} |\n")
+                  else:
+                      f.write("No decodable strings found with specific XBL keys.\n")
 
                   f.write("\n## OEM Command Table Candidates\n")
                   if oem_tables:
@@ -670,6 +745,7 @@ jobs:
                       'xor_functions': xors,
                       'high_entropy_regions': high_entropy_regions,
                       'xor_decoded_strings': decoded_from_xor_all,
+                      'specific_xor_decoded_strings': specific_decoded_entries,
                       'oem_command_tables': oem_tables,
                       'unlock_variables': unlock_vars,
                       'emulation_results': emu_results
