@@ -140,7 +140,7 @@ jobs:
           # 4. チェーン公開鍵を testkey_rsa2048.pem から抽出（既知のテスト鍵）
           subprocess.check_call([
               'python2', '/usr/local/bin/avbtool', 'extract_public_key',
-              '--key', 'testkey_rsa2048.pem',
+              '--key', 'keys/testkey_rsa2048.pem',
               '--output', 'work/chain.avbpubkey'
           ])
 
