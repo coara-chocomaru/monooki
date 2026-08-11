@@ -69,6 +69,12 @@ jobs:
           7z x h.zip -o. -aoa -y
           ls -la *.img
 
+      - name: Switch to Python 2
+        run: |
+          sudo apt -y install python2
+          sudo update-alternatives --install /usr/bin/python python /usr/bin/python2 1
+          python --version
+
       - name: Check keys
         run: |
           echo "=== keys directory ==="
@@ -83,31 +89,31 @@ jobs:
 
       - name: info dtbo
         run: |
-          python avb/avbtool info_image --image dtbo.img
+          python2 avb/avbtool info_image --image dtbo.img
 
       - name: info vendor
         run: |
-          python avb/avbtool info_image --image vendor.img
+          python2 avb/avbtool info_image --image vendor.img
 
       - name: info vendor_boot
         run: |
-          python avb/avbtool info_image --image vendor_boot.img
+          python2 avb/avbtool info_image --image vendor_boot.img
 
       - name: info boot
         run: |
-          python avb/avbtool info_image --image boot.img
+          python2 avb/avbtool info_image --image boot.img
 
       - name: info vbmeta
         run: |
-          python avb/avbtool info_image --image vbmeta.img
+          python2 avb/avbtool info_image --image vbmeta.img
 
       - name: info odm
         run: |
-          python avb/avbtool info_image --image odm.img
+          python2 avb/avbtool info_image --image odm.img
 
       - name: info vbmeta_system
         run: |
-          python avb/avbtool info_image --image vbmeta_system.img
+          python2 avb/avbtool info_image --image vbmeta_system.img
 
       - name: Extract public key for vbmeta_system
         run: |
