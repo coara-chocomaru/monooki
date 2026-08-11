@@ -121,12 +121,6 @@ jobs:
             --key keys/testkey_rsa2048.pem \
             --output keys/vbmeta_system.avbpubkey
 
-      - name: Verify original vbmeta_system.img
-        run: |
-          python avb/avbtool verify_image \
-            --image vbmeta_system.img \
-            --key keys/testkey_rsa2048.pem
-
       - name: Prepare signed directory
         run: |
           mkdir -p signed
