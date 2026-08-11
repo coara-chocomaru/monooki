@@ -87,7 +87,7 @@ jobs:
               r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # ---------- DEEP XZ/LZMA CARVING ----------
+          # ---------- RECURSIVE XZ/LZMA CARVING & EXTRACTION ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -159,35 +159,54 @@ jobs:
                           extracted_files.append(full)
               return extracted_files
 
+          # Recursively extract all possible XZ streams and binwalk archives
           def prepare_files(filepath):
               results = []
               temp_dir = tempfile.mkdtemp(prefix='bootloader_')
-              decomp = None
-              if is_xz_compressed(filepath):
-                  decomp = decompress_xz(filepath)
-                  sub_files = extract_with_binwalk(decomp, temp_dir)
-                  if sub_files:
-                      results.extend(sub_files)
-                  else:
+              to_process = [filepath]
+              processed = set()
+              while to_process:
+                  current = to_process.pop()
+                  if current in processed:
+                      continue
+                  processed.add(current)
+                  # If current is XZ compressed, decompress it and add to processing
+                  if is_xz_compressed(current):
+                      decomp = decompress_xz(current)
+                      to_process.append(decomp)
+                      # also run binwalk on decomp
+                      sub_files = extract_with_binwalk(decomp, temp_dir)
+                      for sf in sub_files:
+                          if sf not in processed:
+                              to_process.append(sf)
+                      # carve XZ from decomp directly
+                      carved = carve_xz_streams(decomp, temp_dir)
+                      for cf in carved:
+                          if cf not in processed:
+                              to_process.append(cf)
+                      # add decomp to results after processing its subfiles
                       results.append(decomp)
-              else:
-                  sub_files = extract_with_binwalk(filepath, temp_dir)
-                  if sub_files:
-                      results.extend(sub_files)
                   else:
-                      results.append(filepath)
-              carve_sources = [filepath]
-              if decomp and os.path.exists(decomp):
-                  carve_sources.append(decomp)
-              for src in carve_sources:
-                  carved = carve_xz_streams(src, temp_dir)
-                  if carved:
-                      results.extend(carved)
-              if not results and decomp:
-                  results.append(decomp)
-              if not results:
-                  results.append(filepath)
-              return list(set(results))
+                      # run binwalk on current
+                      sub_files = extract_with_binwalk(current, temp_dir)
+                      for sf in sub_files:
+                          if sf not in processed:
+                              to_process.append(sf)
+                      # carve XZ from current directly
+                      carved = carve_xz_streams(current, temp_dir)
+                      for cf in carved:
+                          if cf not in processed:
+                              to_process.append(cf)
+                      # add current to results (original file or extracted payload)
+                      results.append(current)
+              # Remove duplicates while preserving order
+              seen = set()
+              unique_results = []
+              for f in results:
+                  if f not in seen:
+                      seen.add(f)
+                      unique_results.append(f)
+              return unique_results
 
           # ---------- ADVANCED ANALYSES ----------
           def entropy(data):
@@ -218,6 +237,7 @@ jobs:
                               regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
               return regions
 
+          # Single-byte XOR decode
           def decode_with_xor_keys(data, keys):
               results = []
               for key in keys:
@@ -230,9 +250,40 @@ jobs:
                       results.append({'key': key, 'decoded': dec_str})
               return results
 
+          # Multi-byte XOR decode (2 or 4 bytes)
+          def decode_with_multi_byte_xor(data, key_bytes):
+              if len(key_bytes) not in (2, 4):
+                  return []
+              key_len = len(key_bytes)
+              key_int = int.from_bytes(key_bytes, 'little')
+              results = []
+              # for 2-byte: process each 2-byte chunk
+              chunk_size = key_len
+              decoded_bytes = bytearray()
+              for i in range(0, len(data) - chunk_size + 1, chunk_size):
+                  chunk = int.from_bytes(data[i:i+chunk_size], 'little')
+                  decoded = chunk ^ key_int
+                  decoded_bytes += decoded.to_bytes(chunk_size, 'little')
+              # handle remaining bytes (if any) by padding? just ignore for simplicity
+              try:
+                  dec_str = decoded_bytes.decode('ascii', errors='ignore')
+              except:
+                  return []
+              if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
+                  results.append({'key': key_int, 'key_hex': key_bytes.hex(), 'decoded': dec_str})
+              return results
+
           def search_all_xor_keys_on_regions(r2, regions):
               decoded_entries = []
-              keys = list(range(0x100)) + [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C]
+              # single-byte keys
+              keys_single = list(range(0x100)) + [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C]
+              # multi-byte keys (2-byte and 4-byte)
+              multi_keys = []
+              for k in [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]:
+                  multi_keys.append(k.to_bytes(2, 'little'))
+              for k in [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]:
+                  multi_keys.append(k.to_bytes(4, 'little'))
+
               for region in regions:
                   addr = region['addr']
                   size = region['size']
@@ -241,15 +292,30 @@ jobs:
                       raw = bytes.fromhex(''.join(data.split()))
                   except:
                       continue
-                  matches = decode_with_xor_keys(raw, keys)
+                  # single-byte
+                  matches = decode_with_xor_keys(raw, keys_single)
                   for m in matches:
                       decoded_entries.append({
                           'addr': addr,
                           'size': size,
                           'entropy': region['entropy'],
+                          'type': 'single-byte',
                           'key': m['key'],
                           'decoded_string': m['decoded'][:200]
                       })
+                  # multi-byte
+                  for kb in multi_keys:
+                      matches_multi = decode_with_multi_byte_xor(raw, kb)
+                      for m in matches_multi:
+                          decoded_entries.append({
+                              'addr': addr,
+                              'size': size,
+                              'entropy': region['entropy'],
+                              'type': f'{len(kb)}-byte',
+                              'key': m['key'],
+                              'key_hex': m['key_hex'],
+                              'decoded_string': m['decoded'][:200]
+                          })
               return decoded_entries
 
           def find_oem_command_table(r2):
@@ -524,10 +590,14 @@ jobs:
 
                   f.write("\n## XOR Decoded Strings from High-Entropy Regions\n")
                   if decoded_from_xor:
-                      f.write("| Address | Key | Decoded Preview |\n")
-                      f.write("|---------|-----|-----------------|\n")
+                      f.write("| Address | Type | Key | Decoded Preview |\n")
+                      f.write("|---------|------|-----|-----------------|\n")
                       for d in decoded_from_xor[:50]:
-                          f.write(f"| {d['addr']:#x} | 0x{d['key']:02X} | {d['decoded_string'][:80]} |\n")
+                          if d.get('type') == 'single-byte':
+                              key_str = f"0x{d['key']:02X}"
+                          else:
+                              key_str = f"0x{d['key']:X} (hex: {d.get('key_hex','')})"
+                          f.write(f"| {d['addr']:#x} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
                   else:
                       f.write("No decodable strings found via XOR.\n")
 
