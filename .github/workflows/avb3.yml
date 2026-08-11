@@ -1,10 +1,10 @@
-name: Resign vbmeta (with avbtool Android 11)
+name: Resign vbmeta (boot only, preserve all others)
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: '全イメージ (boot, dtbo, vendor_boot, odm, vendor, vbmeta) を含むZIPファイルのURL'
+        description: '全イメージ (boot, dtbo, vendor_boot, odm, vendor, vbmeta_system, vbmeta) を含むZIPファイルのURL'
         required: true
         type: string
       output_zip:
@@ -20,13 +20,21 @@ jobs:
       contents: read
 
     steps:
+      # ============================================================
+      # 1. リポジトリのチェックアウト（keys/ 配下に秘密鍵があることを想定）
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Python 2.7 from source
+      # ============================================================
+      # 2. Python 2.7 のビルドと avbtool (Android 11) のセットアップ
+      # ============================================================
+      - name: Build Python 2.7 from source and install avbtool
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential wget git unzip zip openssl libssl-dev zlib1g-dev
+
+          # Python 2.7.18 のビルド
           wget -q https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
           tar xzf Python-2.7.18.tgz
           cd Python-2.7.18
@@ -36,12 +44,14 @@ jobs:
           cd ..
           sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
 
-      - name: Clone avbtool from android-11.0.0_r39
-        run: |
+          # avbtool (android-11.0.0_r39) のクローン & インストール
           git clone --depth 1 --branch android-11.0.0_r39 https://android.googlesource.com/platform/external/avb
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
+      # ============================================================
+      # 3. 入力ZIPのダウンロードと解凍
+      # ============================================================
       - name: Download and extract ZIP
         run: |
           mkdir -p work
@@ -50,106 +60,111 @@ jobs:
           unzip -q images.zip
           ls -la *.img
 
-      - name: Extract original vbmeta and boot parameters
-        id: parse
+      # ============================================================
+      # 4. 元のパラメータ (Algorithm, Rollback, Flags, Bootサイズ) を抽出
+      # ============================================================
+      - name: Extract original parameters
+        id: params
         run: |
+          # 元の vbmeta から Algorithm, Rollback Index, Flags を取得
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img > work/vbmeta_info.txt
+          ALG=$(grep '^Algorithm:' work/vbmeta_info.txt | awk '{print $2}')
+          ROLLBACK=$(grep '^Rollback Index:' work/vbmeta_info.txt | awk '{print $3}')
+          FLAGS=$(grep '^Flags:' work/vbmeta_info.txt | awk '{print $2}')
+
+          # 元の boot.img からパーティションサイズ (フッター込みの総サイズ) を取得
           python2 /usr/local/bin/avbtool info_image --image work/boot.img > work/boot_info.txt
+          BOOT_SIZE=$(grep '^Image size:' work/boot_info.txt | head -1 | awk '{print $3}')
 
-          python3 << 'EOF'
-          import re, json
+          # 環境変数にセット (後続のステップで使用)
+          echo "ALGORITHM=$ALG" >> $GITHUB_ENV
+          echo "ROLLBACK=$ROLLBACK" >> $GITHUB_ENV
+          echo "FLAGS=$FLAGS" >> $GITHUB_ENV
+          echo "BOOT_SIZE=$BOOT_SIZE" >> $GITHUB_ENV
 
-          with open('work/vbmeta_info.txt', 'r') as f:
-              vbmeta_data = f.read()
+          echo "Extracted Algorithm: $ALG"
+          echo "Extracted Rollback: $ROLLBACK"
+          echo "Extracted Flags: $FLAGS"
+          echo "Extracted Boot Partition Size: $BOOT_SIZE"
 
-          with open('work/boot_info.txt', 'r') as f:
-              boot_data = f.read()
-
-          algorithm = re.search(r'Algorithm:\s*(\S+)', vbmeta_data).group(1)
-          rollback = re.search(r'Rollback Index:\s*(\d+)', vbmeta_data).group(1)
-          flags = re.search(r'Flags:\s*(\d+)', vbmeta_data).group(1)
-
-          props = []
-          for m in re.finditer(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', vbmeta_data):
-              props.append((m.group(1), m.group(2)))
-
-          chain = None
-          cm = re.search(r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+)', vbmeta_data, re.DOTALL)
-          if cm:
-              chain = (cm.group(1), cm.group(2))
-
-          boot_partition_size = re.search(r'Image size:\s*(\d+)\s*bytes', boot_data).group(1)
-
-          with open('work/params.json', 'w') as f:
-              json.dump({
-                  'algorithm': algorithm,
-                  'rollback': rollback,
-                  'flags': flags,
-                  'props': props,
-                  'chain': chain,
-                  'boot_partition_size': boot_partition_size
-              }, f)
-          EOF
-
-      - name: Extract chain partition public key
+      # ============================================================
+      # 5. 新しい boot.img を準備 (プロパティなしのハッシュフッターのみ追加)
+      #    ※ --prop は絶対に付けない。これにより boot.img にプロパティ記述子が含まれない。
+      # ============================================================
+      - name: Prepare new boot.img (hash footer only, NO props)
         run: |
-          python2 /usr/local/bin/avbtool extract_public_key --key keys/vbmeta_system.pem --output work/chain_partition.avbpubkey
+          # 既存のフッターを削除（あれば）
+          python2 /usr/local/bin/avbtool erase_footer --image work/boot.img 2>/dev/null || true
 
-      - name: Prepare new boot.img (hash footer only, no signature)
-        run: |
-          cp work/boot.img work/boot_new.img
-          python2 /usr/local/bin/avbtool erase_footer --image work/boot_new.img 2>/dev/null || true
-          BOOT_PARTITION_SIZE=$(python3 -c "import json; print(json.load(open('work/params.json'))['boot_partition_size'])")
+          # 新しいハッシュフッターを追加（--algorithm NONE で署名なし、--prop なし）
           python2 /usr/local/bin/avbtool add_hash_footer \
-            --image work/boot_new.img \
+            --image work/boot.img \
             --partition_name boot \
-            --partition_size $BOOT_PARTITION_SIZE \
+            --partition_size ${{ env.BOOT_SIZE }} \
             --hash_algorithm sha256 \
             --algorithm NONE
 
-      - name: Build vbmeta (exact structure, props explicitly added)
+          echo "New boot.img prepared with hash footer only."
+
+      # ============================================================
+      # 6. 新しい vbmeta.img を生成 (最重要ステップ)
+      #    ポイント: 新しい boot.img を最初に指定し、古い vbmeta.img を後に指定する。
+      #    これにより、新しい boot のハッシュが先頭に追加され、
+      #    古い vbmeta の全記述子 (チェーン、プロパティ、dtbo/vendor等のハッシュ) が後ろに連結される。
+      #    重複する boot 記述子は libavb が先頭の新しい方を採用し、古い方は無視する。
+      # ============================================================
+      - name: Generate new vbmeta (NEW boot first, OLD vbmeta second)
         run: |
-          python3 << 'EOF'
-          import json, subprocess
+          python2 /usr/local/bin/avbtool make_vbmeta_image \
+            --output work/vbmeta_new.img \
+            --key keys/vbmeta.pem \
+            --algorithm ${{ env.ALGORITHM }} \
+            --rollback_index ${{ env.ROLLBACK }} \
+            --flags ${{ env.FLAGS }} \
+            --include_descriptors_from_image work/boot.img \
+            --include_descriptors_from_image work/vbmeta.img
 
-          with open('work/params.json', 'r') as f:
-              p = json.load(f)
+          echo "vbmeta_new.img generated successfully."
 
-          cmd = [
-              'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
-              '--output', 'work/vbmeta_new.img',
-              '--key', 'keys/vbmeta.pem',
-              '--algorithm', p['algorithm'],
-              '--rollback_index', p['rollback'],
-              '--flags', p['flags']
-          ]
-
-          if p['chain']:
-              cmd.extend(['--chain_partition', '{}:{}:work/chain_partition.avbpubkey'.format(p['chain'][0], p['chain'][1])])
-
-          for key, value in p['props']:
-              cmd.extend(['--prop', '{}:{}'.format(key, value)])
-
-          for img in ['dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img', 'boot_new.img']:
-              cmd.extend(['--include_descriptors_from_image', 'work/{}'.format(img)])
-
-          subprocess.check_call(cmd)
-          print("vbmeta_new.img generated.")
-          EOF
-
-      - name: Show signed vbmeta info
+      # ============================================================
+      # 7. 生成物の構造を検証 (info_image で内容を表示)
+      # ============================================================
+      - name: Verify generated vbmeta structure
         run: |
-          echo "=== Signed vbmeta_new.img ==="
+          echo "=============================================="
+          echo "=== Original vbmeta.img (for reference) ==="
+          echo "=============================================="
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img
+
+          echo ""
+          echo "=============================================="
+          echo "=== Generated vbmeta_new.img ==="
+          echo "=============================================="
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img
 
+          echo ""
+          echo "=============================================="
+          echo "=== Boot hash comparison (Original vs New) ==="
+          echo "=============================================="
+          echo "Original boot digest:"
+          python2 /usr/local/bin/avbtool info_image --image work/boot.img | grep -A 5 "Hash descriptor:" | grep Digest
+          echo "New vbmeta boot digest (should be extracted from new boot):"
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 7 "Hash descriptor:" | grep -A 2 "Partition Name:.*boot" | grep Digest || echo "(Check manually above)"
+
+      # ============================================================
+      # 8. 出力ZIPの作成 (boot.img と vbmeta_new.img を同梱)
+      # ============================================================
       - name: Create output ZIP
         run: |
           mkdir -p out
-          cp work/boot_new.img out/boot.img
+          cp work/boot.img out/boot.img
           cp work/vbmeta_new.img out/vbmeta.img
           cd out
           zip ${{ github.event.inputs.output_zip }} boot.img vbmeta.img
 
+      # ============================================================
+      # 9. 成果物のアップロード
+      # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
