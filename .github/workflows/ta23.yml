@@ -70,20 +70,24 @@ jobs:
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
               'download', 'continue', 'boot', 'update', 'unlock', 'lock',
-              'device_state', 'secure', 'critical', 'slot', 'partition'
+              'device_state', 'secure', 'critical', 'slot', 'partition',
+              'flag', 'set'
           ]
           UNLOCK_KEYWORDS = ['unlock', 'lock', 'oem_unlock', 'device_locked',
                              'device_unlocked', 'lock_state', 'secure_boot',
-                             'unlock_ability', 'allow_unlock', 'unlock_code']
+                             'unlock_ability', 'allow_unlock', 'unlock_code',
+                             'go', 'flag']
           VENDOR_KEYWORDS = ['tinno', 'gcom', 'rakuten', 'hand5g', 'rakuten_hand',
                              'p780', 'oem', 'qcom', 'qualcomm', 'sectools']
           OEM_COMMAND_PATTERNS = [
               r'oem\s+unlock', r'oem\s+lock', r'oem\s+device-info',
               r'oem\s+getvar', r'oem\s+setvar', r'fastboot\s+oem',
-              r'androidboot\.unlocked', r'ro\.oem_unlock'
+              r'androidboot\.unlocked', r'ro\.oem_unlock',
+              r'oem\s+unlock-go', r'oem\s+set', r'oem\s+flag',
+              r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # ---------- DEEP XZ/LZMA CARVING (unchanged) ----------
+          # ---------- DEEP XZ/LZMA CARVING ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -185,7 +189,7 @@ jobs:
                   results.append(filepath)
               return list(set(results))
 
-          # ---------- NEW: ADVANCED ANALYSES ----------
+          # ---------- ADVANCED ANALYSES ----------
           def entropy(data):
               if not data:
                   return 0
@@ -222,7 +226,7 @@ jobs:
                       dec_str = dec.decode('ascii', errors='ignore')
                   except:
                       continue
-                  if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock']):
+                  if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
                       results.append({'key': key, 'decoded': dec_str})
               return results
 
@@ -252,9 +256,12 @@ jobs:
               strings = r2.cmdj('izzj') or []
               string_addrs = {}
               for s in strings:
-                  if 'addr' in s and 'string' in s:
-                      addr = int(s['addr'], 0) if s['addr'].startswith('0x') else int(s['addr'])
-                      string_addrs[addr] = s['string']
+                  if 'string' in s:
+                      addr = s.get('addr')
+                      if addr is not None:
+                          if isinstance(addr, str):
+                              addr = int(addr, 0) if addr.startswith('0x') else int(addr)
+                          string_addrs[addr] = s['string']
               tables = []
               for addr, s in string_addrs.items():
                   refs = r2.cmdj(f'axtj {addr:#x}') or []
@@ -294,15 +301,18 @@ jobs:
               unlock_vars = []
               for sym in symbols:
                   name = sym.get('name', '')
-                  if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot']):
+                  if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot', 'go', 'flag', 'set']):
                       unlock_vars.append({'name': name, 'addr': sym.get('vaddr'), 'type': sym.get('type')})
               strings = r2.cmdj('izzj') or []
               for s in strings:
-                  if 'unlock' in s.get('string', '').lower() or 'lock' in s.get('string', '').lower():
-                      refs = r2.cmdj(f'axtj {s["addr"]}') or []
-                      for ref in refs:
-                          if ref.get('type') == 'data':
-                              unlock_vars.append({'name': f'data_ref_{s["string"]}', 'addr': ref.get('from'), 'type': 'data reference'})
+                  s_str = s.get('string', '')
+                  if any(kw in s_str.lower() for kw in ['unlock', 'lock', 'unlock-go', 'oem', 'flag']):
+                      addr = s.get('addr')
+                      if addr is not None:
+                          refs = r2.cmdj(f'axtj {addr}') or []
+                          for ref in refs:
+                              if ref.get('type') == 'data':
+                                  unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
               return unlock_vars
 
           # ---------- EXISTING ANALYSIS FUNCTIONS (with enhancements) ----------
