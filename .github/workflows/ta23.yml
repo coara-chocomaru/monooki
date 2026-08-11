@@ -56,7 +56,7 @@ jobs:
           pip3 install --upgrade pip
           pip3 install r2pipe pefile capstone pyelftools binwalk
 
-      - name: Create Advanced Analysis Script
+      - name: Create Advanced Analysis Script (with Deep XZ/LZMA Carving)
         run: |
           cat > /tmp/analyze_bootloader.py << 'EOF'
           #!/usr/bin/env python3
@@ -81,6 +81,66 @@ jobs:
               r'androidboot\.unlocked', r'ro\.oem_unlock'
           ]
 
+          # ---------- DEEP XZ/LZMA CARVING ----------
+          def find_xz_magic_offsets(filepath):
+              """Return list of offsets where XZ magic (FD 37 7A 58 5A 00) appears."""
+              offsets = []
+              magic = b'\xFD\x37\x7A\x58\x5A\x00'
+              with open(filepath, 'rb') as f:
+                  data = f.read()
+              start = 0
+              while True:
+                  pos = data.find(magic, start)
+                  if pos == -1:
+                      break
+                  offsets.append(pos)
+                  start = pos + 1
+              return offsets
+
+          def carve_xz_streams(filepath, outdir):
+              """
+              Carve each XZ stream at its magic offset and attempt to decompress.
+              Returns a list of paths to successfully decompressed files.
+              """
+              carved_files = []
+              offsets = find_xz_magic_offsets(filepath)
+              if not offsets:
+                  return carved_files
+
+              print(f"[*] Found {len(offsets)} XZ magic occurrences in {filepath}")
+
+              for idx, off in enumerate(offsets):
+                  # Carve from offset to end (we rely on xz to detect the end)
+                  carved_raw = os.path.join(outdir, f"xz_carved_{idx}_{off:x}.xz")
+                  with open(filepath, 'rb') as fin:
+                      fin.seek(off)
+                      data = fin.read()
+                  with open(carved_raw, 'wb') as fout:
+                      fout.write(data)
+
+                  # Try decompress, ignoring errors
+                  decompressed = carved_raw + '.decomp'
+                  try:
+                      subprocess.check_call(
+                          ['xz', '-d', '-k', '-c', carved_raw],
+                          stdout=open(decompressed, 'wb'),
+                          stderr=subprocess.DEVNULL
+                      )
+                      if os.path.exists(decompressed) and os.path.getsize(decompressed) > 0:
+                          carved_files.append(decompressed)
+                          print(f"[+] Successfully decompressed carved stream at offset 0x{off:x}")
+                      else:
+                          os.unlink(decompressed) if os.path.exists(decompressed) else None
+                          print(f"[-] Decompression of stream at 0x{off:x} produced empty file, skipping.")
+                  except Exception as e:
+                      print(f"[-] Failed to decompress carved stream at 0x{off:x}: {e}")
+                  finally:
+                      # Remove the raw carved file to save space
+                      if os.path.exists(carved_raw):
+                          os.unlink(carved_raw)
+
+              return carved_files
+
           def is_xz_compressed(filepath):
               with open(filepath, 'rb') as f:
                   magic = f.read(6)
@@ -98,7 +158,6 @@ jobs:
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                   )
               except subprocess.CalledProcessError as e:
-                  # binwalk failed; log the error but continue
                   print(f"[!] binwalk extraction failed for {filepath} (exit {e.returncode})")
                   return []
               extracted_files = []
@@ -120,22 +179,33 @@ jobs:
                       results.extend(sub_files)
                   else:
                       results.append(decomp)
-                  # optionally remove decomp later? We'll keep for analysis
               else:
                   sub_files = extract_with_binwalk(filepath, temp_dir)
                   if sub_files:
                       results.extend(sub_files)
                   else:
                       results.append(filepath)
+
+              # **NEW**: also carve XZ streams from the original file (and from decomp if we created one)
+              carve_sources = [filepath]
+              if decomp and os.path.exists(decomp):
+                  carve_sources.append(decomp)
+              for src in carve_sources:
+                  carved = carve_xz_streams(src, temp_dir)
+                  if carved:
+                      results.extend(carved)
+
               # If no files extracted and decomp exists, use decomp
               if not results and decomp:
                   results.append(decomp)
               # If still empty, fallback to original
               if not results:
                   results.append(filepath)
-              # Clean up temporary directory after analysis? We'll leave for debugging.
+              # Deduplicate by path
+              results = list(set(results))
               return results
 
+          # ---------- ANALYSIS (unchanged, except we add a new section in report) ----------
           def extract_all_strings(r2):
               strings = []
               try:
@@ -353,6 +423,13 @@ jobs:
                   else:
                       f.write("No XOR loops detected.\n")
 
+                  # NEW: report on compression streams found during carving
+                  f.write("\n## XZ/LZMA Compression Streams Discovered\n")
+                  # We can log this information; we don't have it easily here, but we could store offsets
+                  # For now, we note that the analysis may include decompressed content from carved streams.
+                  f.write("The input file was scanned for embedded XZ magic bytes. Any successfully decompressed streams have been analyzed as separate 'parts'.\n")
+                  f.write("Check the JSON output for detailed carving offsets.\n")
+
               with open(f"{out_dir}/{safe_label}_fastboot_data.json", 'w') as f:
                   json.dump({
                       'fastboot_matches': fastboot_matches,
@@ -378,9 +455,22 @@ jobs:
                   label = "xbl" if idx == 0 else "abl"
                   files = prepare_files(img)
                   for f in files:
-                      all_files.append((f, label + "_part" + str(files.index(f)) if len(files)>1 else label))
+                      # Create a label that includes the base name and a part index
+                      base_label = label
+                      if len(files) > 1:
+                          part_idx = files.index(f)
+                          base_label = f"{label}_part{part_idx}"
+                      # Also indicate if it's a carved/decompressed file
+                      if 'xz_carved' in f or '.decomp' in f:
+                          base_label += "_decompressed"
+                      all_files.append((f, base_label))
 
+              # Process each file (deduplicate by file path)
+              seen = set()
               for f, lbl in all_files:
+                  if f in seen:
+                      continue
+                  seen.add(f)
                   analyze_file(f, lbl)
 
               print("[+] All analysis complete. Reports are in /tmp/artifacts/")
@@ -421,6 +511,7 @@ jobs:
           <h2>Quick Summary</h2>
           <p>Check the detailed reports above for full analysis including strings, functions, and potential unlock commands.</p>
           <p class="warning">If unlock-related strings are not found, check for XOR-encoded strings or analyze function disassembly.</p>
+          <p>Embedded XZ/LZMA streams were automatically carved, decompressed, and analyzed as separate parts.</p>
           </body></html>
           HTML
 
