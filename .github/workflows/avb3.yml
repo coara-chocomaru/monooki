@@ -1,196 +1,273 @@
-name: Resign vbmeta (exact structure, old boot descriptor removed)
+name: Next
 
 on:
-  workflow_dispatch:
-    inputs:
-      zip_url:
-        description: '全イメージ (boot, dtbo, vendor_boot, odm, vendor, vbmeta_system, vbmeta) を含むZIPのURL'
-        required: true
-        type: string
-      output_zip:
-        description: '出力ZIPファイル名'
-        required: false
-        default: 'resigned_images.zip'
-        type: string
+  push:
+    branches:
+      - 2  # 実行するブランチを指定
 
 jobs:
-  resign:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+      contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build Python 2.7 and install avbtool
+      - name: Display Run Parameters
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential wget git unzip zip openssl libssl-dev zlib1g-dev
-          wget -q https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
-          tar xzf Python-2.7.18.tgz
-          cd Python-2.7.18
-          ./configure --enable-optimizations
-          make -j$(nproc) || true
-          sudo make altinstall
-          cd ..
-          sudo ln -sf /usr/local/bin/python2.7 /usr/local/bin/python2
-          git clone --depth 1 --branch android-11.0.0_r39 https://android.googlesource.com/platform/external/avb
-          sudo cp avb/avbtool /usr/local/bin/
-          sudo chmod +x /usr/local/bin/avbtool
+          echo "::group::User Environment Variables"
+          echo "Device Name: a05ba"
+          echo "Build Target: AVB resign"
+          echo "::endgroup::"
 
-      - name: Download and extract ZIP
+      - name: Check Out
+        uses: actions/checkout@v3
+
+      - name: Cleanup
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Prepare the environment
         run: |
-          mkdir -p work
-          wget -q -O work/images.zip "${{ github.event.inputs.zip_url }}"
-          cd work
-          unzip -q images.zip
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Asia/Tokyo
+          sudo apt update
+          sudo apt-get install -y tzdata
+          sudo apt -y upgrade
+          sudo apt -y install \
+            gperf gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib \
+            libc6-dev lib32ncurses5-dev x11proto-core-dev libx11-dev tree \
+            lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc bc ccache \
+            lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev \
+            libsdl1.2-dev libwxgtk3.0-gtk3-dev libxml2 lzop pngcrush \
+            schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp \
+            qemu-user-static libstdc++-10-dev libncurses5 python3 libtinfo5 \
+            openssl python2.7 python2.7-dev git wget xxd python3-cryptography zip curl \
+            python3-pycryptodome \
+            p7zip-full
+
+      - name: Setup SSH Keys
+        if: startsWith(github.server_url, 'ssh')
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Download avbtool 1.1.0 from AOSP android-9.0.0_r34
+        run: |
+          git clone \
+            --depth 1 \
+            --branch android-9.0.0_r34 \
+            https://android.googlesource.com/platform/external/avb
+
+      - name: Download zip
+        run: |
+          wget -O h.zip \
+            https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/h.zip
+
+      - name: Extract images
+        run: |
+          7z x h.zip -o. -aoa -y
           ls -la *.img
 
-      - name: Extract parameters (header, props, chain, boot partition size)
-        id: extract
+      - name: Check keys
         run: |
-          python3 << 'EOF'
-          import re, json, subprocess
+          echo "=== keys directory ==="
+          ls -la keys/
 
-          def run_avbtool(cmd):
-              return subprocess.check_output(['python2', '/usr/local/bin/avbtool'] + cmd, text=True)
+          echo "=== required keys ==="
+          test -f keys/testkey_rsa2048.pem
+          test -f keys/testkey_rsa4096.pem
 
-          # 元の vbmeta 情報
-          vbmeta_info = run_avbtool(['info_image', '--image', 'work/vbmeta.img'])
-          header = {
-              'algorithm': re.search(r'Algorithm:\s+(\S+)', vbmeta_info).group(1),
-              'rollback': re.search(r'Rollback Index:\s+(\d+)', vbmeta_info).group(1),
-              'flags': re.search(r'Flags:\s+(\d+)', vbmeta_info).group(1),
-          }
-          # プロパティは元の出現順を保持（チェーンの次に来る）
-          props = re.findall(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', vbmeta_info)
-          chain_match = re.search(
-              r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+)',
-              vbmeta_info, re.DOTALL
-          )
-          chain = (chain_match.group(1), chain_match.group(2)) if chain_match else None
+          echo "testkey_rsa2048.pem: OK"
+          echo "testkey_rsa4096.pem: OK"
 
-          # 元の boot パーティションサイズ（フッター込み）を取得
-          boot_info = run_avbtool(['info_image', '--image', 'work/boot.img'])
-          boot_partition_size = re.search(r'Image size:\s+(\d+)\s+bytes', boot_info).group(1)
-
-          # 新しい boot.img にハッシュフッターを追加（--prop なし、--algorithm NONE）
-          subprocess.check_call([
-              'python2', '/usr/local/bin/avbtool', 'erase_footer', '--image', 'work/boot.img'
-          ], stderr=subprocess.DEVNULL)
-          subprocess.check_call([
-              'python2', '/usr/local/bin/avbtool', 'add_hash_footer',
-              '--image', 'work/boot.img',
-              '--partition_name', 'boot',
-              '--partition_size', boot_partition_size,
-              '--hash_algorithm', 'sha256',
-              '--algorithm', 'NONE'
-          ])
-
-          # チェーン公開鍵を testkey_rsa2048.pem から抽出
-          subprocess.check_call([
-              'python2', '/usr/local/bin/avbtool', 'extract_public_key',
-              '--key', 'keys/testkey_rsa2048.pem',
-              '--output', 'work/chain.avbpubkey'
-          ])
-
-          with open('work/params.json', 'w') as f:
-              json.dump({
-                  'header': header,
-                  'props': props,
-                  'chain': chain,
-              }, f)
-          EOF
-
-      - name: Build new vbmeta (explicit chain + props + descriptors from images, NO old vbmeta)
+      - name: info dtbo
         run: |
-          python3 << 'EOF'
-          import json, subprocess
+          python avb/avbtool info_image --image dtbo.img
 
-          with open('work/params.json', 'r') as f:
-              p = json.load(f)
-
-          cmd = [
-              'python2', '/usr/local/bin/avbtool', 'make_vbmeta_image',
-              '--output', 'work/vbmeta_new.img',
-              '--key', 'keys/vbmeta.pem',
-              '--algorithm', p['header']['algorithm'],
-              '--rollback_index', p['header']['rollback'],
-              '--flags', p['header']['flags']
-          ]
-
-          # 1. チェーン（元の順序：最初）
-          if p['chain']:
-              cmd.extend([
-                  '--chain_partition',
-                  f"{p['chain'][0]}:{p['chain'][1]}:work/chain.avbpubkey"
-              ])
-
-          # 2. プロパティ（元の順序：チェーンの次）
-          for key, value in p['props']:
-              cmd.extend(['--prop', f'{key}:{value}'])
-
-          # 3. 各パーティションの記述子をイメージから取り込む（boot → dtbo → vendor_boot → odm → vendor）
-          #    これにより古い boot 記述子は一切含まれない
-          for img in ['boot.img', 'dtbo.img', 'vendor_boot.img', 'odm.img', 'vendor.img']:
-              cmd.extend(['--include_descriptors_from_image', f'work/{img}'])
-
-          subprocess.check_call(cmd)
-          print("vbmeta_new.img generated with exact structure (old boot descriptor removed).")
-          EOF
-
-      - name: Verify structure and boot hash
+      - name: info vendor
         run: |
-          echo "=============================================="
-          echo "=== Original vbmeta (full) ==="
-          echo "=============================================="
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img
+          python avb/avbtool info_image --image vendor.img
 
-          echo ""
-          echo "=============================================="
-          echo "=== New vbmeta (old boot descriptor removed) ==="
-          echo "=============================================="
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img
-
-          echo ""
-          echo "=============================================="
-          echo "=== Boot hash comparison ==="
-          echo "=============================================="
-          echo "Original boot digest:"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img | grep -A 6 "Hash descriptor:" | grep -A 1 "Partition Name:.*boot" | grep Digest | head -1
-          echo "New boot digest:"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 6 "Hash descriptor:" | grep -A 1 "Partition Name:.*boot" | grep Digest | head -1
-
-          echo ""
-          echo "=============================================="
-          echo "=== Chain partition check (must be cdbb77177...) ==="
-          echo "=============================================="
-          echo "Original chain pubkey (sha1):"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img | grep -A 3 "Chain Partition descriptor:" | grep "Public key (sha1)"
-          echo "New chain pubkey (sha1):"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 3 "Chain Partition descriptor:" | grep "Public key (sha1)"
-
-          echo ""
-          echo "=============================================="
-          echo "=== Auxiliary Block size check ==="
-          echo "=============================================="
-          echo "Original Auxiliary Block size:"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img | grep "Auxiliary Block:" | awk '{print $3}'
-          echo "New Auxiliary Block size (should be close to original, no old boot descriptor):"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep "Auxiliary Block:" | awk '{print $3}'
-
-      - name: Create output ZIP
+      - name: info vendor_boot
         run: |
-          mkdir -p out
-          cp work/boot.img out/boot.img
-          cp work/vbmeta_new.img out/vbmeta.img
-          cd out
-          zip ${{ github.event.inputs.output_zip }} boot.img vbmeta.img
+          python avb/avbtool info_image --image vendor_boot.img
+
+      - name: info boot
+        run: |
+          python avb/avbtool info_image --image boot.img
+
+      - name: info vbmeta
+        run: |
+          python avb/avbtool info_image --image vbmeta.img
+
+      - name: info odm
+        run: |
+          python avb/avbtool info_image --image odm.img
+
+      - name: info vbmeta_system
+        run: |
+          python avb/avbtool info_image --image vbmeta_system.img
+
+      - name: Extract public key for vbmeta_system
+        run: |
+          python avb/avbtool extract_public_key \
+            --key keys/testkey_rsa2048.pem \
+            --output keys/vbmeta_system.avbpubkey
+
+      - name: Verify original vbmeta_system.img
+        run: |
+          python avb/avbtool verify_image \
+            --image vbmeta_system.img \
+            --key keys/testkey_rsa2048.pem
+
+      - name: Prepare signed directory
+        run: |
+          mkdir -p signed
+
+      - name: Keep original vbmeta_system.img unchanged
+        run: |
+          cp vbmeta_system.img signed/vbmeta_system.img
+
+      - name: Verify copied vbmeta_system.img
+        run: |
+          cmp -s vbmeta_system.img signed/vbmeta_system.img
+          echo "vbmeta_system.img is unchanged."
+
+      - name: Set fixed salt for all partitions
+        run: |
+          echo "FIXED_SALT=70a0876074f1d5f3a4e57148cfbd248855407f3e62236b049f30a5c9d93cfed8" >> $GITHUB_ENV
+
+      - name: Capture original partition sizes
+        run: |
+          cd $GITHUB_WORKSPACE
+          echo "BOOT_PARTITION_SIZE=$(stat -c%s boot.img)" >> $GITHUB_ENV
+          echo "ODM_PARTITION_SIZE=$(stat -c%s odm.img)" >> $GITHUB_ENV
+          echo "VENDOR_BOOT_PARTITION_SIZE=$(stat -c%s vendor_boot.img)" >> $GITHUB_ENV
+          echo "VENDOR_PARTITION_SIZE=$(stat -c%s vendor.img)" >> $GITHUB_ENV
+          echo "DTBO_PARTITION_SIZE=$(stat -c%s dtbo.img)" >> $GITHUB_ENV
+
+      - name: Sign boot.img => signed/boot.img
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp boot.img signed/boot.img
+
+          python $GITHUB_WORKSPACE/avb/avbtool erase_footer \
+            --image signed/boot.img \
+            2>/dev/null || true
+
+          python $GITHUB_WORKSPACE/avb/avbtool add_hash_footer \
+            --image signed/boot.img \
+            --partition_name boot \
+            --partition_size $BOOT_PARTITION_SIZE \
+            --hash_algorithm sha256 \
+            --algorithm NONE \
+            --salt e5221de4db25a10ca4ce5f651de5498c423ac4f86dff69815f3fcf5a9f370bde
+
+      - name: Sign odm.img => signed/odm.img
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp odm.img signed/odm.img
+
+      - name: Sign vendor_boot.img => signed/vendor_boot.img
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp vendor_boot.img signed/vendor_boot.img
+
+      - name: Sign vendor.img => signed/vendor.img
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp vendor.img signed/vendor.img
+
+      - name: Sign dtbo.img => signed/dtbo.img
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp dtbo.img signed/dtbo.img
+
+      - name: Build vbmeta image
+        run: |
+          python avb/avbtool make_vbmeta_image \
+            --output signed/vbmeta.img \
+            --key keys/testkey_rsa4096.pem \
+            --algorithm SHA256_RSA4096 \
+            --rollback_index 0 \
+            --flags 0 \
+            --chain_partition vbmeta_system:2:keys/vbmeta_system.avbpubkey \
+            --include_descriptors_from_image signed/boot.img \
+            --include_descriptors_from_image signed/dtbo.img \
+            --include_descriptors_from_image signed/vendor_boot.img \
+            --include_descriptors_from_image signed/odm.img \
+            --include_descriptors_from_image signed/vendor.img \
+            --prop com.android.build.vendor.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
+            --prop com.android.build.vendor.os_version:11 \
+            --prop com.android.build.vendor.security_patch:2024-02-01 \
+            --prop com.android.build.vendor_boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
+            --prop com.android.build.boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
+            --prop com.android.build.boot.os_version:11 \
+            --prop com.android.build.boot.security_patch:2024-02-01 \
+            --prop com.android.build.odm.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
+            --prop com.android.build.odm.os_version:11 \
+            --prop com.android.build.dtbo.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys
+
+      - name: Show vbmeta info
+        run: |
+          python avb/avbtool info_image \
+            --image signed/vbmeta.img
+
+          echo "---hexdump---"
+
+          xxd signed/vbmeta.img | head -30
+
+      - name: Install Python2 crypto libs
+        run: |
+          curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py
+          python get-pip.py
+          python -m pip install --upgrade "pip<21"
+          python -m pip install "setuptools<45"
+          python -m pip uninstall -y pycryptodome || true
+          python -m pip install "pycrypto==2.6.1"
+
+      - name: Verify vbmeta_system.img with original signing key
+        run: |
+          python avb/avbtool verify_image \
+            --image signed/vbmeta_system.img \
+            --key keys/testkey_rsa2048.pem
+
+      - name: Explicit testkey verification
+        run: |
+          python avb/avbtool verify_image \
+            --image signed/vbmeta.img \
+            --key keys/testkey_rsa4096.pem \
+            --expected_chain_partition vbmeta_system:2:keys/vbmeta_system.avbpubkey
+
+      - name: Verify vbmeta_system.img was not modified
+        run: |
+          sha256sum vbmeta_system.img
+          sha256sum signed/vbmeta_system.img
+
+          cmp -s vbmeta_system.img signed/vbmeta_system.img
+
+          echo "Original and output vbmeta_system.img are identical."
+
+      - name: Zip keys folder
+        run: |
+          zip -r keys.zip keys/
+
+      - name: Upload keys artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-keys
+          path: keys.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: resigned-images
-          path: out/${{ github.event.inputs.output_zip }}
-          if-no-files-found: error
+          name: resigned-all-partitions
+          path: |
+            signed/vbmeta.img
+            signed/vbmeta_system.img
+            signed/boot.img
+            signed/odm.img
+            signed/dtbo.img
+            signed/vendor_boot.img
+            signed/vendor.img
