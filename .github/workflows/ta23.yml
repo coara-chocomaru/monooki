@@ -65,7 +65,8 @@ jobs:
           import r2pipe
           from collections import defaultdict
           import binwalk
-          import lzma  # Python標準モジュール（ビルド不要）
+          import lzma
+          import traceback
 
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
@@ -292,16 +293,22 @@ jobs:
               # 2バイト（リトルエンディアン）
               common_2byte = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]
               specific_2byte = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343]
-              for k in common_2byte + specific_2byte:
+              # さらに、よく使われるASCII由来のキー
+              ascii_keys_2 = [0x4F45, 0x454D, 0x4D00, 0x004D]  # 'OE', 'EM', etc.
+              for k in common_2byte + specific_2byte + ascii_keys_2:
                   multi_keys.append(k.to_bytes(2, 'little'))
+                  multi_keys.append(k.to_bytes(2, 'big'))  # ビッグエンディアンも試す
               # 4バイト（リトルエンディアン）
               common_4byte = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]
               specific_4byte = [
                   0x044B5134, 0x5134044B, 0x34514B04,
                   0x4B043451, 0x44B5134,  0x5134
               ]
-              for k in common_4byte + specific_4byte:
+              # ASCII由来の4バイトキー
+              ascii_keys_4 = [0x4F454D00, 0x004D454F, 0x4F454D20]  # 'OEM', ' MEO', etc.
+              for k in common_4byte + specific_4byte + ascii_keys_4:
                   multi_keys.append(k.to_bytes(4, 'little'))
+                  multi_keys.append(k.to_bytes(4, 'big'))
 
               # さらにエミュレーション結果のレジスタ値もキーとして追加
               reg_keys = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
@@ -310,8 +317,10 @@ jobs:
                       keys_single.append(k)
                   elif k < 0x10000:
                       multi_keys.append(k.to_bytes(2, 'little'))
+                      multi_keys.append(k.to_bytes(2, 'big'))
                   else:
                       multi_keys.append(k.to_bytes(4, 'little'))
+                      multi_keys.append(k.to_bytes(4, 'big'))
 
               for sec in sections:
                   addr = sec.get('vaddr', 0)
@@ -386,6 +395,7 @@ jobs:
                               })
               return tables
 
+          # エミュレーション（エラーを完全に無視）
           def emulate_xor_loop(r2, func_addr):
               try:
                   r2.cmd(f's {func_addr}')
@@ -393,7 +403,8 @@ jobs:
                   r2.cmd('aec')
                   regs = r2.cmd('dr')
                   return {'function': func_addr, 'registers': regs, 'note': 'Emulation attempted, check disassembly for XOR pattern.'}
-              except:
+              except Exception as e:
+                  # ESILエラーなどは無視
                   return None
 
           def find_unlock_variables(r2):
@@ -484,17 +495,18 @@ jobs:
               out_dir = "/tmp/artifacts"
               os.makedirs(out_dir, exist_ok=True)
 
+              # Radare2を開き、分析を試行（エラーは無視）
               r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-              # エラーを回避するため aaa を使用（aaaa は失敗することがある）
-              try:
-                  r2.cmd('aaa')
-              except:
-                  print("[-] aaa failed, trying aa")
+              # 分析レベルを段階的に試す
+              for cmd in ['aaa', 'aa', 'a']:
                   try:
-                      r2.cmd('aa')
-                  except:
-                      pass
+                      print(f"[*] Trying analysis command: {cmd}")
+                      r2.cmd(cmd)
+                      break
+                  except Exception as e:
+                      print(f"[-] {cmd} failed: {e}, trying next")
 
+              # 基本情報取得
               strings = extract_all_strings(r2)
               funcs = get_functions(r2)
               xors = find_xor_loops_enhanced(r2)
@@ -546,7 +558,6 @@ jobs:
                       continue
                   if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
                       r2.cmd(f's {addr}')
-                      # pdr を使用
                       disasm = r2.cmd('pdr')
                       unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm})
                   else:
