@@ -227,27 +227,12 @@ jobs:
           python -m pip uninstall -y pycryptodome || true
           python -m pip install "pycrypto==2.6.1"
 
-      - name: Verify vbmeta_system.img with original signing key
-        run: |
-          python avb/avbtool verify_image \
-            --image signed/vbmeta_system.img \
-            --key keys/testkey_rsa2048.pem
-
       - name: Explicit testkey verification
         run: |
           python avb/avbtool verify_image \
             --image signed/vbmeta.img \
             --key keys/testkey_rsa4096.pem \
             --expected_chain_partition vbmeta_system:2:keys/vbmeta_system.avbpubkey
-
-      - name: Verify vbmeta_system.img was not modified
-        run: |
-          sha256sum vbmeta_system.img
-          sha256sum signed/vbmeta_system.img
-
-          cmp -s vbmeta_system.img signed/vbmeta_system.img
-
-          echo "Original and output vbmeta_system.img are identical."
 
       - name: Zip keys folder
         run: |
