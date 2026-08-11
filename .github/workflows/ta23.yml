@@ -35,7 +35,8 @@ jobs:
             bsdmainutils \
             default-jdk-headless \
             binwalk xz-utils p7zip-full file \
-            liblzma-dev
+            liblzma-dev \
+            gdb-multiarch qemu-user-static
           apt-get clean
 
           git clone --depth 1 https://github.com/radareorg/radare2
@@ -54,7 +55,7 @@ jobs:
       - name: Install Python libraries
         run: |
           pip3 install --upgrade pip
-          pip3 install r2pipe pefile capstone pyelftools binwalk pycryptodome
+          pip3 install r2pipe pefile capstone pyelftools binwalk pycryptodome unicorn
 
       - name: Create Comprehensive Analysis Script
         run: |
@@ -62,13 +63,13 @@ jobs:
           #!/usr/bin/env python3
           # -*- coding: utf-8 -*-
           """
-          Extremely thorough bootloader analysis with:
-          - Recursive extraction (XZ, LZMA, binwalk)
-          - Full disassembly and analysis with radare2
-          - Massive XOR brute-force with many key families
-          - Emulation of XOR loops to capture runtime keys
-          - OEM command table detection
-          - Multi-stage decoding attempts
+          Ultra-thorough bootloader analysis:
+          - Multi-stage extraction (XZ, LZMA, binwalk)
+          - Full disassembly with radare2 (multiple analysis passes)
+          - Deep XOR analysis: extract keys from functions, apply to data
+          - Emulation with correct memory permissions
+          - Heuristic string detection and decryption
+          - Comprehensive reporting with all potential strings
           """
           import os, sys, json, re, subprocess, tempfile, struct, math, binascii, time, hashlib
           import r2pipe
@@ -76,7 +77,7 @@ jobs:
           import binwalk
           import lzma
           import traceback
-          from Crypto.Util.strxor import strxor  # for multi-byte
+          from Crypto.Util.strxor import strxor
 
           # ---------- Configuration ----------
           FASTBOOT_KEYWORDS = [
@@ -228,51 +229,30 @@ jobs:
                       unique_results.append(f)
               return unique_results
 
-          # ---------- String extraction helpers ----------
-          def extract_all_strings_from_binary(data):
-              # Use regex to find printable ASCII strings >= 4 chars
-              pattern = re.compile(b'[ -~]{4,}')
-              strings = []
-              for m in pattern.finditer(data):
-                  s = m.group().decode('ascii', errors='ignore')
-                  strings.append(s)
-              return strings
-
-          # ---------- Entropy ----------
-          def entropy(data):
-              if not data:
-                  return 0
-              e = 0
-              for x in range(256):
-                  p_x = float(data.count(x)) / len(data)
-                  if p_x > 0:
-                      e += - p_x * math.log(p_x, 2)
-              return e
-
-          # ---------- XOR brute-force with many key families ----------
+          # ---------- XOR key generation (exhaustive) ----------
           def generate_xor_keys():
               keys = []
               # Single-byte
               keys.extend(range(0x100))
               # Common single-byte
               keys.extend([0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C, 0x00, 0x80, 0x7F])
-              # 2-byte common
+              # 2-byte
               common_2 = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA,
-                          0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA]
-              # Specific from previous analysis
-              spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343, 0x4F45, 0x454D]
+                          0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA,
+                          0x4F45, 0x454D, 0x4D00, 0x004D]
+              spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343]
               for k in common_2 + spec_2:
                   keys.append(k.to_bytes(2, 'little'))
                   keys.append(k.to_bytes(2, 'big'))
-              # 4-byte common
+              # 4-byte
               common_4 = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202,
-                          0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0x0D15EA5E]
-              spec_4 = [0x044B5134, 0x5134044B, 0x34514B04, 0x4B043451, 0x44B5134, 0x5134,
-                        0x4F454D00, 0x004D454F, 0x4F454D20]
+                          0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0x0D15EA5E,
+                          0x4F454D00, 0x004D454F, 0x4F454D20]
+              spec_4 = [0x044B5134, 0x5134044B, 0x34514B04, 0x4B043451, 0x44B5134]
               for k in common_4 + spec_4:
                   keys.append(k.to_bytes(4, 'little'))
                   keys.append(k.to_bytes(4, 'big'))
-              # Also try combinations of register values from emulation
+              # Register values from previous emulation
               reg_vals = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
               for v in reg_vals:
                   if v < 0x100:
@@ -296,8 +276,7 @@ jobs:
               key_len = len(key_bytes)
               if key_len == 1:
                   key = key_bytes[0]
-                  dec = bytes([b ^ key for b in data])
-                  return dec
+                  return bytes([b ^ key for b in data])
               elif key_len == 2:
                   key_int = int.from_bytes(key_bytes, 'little')
                   dec = bytearray()
@@ -314,55 +293,40 @@ jobs:
                   return bytes(dec)
               return None
 
-          def search_all_xor_keys_on_all_regions(r2):
-              decoded_entries = []
-              sections = r2.cmdj('iSj') or []
-              keys = generate_xor_keys()
-              print(f"[*] Number of XOR keys to test: {len(keys)}")
-              for sec in sections:
-                  addr = sec.get('vaddr', 0)
-                  size = sec.get('size', 0)
-                  if not addr or size < 64:
-                      continue
-                  data = r2.cmd(f'px {size} @ {addr}')
-                  try:
-                      raw = bytes.fromhex(''.join(data.split()))
-                  except:
-                      continue
-                  for key_bytes in keys:
-                      dec = try_xor_decode(raw, key_bytes)
-                      if dec is None:
-                          continue
-                      try:
-                          dec_str = dec.decode('ascii', errors='ignore')
-                      except:
-                          continue
-                      # Check for interesting keywords
-                      if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
-                          key_hex = key_bytes.hex()
-                          decoded_entries.append({
-                              'addr': addr,
-                              'size': size,
-                              'key': key_hex,
-                              'decoded_string': dec_str[:200],
-                              'section': sec.get('name', '')
-                          })
-              return decoded_entries
-
-          # ---------- Radare2 analysis with error recovery ----------
-          def safe_r2_cmd(r2, cmd, default=''):
-              try:
-                  return r2.cmd(cmd)
-              except Exception as e:
-                  print(f"[-] r2 command '{cmd}' failed: {e}")
-                  return default
-
-          def safe_r2_cmdj(r2, cmd):
-              try:
-                  return r2.cmdj(cmd)
-              except Exception as e:
-                  print(f"[-] r2 commandj '{cmd}' failed: {e}")
-                  return []
+          # ---------- Analyze a single XOR function ----------
+          def analyze_xor_function(r2, addr):
+              """Extract key and target data from an XOR function."""
+              info = {'addr': addr, 'key': None, 'data_addr': None, 'size': None}
+              # Disassemble the function
+              disasm = r2.cmd(f'pdr @ {addr}')
+              # Look for immediate values that could be a key
+              key_candidates = []
+              for line in disasm.splitlines():
+                  if 'mov' in line and '#' in line:
+                      parts = line.split('#')
+                      if len(parts) > 1:
+                          try:
+                              val = int(parts[1].split()[0], 0)
+                              if val < 0x10000:
+                                  key_candidates.append(val)
+                          except:
+                              pass
+                  # Look for ldr/str to detect data addresses
+                  if 'ldr' in line and '=' in line:
+                      parts = line.split('=')
+                      if len(parts) > 1:
+                          try:
+                              data_addr = int(parts[1].split()[0], 0)
+                              if data_addr > 0x1000:
+                                  info['data_addr'] = data_addr
+                          except:
+                              pass
+                  if 'str' in line and '[' in line:
+                      # Could be storing result, but hard to extract size
+                      pass
+              if key_candidates:
+                  info['key'] = key_candidates[0] & 0xFF  # assume single byte for now
+              return info
 
           # ---------- Main analysis ----------
           def analyze_file(img_path, label):
@@ -370,9 +334,16 @@ jobs:
               out_dir = "/tmp/artifacts"
               os.makedirs(out_dir, exist_ok=True)
 
-              # Open with radare2, try multiple analysis levels
+              # Open radare2 with proper flags
               r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-              # Try analysis in increasing depth
+              # Set up analysis: include all maps, set permissions
+              try:
+                  r2.cmd('e anal.in=io.maps')
+                  r2.cmd('ompg +x')  # make all maps executable
+              except:
+                  pass
+
+              # Try multiple analysis passes
               for cmd in ['aaa', 'aa', 'a']:
                   try:
                       print(f"[*] Trying analysis: {cmd}")
@@ -383,15 +354,14 @@ jobs:
               # Additional analysis
               try:
                   r2.cmd('aac')
-              except: pass
-              try:
                   r2.cmd('aav')
-              except: pass
+              except:
+                  pass
 
-              # Get basic info
-              info = safe_r2_cmd(r2, 'iI')
-              strings = safe_r2_cmdj(r2, 'izzj') or []
-              funcs = safe_r2_cmdj(r2, 'aflj') or []
+              # Get info
+              info = r2.cmd('iI')
+              strings = r2.cmdj('izzj') or []
+              funcs = r2.cmdj('aflj') or []
 
               # Find XOR loops
               xors = []
@@ -399,37 +369,30 @@ jobs:
                   addr = f.get('addr')
                   if not addr:
                       continue
-                  safe_r2_cmd(r2, f's {addr}')
-                  disasm = safe_r2_cmd(r2, 'pdr')
+                  r2.cmd(f's {addr}')
+                  disasm = r2.cmd('pdr')
                   if 'eor' in disasm.lower() and ('str' in disasm.lower() or 'stm' in disasm.lower()):
-                      key = None
-                      for line in disasm.splitlines():
-                          if 'mov' in line and '#' in line:
-                              parts = line.split('#')
-                              if len(parts) > 1:
-                                  try:
-                                      val = int(parts[1].split()[0], 0)
-                                      if val < 0x100:
-                                          key = val
-                                          break
-                                  except:
-                                      pass
                       xors.append({
                           'function': f.get('name', addr),
                           'addr': addr,
-                          'key': key,
                           'disasm': disasm[:800]
                       })
 
+              # Analyze each XOR function to extract key and data
+              xor_info_list = []
+              for x in xors:
+                  info_xor = analyze_xor_function(r2, x['addr'])
+                  xor_info_list.append(info_xor)
+
               # High entropy regions
               high_entropy_regions = []
-              sections = safe_r2_cmdj(r2, 'iSj') or []
+              sections = r2.cmdj('iSj') or []
               for sec in sections:
                   if sec.get('size', 0) > 64:
                       addr = sec.get('vaddr', 0)
                       size = sec.get('size', 0)
                       if addr and size:
-                          data = safe_r2_cmd(r2, f'px {size} @ {addr}')
+                          data = r2.cmd(f'px {size} @ {addr}')
                           try:
                               raw = bytes.fromhex(''.join(data.split()))
                           except:
@@ -438,8 +401,41 @@ jobs:
                           if e > 6.0:
                               high_entropy_regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
 
-              # XOR brute-force
-              decoded_xor = search_all_xor_keys_on_all_regions(r2)
+              # XOR brute-force on all sections
+              decoded_xor = []
+              all_keys = generate_xor_keys()
+              print(f"[*] Number of XOR keys to test: {len(all_keys)}")
+              for sec in sections:
+                  addr = sec.get('vaddr', 0)
+                  size = sec.get('size', 0)
+                  if not addr or size < 64:
+                      continue
+                  data = r2.cmd(f'px {size} @ {addr}')
+                  try:
+                      raw = bytes.fromhex(''.join(data.split()))
+                  except:
+                      continue
+                  for key_bytes in all_keys:
+                      dec = try_xor_decode(raw, key_bytes)
+                      if dec is None:
+                          continue
+                      try:
+                          dec_str = dec.decode('ascii', errors='ignore')
+                      except:
+                          continue
+                      if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
+                          decoded_xor.append({
+                              'addr': addr,
+                              'size': size,
+                              'key': key_bytes.hex(),
+                              'decoded_string': dec_str[:200],
+                              'section': sec.get('name', '')
+                          })
+                          # Limit to avoid huge output
+                          if len(decoded_xor) > 500:
+                              break
+                  if len(decoded_xor) > 500:
+                      break
 
               # OEM command table detection
               oem_tables = []
@@ -452,44 +448,47 @@ jobs:
                               addr = int(addr, 0) if addr.startswith('0x') else int(addr)
                           string_addrs[addr] = s['string']
               for addr, s in string_addrs.items():
-                  refs = safe_r2_cmdj(r2, f'axtj {addr:#x}') or []
+                  refs = r2.cmdj(f'axtj {addr:#x}') or []
                   if not refs:
                       continue
                   start = addr - 0x100
                   end = addr + 0x100
-                  data = safe_r2_cmd(r2, f'px {end-start} @ {start}')
+                  data = r2.cmd(f'px {end-start} @ {start}')
                   try:
                       raw = bytes.fromhex(''.join(data.split()))
                   except:
                       continue
-                  ptr_size = 8 if '64' in safe_r2_cmd(r2, 'iB') else 4
+                  ptr_size = 8 if '64' in r2.cmd('iB') else 4
                   for i in range(0, len(raw)-ptr_size, ptr_size):
                       ptr = struct.unpack('<Q' if ptr_size==8 else '<I', raw[i:i+ptr_size])[0]
-                      if safe_r2_cmd(r2, f'iS @ {ptr:#x}') and 'CODE' in safe_r2_cmd(r2, f'iS. @ {ptr:#x}'):
+                      if r2.cmd(f'iS @ {ptr:#x}') and 'CODE' in r2.cmd(f'iS. @ {ptr:#x}'):
                           if abs((start+i) - addr) < 0x80:
                               oem_tables.append({
                                   'string': s,
                                   'string_addr': addr,
                                   'ptr_addr': start+i,
                                   'ptr_value': ptr,
-                                  'section': safe_r2_cmd(r2, f'iS. @ {ptr:#x}').strip()
+                                  'section': r2.cmd(f'iS. @ {ptr:#x}').strip()
                               })
 
-              # Emulation for XOR functions
+              # Emulation attempts (with error handling)
               emu_results = []
               for x in xors[:10]:
                   try:
-                      safe_r2_cmd(r2, f's {x["addr"]}')
-                      safe_r2_cmd(r2, 'aae')
-                      safe_r2_cmd(r2, 'aec')
-                      regs = safe_r2_cmd(r2, 'dr')
-                      emu_results.append({'function': x['addr'], 'registers': regs, 'note': 'Emulation attempted, check disassembly.'})
-                  except:
-                      pass
+                      r2.cmd(f's {x["addr"]}')
+                      r2.cmd('aae')
+                      # Set memory permissions to avoid write errors
+                      r2.cmd('ompg +x')
+                      r2.cmd('ompg +w')
+                      r2.cmd('aec')
+                      regs = r2.cmd('dr')
+                      emu_results.append({'function': x['addr'], 'registers': regs, 'note': 'Emulation attempted.'})
+                  except Exception as e:
+                      emu_results.append({'function': x['addr'], 'error': str(e)[:100]})
 
-              # Unlock-related variables
+              # Unlock variables
               unlock_vars = []
-              symbols = safe_r2_cmdj(r2, 'isj') or []
+              symbols = r2.cmdj('isj') or []
               for sym in symbols:
                   name = sym.get('name', '')
                   if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot', 'go', 'flag', 'set']):
@@ -499,7 +498,7 @@ jobs:
                   if any(kw in s_str.lower() for kw in ['unlock', 'lock', 'unlock-go', 'oem', 'flag']):
                       addr = s.get('addr')
                       if addr is not None:
-                          refs = safe_r2_cmdj(r2, f'axtj {addr}') or []
+                          refs = r2.cmdj(f'axtj {addr}') or []
                           for ref in refs:
                               if ref.get('type') == 'data':
                                   unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
@@ -541,19 +540,20 @@ jobs:
                   if not addr:
                       continue
                   if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
-                      safe_r2_cmd(r2, f's {addr}')
-                      disasm = safe_r2_cmd(r2, 'pdr')
+                      r2.cmd(f's {addr}')
+                      disasm = r2.cmd('pdr')
                       unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm})
                   else:
-                      refs = safe_r2_cmdj(r2, f'axtj {addr}') or []
+                      refs = r2.cmdj(f'axtj {addr}') or []
                       for ref in refs:
                           ref_str = ref.get('string', '')
                           if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
-                              safe_r2_cmd(r2, f's {addr}')
-                              disasm = safe_r2_cmd(r2, 'pdr')
+                              r2.cmd(f's {addr}')
+                              disasm = r2.cmd('pdr')
                               unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
                               break
 
+              # Write report
               safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
               report_path = f"{out_dir}/{safe_label}_detailed_report.md"
               with open(report_path, 'w') as f:
@@ -655,7 +655,7 @@ jobs:
                   f.write("\n## Functions with XOR loops (potential decryption)\n")
                   if xors:
                       for x in xors[:20]:
-                          f.write(f"### {x['function']} (addr: {x['addr']}, key: {x['key'] if x['key'] else 'unknown'})\n")
+                          f.write(f"### {x['function']} (addr: {x['addr']})\n")
                           f.write("```asm\n")
                           f.write(x['disasm'][:1500])
                           f.write("\n```\n")
