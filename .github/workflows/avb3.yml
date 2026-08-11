@@ -197,18 +197,8 @@ jobs:
             --include_descriptors_from_image signed/dtbo.img \
             --include_descriptors_from_image signed/vendor_boot.img \
             --include_descriptors_from_image signed/odm.img \
-            --include_descriptors_from_image signed/vendor.img \
-            --prop com.android.build.vendor.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
-            --prop com.android.build.vendor.os_version:11 \
-            --prop com.android.build.vendor.security_patch:2024-02-01 \
-            --prop com.android.build.vendor_boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
-            --prop com.android.build.boot.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
-            --prop com.android.build.boot.os_version:11 \
-            --prop com.android.build.boot.security_patch:2024-02-01 \
-            --prop com.android.build.odm.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys \
-            --prop com.android.build.odm.os_version:11 \
-            --prop com.android.build.dtbo.fingerprint:Rakuten/P780/P780:11/RKQ1.210715.001/264:user/release-keys
-
+            --include_descriptors_from_image signed/vendor.img
+            
       - name: Show vbmeta info
         run: |
           python avb/avbtool info_image \
