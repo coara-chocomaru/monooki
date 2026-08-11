@@ -283,21 +283,32 @@ jobs:
           def search_all_xor_keys_on_all_regions(r2):
               decoded_entries = []
               sections = r2.cmdj('iSj') or []
+
+              # シングルバイトキー（全0x00〜0xFF + よく使われるもの）
               keys_single = list(range(0x100)) + [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C]
+
+              # マルチバイトキー（一般的なもの＋解析で特定されたキー）
               multi_keys = []
-              # 一般的な2バイトキー
-              for k in [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]:
+              # 2バイト
+              common_2byte = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]
+              specific_2byte = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451]  # エンディアン違いも
+              for k in common_2byte + specific_2byte:
                   multi_keys.append(k.to_bytes(2, 'little'))
-              # 一般的な4バイトキー
-              for k in [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]:
+              # 4バイト
+              common_4byte = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]
+              specific_4byte = [0x044B5134, 0x5134044B, 0x34  # その他エンディアン違い
+              for k in common_4byte + specific_4byte:
                   multi_keys.append(k.to_bytes(4, 'little'))
-              # ---- 解析で特定した固有キーを追加 ----
-              specific_2byte = [0x5134, 0x044B, 0x55AA]
-              for k in specific_2byte:
-                  multi_keys.append(k.to_bytes(2, 'little'))
-              specific_4byte = [0x044B5134]
-              for k in specific_4byte:
-                  multi_keys.append(k.to_bytes(4, 'little'))
+
+              # さらにエミュレーション結果のレジスタ値もキーとして追加（例：x0=0x0c22dc4a, x1=0x52, x2=0x01000041）
+              reg_keys = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
+              for k in reg_keys:
+                  if k < 0x100:
+                      keys_single.append(k)
+                  elif k < 0x10000:
+                      multi_keys.append(k.to_bytes(2, 'little'))
+                  else:
+                      multi_keys.append(k.to_bytes(4, 'little'))
 
               for sec in sections:
                   addr = sec.get('vaddr', 0)
@@ -320,7 +331,7 @@ jobs:
                           'decoded_string': m['decoded'][:200],
                           'section': sec.get('name', '')
                       })
-                  # マルチ（一般的＋特定）
+                  # マルチ
                   for kb in multi_keys:
                       matches_multi = decode_with_multi_byte_xor(raw, kb)
                       for m in matches_multi:
@@ -608,18 +619,18 @@ jobs:
                   else:
                       f.write("No high-entropy data regions found.\n")
 
-                  f.write("\n## XOR Decoded Strings (Brute-force from All Sections)\n")
+                  f.write("\n## XOR Decoded Strings (Brute-force + Specific Keys from All Sections)\n")
                   if decoded_from_xor_all:
                       f.write("| Address | Section | Type | Key | Decoded Preview |\n")
                       f.write("|---------|---------|------|-----|-----------------|\n")
-                      for d in decoded_from_xor_all[:100]:
+                      for d in decoded_from_xor_all[:200]:
                           if d.get('type') == 'single-byte':
                               key_str = f"0x{d['key']:02X}"
                           else:
                               key_str = f"0x{d['key']:X} (hex: {d.get('key_hex','')})"
                           f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
                   else:
-                      f.write("No decodable strings found via brute-force XOR.\n")
+                      f.write("No decodable strings found via XOR.\n")
 
                   f.write("\n## OEM Command Table Candidates\n")
                   if oem_tables:
