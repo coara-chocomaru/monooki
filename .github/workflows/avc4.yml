@@ -39,6 +39,12 @@ jobs:
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
+      - name: Download testkey_rsa2048.pem (for vbmeta_system chain)
+        run: |
+          # AOSP のテスト鍵をダウンロード（cdbb77177... の秘密鍵）
+          wget -q -O testkey_rsa2048.pem \
+            https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/main/test/data/testkey_rsa2048.pem
+
       - name: Download and extract ZIP
         run: |
           mkdir -p work
@@ -63,6 +69,7 @@ jobs:
               'rollback': re.search(r'Rollback Index:\s+(\d+)', vbmeta_info).group(1),
               'flags': re.search(r'Flags:\s+(\d+)', vbmeta_info).group(1),
           }
+          # プロパティは元の出現順を保持
           props = re.findall(r'Prop:\s+(\S+)\s+->\s+\'(.*)\'', vbmeta_info)
           chain_match = re.search(
               r'Chain Partition descriptor:.*?Partition Name:\s+(\S+).*?Rollback Index Location:\s+(\d+)',
@@ -70,15 +77,13 @@ jobs:
           )
           chain = (chain_match.group(1), chain_match.group(2)) if chain_match else None
 
-          # 2. 各パーティションイメージから記述子パラメータを抽出
-          # 注意: boot は後で新しいものを使うので、ここではスキップ
+          # 2. 各パーティションイメージから記述子パラメータを抽出（boot は後で新しいものを使う）
           partitions = ['dtbo', 'vendor_boot', 'odm', 'vendor']
           descriptors = {}
 
           for part in partitions:
               info = run_avbtool(['info_image', '--image', f'work/{part}.img'])
               if 'Hash descriptor:' in info:
-                  # ハッシュ記述子
                   m = re.search(
                       r'Hash descriptor:.*?Image Size:\s+(\d+)\s+bytes.*?Hash Algorithm:\s+(\S+).*?Salt:\s+(\S+).*?Digest:\s+(\S+).*?Flags:\s+(\d+)',
                       info, re.DOTALL
@@ -93,7 +98,6 @@ jobs:
                           'flags': m.group(5),
                       }
               elif 'Hashtree descriptor:' in info:
-                  # ハッシュツリー記述子
                   m = re.search(
                       r'Hashtree descriptor:.*?Image Size:\s+(\d+)\s+bytes.*?Tree Offset:\s+(\d+).*?Tree Size:\s+(\d+).*?Data Block Size:\s+(\d+).*?Hash Block Size:\s+(\d+).*?FEC num roots:\s+(\d+).*?FEC offset:\s+(\d+).*?FEC size:\s+(\d+).*?Hash Algorithm:\s+(\S+).*?Salt:\s+(\S+).*?Root Digest:\s+(\S+).*?Flags:\s+(\d+)',
                       info, re.DOTALL
@@ -115,7 +119,7 @@ jobs:
                           'flags': m.group(12),
                       }
 
-          # 3. 新しい boot.img にハッシュフッターを追加（プロパティなし）
+          # 3. 新しい boot.img にハッシュフッターを追加（プロパティなし、署名なし）
           subprocess.check_call([
               'python2', '/usr/local/bin/avbtool', 'erase_footer', '--image', 'work/boot.img'
           ], stderr=subprocess.DEVNULL)
@@ -123,7 +127,7 @@ jobs:
               'python2', '/usr/local/bin/avbtool', 'add_hash_footer',
               '--image', 'work/boot.img',
               '--partition_name', 'boot',
-              '--partition_size', '100663296',   # 元の boot パーティションサイズ（固定）
+              '--partition_size', '100663296',
               '--hash_algorithm', 'sha256',
               '--algorithm', 'NONE'
           ])
@@ -139,14 +143,12 @@ jobs:
               'digest': boot_m.group(3),
           }
 
-          # 4. チェーン公開鍵を元の vbmeta から抽出（vbmeta_system の公開鍵）
-          if chain:
-              subprocess.check_call([
-                  'python2', '/usr/local/bin/avbtool', 'extract_public_key',
-                  '--vbmeta_image', 'work/vbmeta.img',
-                  '--chain_partition', chain[0],
-                  '--output', 'work/chain.avbpubkey'
-              ])
+          # 4. チェーン公開鍵を testkey_rsa2048.pem から抽出（既知のテスト鍵）
+          subprocess.check_call([
+              'python2', '/usr/local/bin/avbtool', 'extract_public_key',
+              '--key', 'testkey_rsa2048.pem',
+              '--output', 'work/chain.avbpubkey'
+          ])
 
           # すべてのデータを JSON に保存
           with open('work/params.json', 'w') as f:
@@ -159,7 +161,7 @@ jobs:
               }, f)
           EOF
 
-      - name: Build new vbmeta with exact structure
+      - name: Build new vbmeta with exact structure (strict order)
         run: |
           python3 << 'EOF'
           import json, subprocess
@@ -176,14 +178,14 @@ jobs:
               '--flags', p['header']['flags']
           ]
 
-          # 1. チェーンパーティション（元の vbmeta と同じ順序）
+          # 1. チェーンパーティション（元の順序：最初）
           if p['chain']:
               cmd.extend([
                   '--chain_partition',
                   f"{p['chain'][0]}:{p['chain'][1]}:work/chain.avbpubkey"
               ])
 
-          # 2. プロパティ（元の vbmeta と同じ順序）
+          # 2. プロパティ（元の順序：チェーンの次）
           for key, value in p['props']:
               cmd.extend(['--prop', f'{key}:{value}'])
 
@@ -223,19 +225,38 @@ jobs:
           print("vbmeta_new.img generated with exact structure.")
           EOF
 
-      - name: Verify structure matches original
+      - name: Verify structure and boot hash
         run: |
-          echo "=== Original vbmeta ==="
+          echo "=============================================="
+          echo "=== Original vbmeta (full) ==="
+          echo "=============================================="
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img
+
           echo ""
+          echo "=============================================="
           echo "=== New vbmeta (should have same structure, only boot hash changed) ==="
+          echo "=============================================="
           python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img
+
           echo ""
+          echo "=============================================="
           echo "=== Boot hash comparison ==="
-          echo "Original boot digest:"
-          grep -A 6 "Hash descriptor:" work/vbmeta_info.txt | grep -A 1 "Partition Name:.*boot" | grep Digest
-          echo "New boot digest:"
-          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 6 "Hash descriptor:" | grep -A 1 "Partition Name:.*boot" | grep Digest
+          echo "=============================================="
+          echo "Original boot digest (from old vbmeta):"
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img | grep -A 6 "Hash descriptor:" | grep -A 1 "Partition Name:.*boot" | grep Digest | head -1
+
+          echo ""
+          echo "New boot digest (from new vbmeta):"
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 6 "Hash descriptor:" | grep -A 1 "Partition Name:.*boot" | grep Digest | head -1
+
+          echo ""
+          echo "=============================================="
+          echo "=== Chain partition check (must be cdbb77177...) ==="
+          echo "=============================================="
+          echo "Original chain pubkey (sha1):"
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta.img | grep -A 3 "Chain Partition descriptor:" | grep "Public key (sha1)"
+          echo "New chain pubkey (sha1):"
+          python2 /usr/local/bin/avbtool info_image --image work/vbmeta_new.img | grep -A 3 "Chain Partition descriptor:" | grep "Public key (sha1)"
 
       - name: Create output ZIP
         run: |
