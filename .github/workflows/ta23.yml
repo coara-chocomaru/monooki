@@ -287,6 +287,7 @@ jobs:
                   (0x044B5134, 4, '0x044B5134 (32bit)'),
                   (0x5134, 2, '0x5134 (16bit)'),
                   (0x044B, 2, '0x044B (16bit)'),
+                  (0x55AA, 2, '0x55AA (16bit)'),
                   (0x34, 1, '0x34 (8bit)'),
                   (0x51, 1, '0x51 (8bit)'),
                   (0x4B, 1, '0x4B (8bit)'),
@@ -509,25 +510,23 @@ jobs:
 
               # ---- 特定XBLキーによる強制デコード ----
               specific_decoded_entries = []
-              # エミュレーション結果のアドレス（例: 0x0c22dc4a）や、xorsから特定できるアドレスを抽出
               target_addrs = []
               if label == "xbl":
-                  # xbl の emulation_results からアドレスを拾う（実際のJSONに依存）
-                  # 簡易的に、strings から "OEM" 関連のアドレスや、データセクションの先頭を試す
+                  # エミュレーション結果からアドレス候補を抽出
+                  # さらに、strings に "OEM" を含むアドレスをターゲットにする
                   for s in strings:
                       if 'oem' in s.get('string', '').lower():
                           addr = s.get('addr')
                           if addr and isinstance(addr, int):
                               target_addrs.append(addr)
-                  # さらに、xors で見つかった関数の参照先アドレスを追加
+                  # XOR関数の参照先も追加
                   for x in xors:
                       addr = x.get('addr')
                       if addr:
-                          # 関数の前後のデータを読むため、-0x100 ~ +0x100 をスキャン
                           for off in range(-0x80, 0x80, 0x10):
                               target_addrs.append(addr + off)
 
-              for base_addr in target_addrs[:30]:  # 負荷軽減のため上限
+              for base_addr in target_addrs[:50]:  # 負荷軽減
                   try:
                       data = r2.cmd(f'px 256 @ {base_addr:#x}')
                       raw = bytes.fromhex(''.join(data.split()))
