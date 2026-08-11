@@ -296,7 +296,6 @@ jobs:
                   multi_keys.append(k.to_bytes(2, 'little'))
               # 4バイト（リトルエンディアン）
               common_4byte = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]
-              # 解析で特定された4バイトキー（エンディアン違いも含む）
               specific_4byte = [
                   0x044B5134, 0x5134044B, 0x34514B04,
                   0x4B043451, 0x44B5134,  0x5134
@@ -456,7 +455,8 @@ jobs:
                   if not addr:
                       continue
                   r2.cmd(f's {addr}')
-                  disasm = r2.cmd('pdf')
+                  # pdr を使用して再帰的逆アセンブル（エラー回避）
+                  disasm = r2.cmd('pdr')
                   if 'eor' in disasm.lower() and ('str' in disasm.lower() or 'stm' in disasm.lower()):
                       key = None
                       for line in disasm.splitlines():
@@ -485,7 +485,15 @@ jobs:
               os.makedirs(out_dir, exist_ok=True)
 
               r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-              r2.cmd('aaaa')
+              # エラーを回避するため aaa を使用（aaaa は失敗することがある）
+              try:
+                  r2.cmd('aaa')
+              except:
+                  print("[-] aaa failed, trying aa")
+                  try:
+                      r2.cmd('aa')
+                  except:
+                      pass
 
               strings = extract_all_strings(r2)
               funcs = get_functions(r2)
@@ -538,8 +546,9 @@ jobs:
                       continue
                   if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
                       r2.cmd(f's {addr}')
-                      pdf = r2.cmd('pdf')
-                      unlock_functions.append({'addr': addr, 'name': name, 'disasm': pdf})
+                      # pdr を使用
+                      disasm = r2.cmd('pdr')
+                      unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm})
                   else:
                       refs = r2.cmdj(f'axtj {addr}') if hasattr(r2, 'cmdj') else []
                       if refs:
@@ -547,8 +556,8 @@ jobs:
                               ref_str = ref.get('string', '')
                               if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
                                   r2.cmd(f's {addr}')
-                                  pdf = r2.cmd('pdf')
-                                  unlock_functions.append({'addr': addr, 'name': name, 'disasm': pdf, 'reason': f'References string: {ref_str}'})
+                                  disasm = r2.cmd('pdr')
+                                  unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
                                   break
 
               safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
