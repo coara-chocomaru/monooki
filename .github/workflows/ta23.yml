@@ -54,20 +54,31 @@ jobs:
       - name: Install Python libraries
         run: |
           pip3 install --upgrade pip
-          pip3 install r2pipe pefile capstone pyelftools binwalk
+          pip3 install r2pipe pefile capstone pyelftools binwalk pycryptodome
 
-      - name: Create Advanced Analysis Script (with Full XZ/LZMA Carving & XOR/Entropy/OEM-table analysis)
+      - name: Create Comprehensive Analysis Script
         run: |
           cat > /tmp/analyze_bootloader.py << 'EOF'
           #!/usr/bin/env python3
           # -*- coding: utf-8 -*-
-          import os, sys, json, re, subprocess, tempfile, struct, math, binascii
+          """
+          Extremely thorough bootloader analysis with:
+          - Recursive extraction (XZ, LZMA, binwalk)
+          - Full disassembly and analysis with radare2
+          - Massive XOR brute-force with many key families
+          - Emulation of XOR loops to capture runtime keys
+          - OEM command table detection
+          - Multi-stage decoding attempts
+          """
+          import os, sys, json, re, subprocess, tempfile, struct, math, binascii, time, hashlib
           import r2pipe
-          from collections import defaultdict
+          from collections import defaultdict, Counter
           import binwalk
           import lzma
           import traceback
+          from Crypto.Util.strxor import strxor  # for multi-byte
 
+          # ---------- Configuration ----------
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
               'download', 'continue', 'boot', 'update', 'unlock', 'lock',
@@ -88,7 +99,7 @@ jobs:
               r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # ---------- 再帰的XZ/LZMA抽出（エラー無視） ----------
+          # ---------- Recursive extraction ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -217,7 +228,17 @@ jobs:
                       unique_results.append(f)
               return unique_results
 
-          # ---------- 高度なエントロピー & XOR解析 ----------
+          # ---------- String extraction helpers ----------
+          def extract_all_strings_from_binary(data):
+              # Use regex to find printable ASCII strings >= 4 chars
+              pattern = re.compile(b'[ -~]{4,}')
+              strings = []
+              for m in pattern.finditer(data):
+                  s = m.group().decode('ascii', errors='ignore')
+                  strings.append(s)
+              return strings
+
+          # ---------- Entropy ----------
           def entropy(data):
               if not data:
                   return 0
@@ -228,100 +249,76 @@ jobs:
                       e += - p_x * math.log(p_x, 2)
               return e
 
-          def find_high_entropy_regions(r2, threshold=6.0):
-              regions = []
-              sections = r2.cmdj('iSj') or []
-              for sec in sections:
-                  if sec.get('size', 0) > 64:
-                      addr = sec.get('vaddr', 0)
-                      size = sec.get('size', 0)
-                      if addr and size:
-                          data = r2.cmd(f'px {size} @ {addr}')
-                          try:
-                              raw = bytes.fromhex(''.join(data.split()))
-                          except:
-                              continue
-                          e = entropy(raw)
-                          if e > threshold:
-                              regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
-              return regions
+          # ---------- XOR brute-force with many key families ----------
+          def generate_xor_keys():
+              keys = []
+              # Single-byte
+              keys.extend(range(0x100))
+              # Common single-byte
+              keys.extend([0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C, 0x00, 0x80, 0x7F])
+              # 2-byte common
+              common_2 = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA,
+                          0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA]
+              # Specific from previous analysis
+              spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343, 0x4F45, 0x454D]
+              for k in common_2 + spec_2:
+                  keys.append(k.to_bytes(2, 'little'))
+                  keys.append(k.to_bytes(2, 'big'))
+              # 4-byte common
+              common_4 = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202,
+                          0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0x0D15EA5E]
+              spec_4 = [0x044B5134, 0x5134044B, 0x34514B04, 0x4B043451, 0x44B5134, 0x5134,
+                        0x4F454D00, 0x004D454F, 0x4F454D20]
+              for k in common_4 + spec_4:
+                  keys.append(k.to_bytes(4, 'little'))
+                  keys.append(k.to_bytes(4, 'big'))
+              # Also try combinations of register values from emulation
+              reg_vals = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
+              for v in reg_vals:
+                  if v < 0x100:
+                      keys.append(v.to_bytes(1, 'little'))
+                  elif v < 0x10000:
+                      keys.append(v.to_bytes(2, 'little'))
+                      keys.append(v.to_bytes(2, 'big'))
+                  else:
+                      keys.append(v.to_bytes(4, 'little'))
+                      keys.append(v.to_bytes(4, 'big'))
+              # Remove duplicates
+              seen = set()
+              unique = []
+              for k in keys:
+                  if k not in seen:
+                      seen.add(k)
+                      unique.append(k)
+              return unique
 
-          # シングルバイトXOR復号
-          def decode_with_xor_keys(data, keys):
-              results = []
-              for key in keys:
-                  dec = bytes([b ^ key for b in data])
-                  try:
-                      dec_str = dec.decode('ascii', errors='ignore')
-                  except:
-                      continue
-                  if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
-                      results.append({'key': key, 'decoded': dec_str})
-              return results
-
-          # マルチバイトXOR復号 (2/4バイト)
-          def decode_with_multi_byte_xor(data, key_bytes):
-              if len(key_bytes) not in (2, 4):
-                  return []
+          def try_xor_decode(data, key_bytes):
               key_len = len(key_bytes)
-              key_int = int.from_bytes(key_bytes, 'little')
-              results = []
-              chunk_size = key_len
-              decoded_bytes = bytearray()
-              for i in range(0, len(data) - chunk_size + 1, chunk_size):
-                  chunk = int.from_bytes(data[i:i+chunk_size], 'little')
-                  decoded = chunk ^ key_int
-                  decoded_bytes += decoded.to_bytes(chunk_size, 'little')
-              try:
-                  dec_str = decoded_bytes.decode('ascii', errors='ignore')
-              except:
-                  return []
-              if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
-                  results.append({'key': key_int, 'key_hex': key_bytes.hex(), 'decoded': dec_str})
-              return results
+              if key_len == 1:
+                  key = key_bytes[0]
+                  dec = bytes([b ^ key for b in data])
+                  return dec
+              elif key_len == 2:
+                  key_int = int.from_bytes(key_bytes, 'little')
+                  dec = bytearray()
+                  for i in range(0, len(data) - 1, 2):
+                      chunk = int.from_bytes(data[i:i+2], 'little')
+                      dec += (chunk ^ key_int).to_bytes(2, 'little')
+                  return bytes(dec)
+              elif key_len == 4:
+                  key_int = int.from_bytes(key_bytes, 'little')
+                  dec = bytearray()
+                  for i in range(0, len(data) - 3, 4):
+                      chunk = int.from_bytes(data[i:i+4], 'little')
+                      dec += (chunk ^ key_int).to_bytes(4, 'little')
+                  return bytes(dec)
+              return None
 
-          # ---------- 全セクションXOR探索 (総当たり + 特定キー) ----------
           def search_all_xor_keys_on_all_regions(r2):
               decoded_entries = []
               sections = r2.cmdj('iSj') or []
-
-              # シングルバイトキー（全0x00〜0xFF + よく使われるもの）
-              keys_single = list(range(0x100)) + [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C]
-
-              # マルチバイトキー（一般的なもの＋解析で特定されたキー）
-              multi_keys = []
-              # 2バイト（リトルエンディアン）
-              common_2byte = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]
-              specific_2byte = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343]
-              # さらに、よく使われるASCII由来のキー
-              ascii_keys_2 = [0x4F45, 0x454D, 0x4D00, 0x004D]  # 'OE', 'EM', etc.
-              for k in common_2byte + specific_2byte + ascii_keys_2:
-                  multi_keys.append(k.to_bytes(2, 'little'))
-                  multi_keys.append(k.to_bytes(2, 'big'))  # ビッグエンディアンも試す
-              # 4バイト（リトルエンディアン）
-              common_4byte = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]
-              specific_4byte = [
-                  0x044B5134, 0x5134044B, 0x34514B04,
-                  0x4B043451, 0x44B5134,  0x5134
-              ]
-              # ASCII由来の4バイトキー
-              ascii_keys_4 = [0x4F454D00, 0x004D454F, 0x4F454D20]  # 'OEM', ' MEO', etc.
-              for k in common_4byte + specific_4byte + ascii_keys_4:
-                  multi_keys.append(k.to_bytes(4, 'little'))
-                  multi_keys.append(k.to_bytes(4, 'big'))
-
-              # さらにエミュレーション結果のレジスタ値もキーとして追加
-              reg_keys = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
-              for k in reg_keys:
-                  if k < 0x100:
-                      keys_single.append(k)
-                  elif k < 0x10000:
-                      multi_keys.append(k.to_bytes(2, 'little'))
-                      multi_keys.append(k.to_bytes(2, 'big'))
-                  else:
-                      multi_keys.append(k.to_bytes(4, 'little'))
-                      multi_keys.append(k.to_bytes(4, 'big'))
-
+              keys = generate_xor_keys()
+              print(f"[*] Number of XOR keys to test: {len(keys)}")
               for sec in sections:
                   addr = sec.get('vaddr', 0)
                   size = sec.get('size', 0)
@@ -332,142 +329,78 @@ jobs:
                       raw = bytes.fromhex(''.join(data.split()))
                   except:
                       continue
-                  # シングル
-                  matches = decode_with_xor_keys(raw, keys_single)
-                  for m in matches:
-                      decoded_entries.append({
-                          'addr': addr,
-                          'size': size,
-                          'type': 'single-byte',
-                          'key': m['key'],
-                          'decoded_string': m['decoded'][:200],
-                          'section': sec.get('name', '')
-                      })
-                  # マルチ
-                  for kb in multi_keys:
-                      matches_multi = decode_with_multi_byte_xor(raw, kb)
-                      for m in matches_multi:
+                  for key_bytes in keys:
+                      dec = try_xor_decode(raw, key_bytes)
+                      if dec is None:
+                          continue
+                      try:
+                          dec_str = dec.decode('ascii', errors='ignore')
+                      except:
+                          continue
+                      # Check for interesting keywords
+                      if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
+                          key_hex = key_bytes.hex()
                           decoded_entries.append({
                               'addr': addr,
                               'size': size,
-                              'type': f'{len(kb)}-byte',
-                              'key': m['key'],
-                              'key_hex': m['key_hex'],
-                              'decoded_string': m['decoded'][:200],
+                              'key': key_hex,
+                              'decoded_string': dec_str[:200],
                               'section': sec.get('name', '')
                           })
               return decoded_entries
 
-          # OEMコマンドテーブル候補（強化）
-          def find_oem_command_table(r2):
-              strings = r2.cmdj('izzj') or []
-              string_addrs = {}
-              for s in strings:
-                  if 'string' in s:
-                      addr = s.get('addr')
-                      if addr is not None:
-                          if isinstance(addr, str):
-                              addr = int(addr, 0) if addr.startswith('0x') else int(addr)
-                          string_addrs[addr] = s['string']
-              tables = []
-              for addr, s in string_addrs.items():
-                  refs = r2.cmdj(f'axtj {addr:#x}') or []
-                  if not refs:
-                      continue
-                  start = addr - 0x100
-                  end = addr + 0x100
-                  data = r2.cmd(f'px {end-start} @ {start}')
-                  try:
-                      raw = bytes.fromhex(''.join(data.split()))
-                  except:
-                      continue
-                  ptr_size = 8 if r2.cmd('iB') == '64' else 4
-                  for i in range(0, len(raw)-ptr_size, ptr_size):
-                      ptr = struct.unpack('<Q' if ptr_size==8 else '<I', raw[i:i+ptr_size])[0]
-                      if r2.cmd(f'iS @ {ptr:#x}') and 'CODE' in r2.cmd(f'iS. @ {ptr:#x}'):
-                          if abs((start+i) - addr) < 0x80:
-                              tables.append({
-                                  'string': s,
-                                  'string_addr': addr,
-                                  'ptr_addr': start+i,
-                                  'ptr_value': ptr,
-                                  'section': r2.cmd(f'iS. @ {ptr:#x}').strip()
-                              })
-              return tables
-
-          # エミュレーション（エラーを完全に無視）
-          def emulate_xor_loop(r2, func_addr):
+          # ---------- Radare2 analysis with error recovery ----------
+          def safe_r2_cmd(r2, cmd, default=''):
               try:
-                  r2.cmd(f's {func_addr}')
-                  r2.cmd('aae')
-                  r2.cmd('aec')
-                  regs = r2.cmd('dr')
-                  return {'function': func_addr, 'registers': regs, 'note': 'Emulation attempted, check disassembly for XOR pattern.'}
+                  return r2.cmd(cmd)
               except Exception as e:
-                  # ESILエラーなどは無視
-                  return None
+                  print(f"[-] r2 command '{cmd}' failed: {e}")
+                  return default
 
-          def find_unlock_variables(r2):
-              symbols = r2.cmdj('isj') or []
-              unlock_vars = []
-              for sym in symbols:
-                  name = sym.get('name', '')
-                  if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot', 'go', 'flag', 'set']):
-                      unlock_vars.append({'name': name, 'addr': sym.get('vaddr'), 'type': sym.get('type')})
-              strings = r2.cmdj('izzj') or []
-              for s in strings:
-                  s_str = s.get('string', '')
-                  if any(kw in s_str.lower() for kw in ['unlock', 'lock', 'unlock-go', 'oem', 'flag']):
-                      addr = s.get('addr')
-                      if addr is not None:
-                          refs = r2.cmdj(f'axtj {addr}') or []
-                          for ref in refs:
-                              if ref.get('type') == 'data':
-                                  unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
-              return unlock_vars
-
-          def extract_all_strings(r2):
-              strings = []
+          def safe_r2_cmdj(r2, cmd):
               try:
-                  data = r2.cmdj('izzj')
-                  if data:
-                      for entry in data:
-                          if 'string' in entry:
-                              strings.append(entry)
-              except:
-                  raw = r2.cmd('izz')
-                  for line in raw.splitlines():
-                      if line.strip() and '=' in line:
-                          parts = line.split('=', 1)
-                          if len(parts)==2:
-                              strings.append({'addr': parts[0].strip(), 'string': parts[1].strip()})
-              return strings
+                  return r2.cmdj(cmd)
+              except Exception as e:
+                  print(f"[-] r2 commandj '{cmd}' failed: {e}")
+                  return []
 
-          def get_functions(r2):
-              funcs = []
+          # ---------- Main analysis ----------
+          def analyze_file(img_path, label):
+              print(f"[+] Analyzing {label} : {img_path}")
+              out_dir = "/tmp/artifacts"
+              os.makedirs(out_dir, exist_ok=True)
+
+              # Open with radare2, try multiple analysis levels
+              r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
+              # Try analysis in increasing depth
+              for cmd in ['aaa', 'aa', 'a']:
+                  try:
+                      print(f"[*] Trying analysis: {cmd}")
+                      r2.cmd(cmd)
+                      break
+                  except Exception as e:
+                      print(f"[-] {cmd} failed: {e}")
+              # Additional analysis
               try:
-                  data = r2.cmdj('aflj')
-                  if data:
-                      for f in data:
-                          funcs.append(f)
-              except:
-                  raw = r2.cmd('afl')
-                  for line in raw.splitlines():
-                      if line.strip().startswith('0x'):
-                          parts = line.split()
-                          if len(parts)>=3:
-                              funcs.append({'addr': parts[0], 'name': parts[1], 'size': parts[2]})
-              return funcs
+                  r2.cmd('aac')
+              except: pass
+              try:
+                  r2.cmd('aav')
+              except: pass
 
-          def find_xor_loops_enhanced(r2):
+              # Get basic info
+              info = safe_r2_cmd(r2, 'iI')
+              strings = safe_r2_cmdj(r2, 'izzj') or []
+              funcs = safe_r2_cmdj(r2, 'aflj') or []
+
+              # Find XOR loops
               xors = []
-              for f in get_functions(r2):
+              for f in funcs:
                   addr = f.get('addr')
                   if not addr:
                       continue
-                  r2.cmd(f's {addr}')
-                  # pdr を使用して再帰的逆アセンブル（エラー回避）
-                  disasm = r2.cmd('pdr')
+                  safe_r2_cmd(r2, f's {addr}')
+                  disasm = safe_r2_cmd(r2, 'pdr')
                   if 'eor' in disasm.lower() and ('str' in disasm.lower() or 'stm' in disasm.lower()):
                       key = None
                       for line in disasm.splitlines():
@@ -487,46 +420,96 @@ jobs:
                           'key': key,
                           'disasm': disasm[:800]
                       })
-              return xors
 
-          # ---------- メイン解析 ----------
-          def analyze_file(img_path, label):
-              print(f"[+] Analyzing {label} : {img_path}")
-              out_dir = "/tmp/artifacts"
-              os.makedirs(out_dir, exist_ok=True)
+              # High entropy regions
+              high_entropy_regions = []
+              sections = safe_r2_cmdj(r2, 'iSj') or []
+              for sec in sections:
+                  if sec.get('size', 0) > 64:
+                      addr = sec.get('vaddr', 0)
+                      size = sec.get('size', 0)
+                      if addr and size:
+                          data = safe_r2_cmd(r2, f'px {size} @ {addr}')
+                          try:
+                              raw = bytes.fromhex(''.join(data.split()))
+                          except:
+                              continue
+                          e = entropy(raw)
+                          if e > 6.0:
+                              high_entropy_regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
 
-              # Radare2を開き、分析を試行（エラーは無視）
-              r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
-              # 分析レベルを段階的に試す
-              for cmd in ['aaa', 'aa', 'a']:
+              # XOR brute-force
+              decoded_xor = search_all_xor_keys_on_all_regions(r2)
+
+              # OEM command table detection
+              oem_tables = []
+              string_addrs = {}
+              for s in strings:
+                  if 'string' in s:
+                      addr = s.get('addr')
+                      if addr is not None:
+                          if isinstance(addr, str):
+                              addr = int(addr, 0) if addr.startswith('0x') else int(addr)
+                          string_addrs[addr] = s['string']
+              for addr, s in string_addrs.items():
+                  refs = safe_r2_cmdj(r2, f'axtj {addr:#x}') or []
+                  if not refs:
+                      continue
+                  start = addr - 0x100
+                  end = addr + 0x100
+                  data = safe_r2_cmd(r2, f'px {end-start} @ {start}')
                   try:
-                      print(f"[*] Trying analysis command: {cmd}")
-                      r2.cmd(cmd)
-                      break
-                  except Exception as e:
-                      print(f"[-] {cmd} failed: {e}, trying next")
+                      raw = bytes.fromhex(''.join(data.split()))
+                  except:
+                      continue
+                  ptr_size = 8 if '64' in safe_r2_cmd(r2, 'iB') else 4
+                  for i in range(0, len(raw)-ptr_size, ptr_size):
+                      ptr = struct.unpack('<Q' if ptr_size==8 else '<I', raw[i:i+ptr_size])[0]
+                      if safe_r2_cmd(r2, f'iS @ {ptr:#x}') and 'CODE' in safe_r2_cmd(r2, f'iS. @ {ptr:#x}'):
+                          if abs((start+i) - addr) < 0x80:
+                              oem_tables.append({
+                                  'string': s,
+                                  'string_addr': addr,
+                                  'ptr_addr': start+i,
+                                  'ptr_value': ptr,
+                                  'section': safe_r2_cmd(r2, f'iS. @ {ptr:#x}').strip()
+                              })
 
-              # 基本情報取得
-              strings = extract_all_strings(r2)
-              funcs = get_functions(r2)
-              xors = find_xor_loops_enhanced(r2)
-              high_entropy_regions = find_high_entropy_regions(r2)
-              decoded_from_xor_all = search_all_xor_keys_on_all_regions(r2)
-
-              oem_tables = find_oem_command_table(r2)
-              unlock_vars = find_unlock_variables(r2)
+              # Emulation for XOR functions
               emu_results = []
               for x in xors[:10]:
-                  res = emulate_xor_loop(r2, x['addr'])
-                  if res:
-                      emu_results.append(res)
+                  try:
+                      safe_r2_cmd(r2, f's {x["addr"]}')
+                      safe_r2_cmd(r2, 'aae')
+                      safe_r2_cmd(r2, 'aec')
+                      regs = safe_r2_cmd(r2, 'dr')
+                      emu_results.append({'function': x['addr'], 'registers': regs, 'note': 'Emulation attempted, check disassembly.'})
+                  except:
+                      pass
 
+              # Unlock-related variables
+              unlock_vars = []
+              symbols = safe_r2_cmdj(r2, 'isj') or []
+              for sym in symbols:
+                  name = sym.get('name', '')
+                  if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot', 'go', 'flag', 'set']):
+                      unlock_vars.append({'name': name, 'addr': sym.get('vaddr'), 'type': sym.get('type')})
+              for s in strings:
+                  s_str = s.get('string', '')
+                  if any(kw in s_str.lower() for kw in ['unlock', 'lock', 'unlock-go', 'oem', 'flag']):
+                      addr = s.get('addr')
+                      if addr is not None:
+                          refs = safe_r2_cmdj(r2, f'axtj {addr}') or []
+                          for ref in refs:
+                              if ref.get('type') == 'data':
+                                  unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
+
+              # Categorize strings
               fastboot_matches = []
               unlock_matches = []
               vendor_matches = []
               oem_cmd_matches = []
               partition_candidates = set()
-
               for entry in strings:
                   s = entry.get('string', '')
                   addr = entry.get('addr', '')
@@ -550,6 +533,7 @@ jobs:
                   if 'partition' in lower_s or any(p in lower_s for p in ['aboot','misc','persist','frp','userdata','boot','xbl','abl']):
                       partition_candidates.add(s)
 
+              # Unlock functions
               unlock_functions = []
               for f in funcs:
                   addr = f.get('addr')
@@ -557,26 +541,24 @@ jobs:
                   if not addr:
                       continue
                   if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
-                      r2.cmd(f's {addr}')
-                      disasm = r2.cmd('pdr')
+                      safe_r2_cmd(r2, f's {addr}')
+                      disasm = safe_r2_cmd(r2, 'pdr')
                       unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm})
                   else:
-                      refs = r2.cmdj(f'axtj {addr}') if hasattr(r2, 'cmdj') else []
-                      if refs:
-                          for ref in refs:
-                              ref_str = ref.get('string', '')
-                              if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
-                                  r2.cmd(f's {addr}')
-                                  disasm = r2.cmd('pdr')
-                                  unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
-                                  break
+                      refs = safe_r2_cmdj(r2, f'axtj {addr}') or []
+                      for ref in refs:
+                          ref_str = ref.get('string', '')
+                          if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
+                              safe_r2_cmd(r2, f's {addr}')
+                              disasm = safe_r2_cmd(r2, 'pdr')
+                              unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
+                              break
 
               safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
               report_path = f"{out_dir}/{safe_label}_detailed_report.md"
               with open(report_path, 'w') as f:
                   f.write(f"# Bootloader Analysis Report for {label}\n\n")
                   f.write("## File Info\n")
-                  info = r2.cmd('iI')
                   f.write(f"```\n{info}\n```\n\n")
 
                   f.write("## Fastboot Commands/Keywords\n")
@@ -644,15 +626,11 @@ jobs:
                       f.write("No high-entropy data regions found.\n")
 
                   f.write("\n## XOR Decoded Strings (Brute-force + Specific Keys from All Sections)\n")
-                  if decoded_from_xor_all:
-                      f.write("| Address | Section | Type | Key | Decoded Preview |\n")
-                      f.write("|---------|---------|------|-----|-----------------|\n")
-                      for d in decoded_from_xor_all[:200]:
-                          if d.get('type') == 'single-byte':
-                              key_str = f"0x{d['key']:02X}"
-                          else:
-                              key_str = f"0x{d['key']:X} (hex: {d.get('key_hex','')})"
-                          f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
+                  if decoded_xor:
+                      f.write("| Address | Section | Key | Decoded Preview |\n")
+                      f.write("|---------|---------|-----|-----------------|\n")
+                      for d in decoded_xor[:200]:
+                          f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['key']} | {d['decoded_string'][:80]} |\n")
                   else:
                       f.write("No decodable strings found via XOR.\n")
 
@@ -705,7 +683,7 @@ jobs:
                       'partition_candidates': list(partition_candidates),
                       'xor_functions': xors,
                       'high_entropy_regions': high_entropy_regions,
-                      'xor_decoded_strings': decoded_from_xor_all,
+                      'xor_decoded_strings': decoded_xor,
                       'oem_command_tables': oem_tables,
                       'unlock_variables': unlock_vars,
                       'emulation_results': emu_results
@@ -714,6 +692,7 @@ jobs:
               r2.quit()
               print(f"[+] Report for {label} generated.")
 
+          # ---------- Main ----------
           def main():
               if len(sys.argv) < 3:
                   print("Usage: python3 analyze_bootloader.py <xbl.img> <abl.img>")
@@ -740,7 +719,6 @@ jobs:
                   analyze_file(f, lbl)
 
               print("[+] All analysis complete. Reports are in /tmp/artifacts/")
-              print("[+] Extracted files remain in temporary directories for debugging")
 
           if __name__ == "__main__":
               main()
