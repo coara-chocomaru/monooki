@@ -54,18 +54,18 @@ jobs:
       - name: Install Python libraries
         run: |
           pip3 install --upgrade pip
-          pip3 install r2pipe pefile capstone pyelftools binwalk
+          pip3 install r2pipe pefile capstone pyelftools binwalk pylzma
 
-      - name: Create Advanced Analysis Script (with Deep XZ/LZMA Carving & XOR/Entropy/OEM-table analysis)
+      - name: Create Advanced Analysis Script (with Full XZ/LZMA Carving & XOR/Entropy/OEM-table analysis)
         run: |
           cat > /tmp/analyze_bootloader.py << 'EOF'
           #!/usr/bin/env python3
-          import os, sys, json, re, subprocess, hashlib, tempfile, shutil, glob
+          # -*- coding: utf-8 -*-
+          import os, sys, json, re, subprocess, tempfile, struct, math, binascii
           import r2pipe
           from collections import defaultdict
           import binwalk
-          import struct
-          import math
+          import lzma  # 追加
 
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
@@ -87,7 +87,7 @@ jobs:
               r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # ---------- RECURSIVE XZ/LZMA CARVING & EXTRACTION ----------
+          # ---------- 強化されたXZ/LZMA抽出 ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -117,6 +117,7 @@ jobs:
                       fout.write(data)
                   decompressed = carved_raw + '.decomp'
                   try:
+                      # まず xz コマンドで試す
                       subprocess.check_call(
                           ['xz', '-d', '-k', '-c', carved_raw],
                           stdout=open(decompressed, 'wb'),
@@ -128,7 +129,18 @@ jobs:
                       else:
                           os.unlink(decompressed) if os.path.exists(decompressed) else None
                   except Exception as e:
-                      print(f"[-] Failed to decompress carved stream at 0x{off:x}: {e}")
+                      # コマンドが失敗したら lzma モジュールで再試行
+                      try:
+                          with open(carved_raw, 'rb') as f:
+                              compressed = f.read()
+                          decomp_data = lzma.decompress(compressed)
+                          with open(decompressed, 'wb') as f:
+                              f.write(decomp_data)
+                          if os.path.getsize(decompressed) > 0:
+                              carved_files.append(decompressed)
+                              print(f"[+] lzma module decompressed carved stream at offset 0x{off:x}")
+                      except Exception as e2:
+                          print(f"[-] Failed to decompress carved stream at 0x{off:x} (xz: {e}, lzma: {e2})")
                   finally:
                       if os.path.exists(carved_raw):
                           os.unlink(carved_raw)
@@ -140,7 +152,15 @@ jobs:
 
           def decompress_xz(filepath):
               outpath = filepath + '.decompressed'
-              subprocess.check_call(['xz', '-d', '-k', '-c', filepath], stdout=open(outpath, 'wb'))
+              try:
+                  subprocess.check_call(['xz', '-d', '-k', '-c', filepath], stdout=open(outpath, 'wb'))
+              except:
+                  # モジュールで再試行
+                  with open(filepath, 'rb') as f:
+                      compressed = f.read()
+                  decomp_data = lzma.decompress(compressed)
+                  with open(outpath, 'wb') as f:
+                      f.write(decomp_data)
               return outpath
 
           def extract_with_binwalk(filepath, outdir):
@@ -159,7 +179,7 @@ jobs:
                           extracted_files.append(full)
               return extracted_files
 
-          # Recursively extract all possible XZ streams and binwalk archives
+          # 再帰的に全てのXZストリームとbinwalkアーカイブを抽出
           def prepare_files(filepath):
               results = []
               temp_dir = tempfile.mkdtemp(prefix='bootloader_')
@@ -170,36 +190,29 @@ jobs:
                   if current in processed:
                       continue
                   processed.add(current)
-                  # If current is XZ compressed, decompress it and add to processing
                   if is_xz_compressed(current):
                       decomp = decompress_xz(current)
                       to_process.append(decomp)
-                      # also run binwalk on decomp
                       sub_files = extract_with_binwalk(decomp, temp_dir)
                       for sf in sub_files:
                           if sf not in processed:
                               to_process.append(sf)
-                      # carve XZ from decomp directly
                       carved = carve_xz_streams(decomp, temp_dir)
                       for cf in carved:
                           if cf not in processed:
                               to_process.append(cf)
-                      # add decomp to results after processing its subfiles
                       results.append(decomp)
                   else:
-                      # run binwalk on current
                       sub_files = extract_with_binwalk(current, temp_dir)
                       for sf in sub_files:
                           if sf not in processed:
                               to_process.append(sf)
-                      # carve XZ from current directly
                       carved = carve_xz_streams(current, temp_dir)
                       for cf in carved:
                           if cf not in processed:
                               to_process.append(cf)
-                      # add current to results (original file or extracted payload)
                       results.append(current)
-              # Remove duplicates while preserving order
+              # 重複除去
               seen = set()
               unique_results = []
               for f in results:
@@ -208,7 +221,7 @@ jobs:
                       unique_results.append(f)
               return unique_results
 
-          # ---------- ADVANCED ANALYSES ----------
+          # ---------- 高度なエントロピー & XOR解析 ----------
           def entropy(data):
               if not data:
                   return 0
@@ -219,11 +232,11 @@ jobs:
                       e += - p_x * math.log(p_x, 2)
               return e
 
-          def find_high_entropy_regions(r2, threshold=6.5):
+          def find_high_entropy_regions(r2, threshold=6.0):
               regions = []
               sections = r2.cmdj('iSj') or []
               for sec in sections:
-                  if sec.get('type') == 'data' and sec.get('size', 0) > 64:
+                  if sec.get('size', 0) > 64:
                       addr = sec.get('vaddr', 0)
                       size = sec.get('size', 0)
                       if addr and size:
@@ -237,7 +250,7 @@ jobs:
                               regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
               return regions
 
-          # Single-byte XOR decode
+          # シングルバイトXOR復号
           def decode_with_xor_keys(data, keys):
               results = []
               for key in keys:
@@ -250,21 +263,19 @@ jobs:
                       results.append({'key': key, 'decoded': dec_str})
               return results
 
-          # Multi-byte XOR decode (2 or 4 bytes)
+          # マルチバイトXOR復号 (2/4バイト)
           def decode_with_multi_byte_xor(data, key_bytes):
               if len(key_bytes) not in (2, 4):
                   return []
               key_len = len(key_bytes)
               key_int = int.from_bytes(key_bytes, 'little')
               results = []
-              # for 2-byte: process each 2-byte chunk
               chunk_size = key_len
               decoded_bytes = bytearray()
               for i in range(0, len(data) - chunk_size + 1, chunk_size):
                   chunk = int.from_bytes(data[i:i+chunk_size], 'little')
                   decoded = chunk ^ key_int
                   decoded_bytes += decoded.to_bytes(chunk_size, 'little')
-              # handle remaining bytes (if any) by padding? just ignore for simplicity
               try:
                   dec_str = decoded_bytes.decode('ascii', errors='ignore')
               except:
@@ -273,51 +284,54 @@ jobs:
                   results.append({'key': key_int, 'key_hex': key_bytes.hex(), 'decoded': dec_str})
               return results
 
-          def search_all_xor_keys_on_regions(r2, regions):
+          # 全領域（全セクション）に対してXOR探索
+          def search_all_xor_keys_on_all_regions(r2):
               decoded_entries = []
-              # single-byte keys
+              sections = r2.cmdj('iSj') or []
               keys_single = list(range(0x100)) + [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C]
-              # multi-byte keys (2-byte and 4-byte)
               multi_keys = []
               for k in [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]:
                   multi_keys.append(k.to_bytes(2, 'little'))
               for k in [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]:
                   multi_keys.append(k.to_bytes(4, 'little'))
 
-              for region in regions:
-                  addr = region['addr']
-                  size = region['size']
+              for sec in sections:
+                  addr = sec.get('vaddr', 0)
+                  size = sec.get('size', 0)
+                  if not addr or size < 64:
+                      continue
                   data = r2.cmd(f'px {size} @ {addr}')
                   try:
                       raw = bytes.fromhex(''.join(data.split()))
                   except:
                       continue
-                  # single-byte
+                  # シングル
                   matches = decode_with_xor_keys(raw, keys_single)
                   for m in matches:
                       decoded_entries.append({
                           'addr': addr,
                           'size': size,
-                          'entropy': region['entropy'],
                           'type': 'single-byte',
                           'key': m['key'],
-                          'decoded_string': m['decoded'][:200]
+                          'decoded_string': m['decoded'][:200],
+                          'section': sec.get('name', '')
                       })
-                  # multi-byte
+                  # マルチ
                   for kb in multi_keys:
                       matches_multi = decode_with_multi_byte_xor(raw, kb)
                       for m in matches_multi:
                           decoded_entries.append({
                               'addr': addr,
                               'size': size,
-                              'entropy': region['entropy'],
                               'type': f'{len(kb)}-byte',
                               'key': m['key'],
                               'key_hex': m['key_hex'],
-                              'decoded_string': m['decoded'][:200]
+                              'decoded_string': m['decoded'][:200],
+                              'section': sec.get('name', '')
                           })
               return decoded_entries
 
+          # OEMコマンドテーブル候補（強化）
           def find_oem_command_table(r2):
               strings = r2.cmdj('izzj') or []
               string_addrs = {}
@@ -333,8 +347,8 @@ jobs:
                   refs = r2.cmdj(f'axtj {addr:#x}') or []
                   if not refs:
                       continue
-                  start = addr - 0x80
-                  end = addr + 0x80
+                  start = addr - 0x100
+                  end = addr + 0x100
                   data = r2.cmd(f'px {end-start} @ {start}')
                   try:
                       raw = bytes.fromhex(''.join(data.split()))
@@ -344,7 +358,7 @@ jobs:
                   for i in range(0, len(raw)-ptr_size, ptr_size):
                       ptr = struct.unpack('<Q' if ptr_size==8 else '<I', raw[i:i+ptr_size])[0]
                       if r2.cmd(f'iS @ {ptr:#x}') and 'CODE' in r2.cmd(f'iS. @ {ptr:#x}'):
-                          if abs((start+i) - addr) < 0x40:
+                          if abs((start+i) - addr) < 0x80:
                               tables.append({
                                   'string': s,
                                   'string_addr': addr,
@@ -354,14 +368,19 @@ jobs:
                               })
               return tables
 
+          # XORループのエミュレーション（強化）
           def emulate_xor_loop(r2, func_addr):
               try:
                   r2.cmd(f's {func_addr}')
                   r2.cmd('aae')
-                  return {'function': func_addr, 'note': 'Emulation attempted, check disassembly for XOR pattern.'}
+                  # 実行してレジスタをダンプ
+                  r2.cmd('aec')  # ステップ実行（簡易）
+                  regs = r2.cmd('dr')
+                  return {'function': func_addr, 'registers': regs, 'note': 'Emulation attempted, check disassembly for XOR pattern.'}
               except:
                   return None
 
+          # アンロック関連変数
           def find_unlock_variables(r2):
               symbols = r2.cmdj('isj') or []
               unlock_vars = []
@@ -381,7 +400,7 @@ jobs:
                                   unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
               return unlock_vars
 
-          # ---------- EXISTING ANALYSIS FUNCTIONS ----------
+          # 文字列抽出
           def extract_all_strings(r2):
               strings = []
               try:
@@ -415,6 +434,7 @@ jobs:
                               funcs.append({'addr': parts[0], 'name': parts[1], 'size': parts[2]})
               return funcs
 
+          # XORループ検出（強化）
           def find_xor_loops_enhanced(r2):
               xors = []
               for f in get_functions(r2):
@@ -440,11 +460,11 @@ jobs:
                           'function': f.get('name', addr),
                           'addr': addr,
                           'key': key,
-                          'disasm': disasm[:500]
+                          'disasm': disasm[:800]
                       })
               return xors
 
-          # ---------- MAIN ANALYSIS ----------
+          # ---------- メイン解析 ----------
           def analyze_file(img_path, label):
               print(f"[+] Analyzing {label} : {img_path}")
               out_dir = "/tmp/artifacts"
@@ -457,11 +477,12 @@ jobs:
               funcs = get_functions(r2)
               xors = find_xor_loops_enhanced(r2)
               high_entropy_regions = find_high_entropy_regions(r2)
-              decoded_from_xor = search_all_xor_keys_on_regions(r2, high_entropy_regions)
+              # 全領域XOR探索
+              decoded_from_xor_all = search_all_xor_keys_on_all_regions(r2)
               oem_tables = find_oem_command_table(r2)
               unlock_vars = find_unlock_variables(r2)
               emu_results = []
-              for x in xors[:5]:
+              for x in xors[:10]:
                   res = emulate_xor_loop(r2, x['addr'])
                   if res:
                       emu_results.append(res)
@@ -588,16 +609,16 @@ jobs:
                   else:
                       f.write("No high-entropy data regions found.\n")
 
-                  f.write("\n## XOR Decoded Strings from High-Entropy Regions\n")
-                  if decoded_from_xor:
-                      f.write("| Address | Type | Key | Decoded Preview |\n")
-                      f.write("|---------|------|-----|-----------------|\n")
-                      for d in decoded_from_xor[:50]:
+                  f.write("\n## XOR Decoded Strings from All Sections\n")
+                  if decoded_from_xor_all:
+                      f.write("| Address | Section | Type | Key | Decoded Preview |\n")
+                      f.write("|---------|---------|------|-----|-----------------|\n")
+                      for d in decoded_from_xor_all[:100]:
                           if d.get('type') == 'single-byte':
                               key_str = f"0x{d['key']:02X}"
                           else:
                               key_str = f"0x{d['key']:X} (hex: {d.get('key_hex','')})"
-                          f.write(f"| {d['addr']:#x} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
+                          f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['type']} | {key_str} | {d['decoded_string'][:80]} |\n")
                   else:
                       f.write("No decodable strings found via XOR.\n")
 
@@ -650,7 +671,7 @@ jobs:
                       'partition_candidates': list(partition_candidates),
                       'xor_functions': xors,
                       'high_entropy_regions': high_entropy_regions,
-                      'xor_decoded_strings': decoded_from_xor,
+                      'xor_decoded_strings': decoded_from_xor_all,
                       'oem_command_tables': oem_tables,
                       'unlock_variables': unlock_vars,
                       'emulation_results': emu_results
