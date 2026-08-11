@@ -289,18 +289,22 @@ jobs:
 
               # マルチバイトキー（一般的なもの＋解析で特定されたキー）
               multi_keys = []
-              # 2バイト
+              # 2バイト（リトルエンディアン）
               common_2byte = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA]
-              specific_2byte = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451]  # エンディアン違いも
+              specific_2byte = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343]
               for k in common_2byte + specific_2byte:
                   multi_keys.append(k.to_bytes(2, 'little'))
-              # 4バイト
+              # 4バイト（リトルエンディアン）
               common_4byte = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202]
-              specific_4byte = [0x044B5134, 0x5134044B, 0x34  # その他エンディアン違い
+              # 解析で特定された4バイトキー（エンディアン違いも含む）
+              specific_4byte = [
+                  0x044B5134, 0x5134044B, 0x34514B04,
+                  0x4B043451, 0x44B5134,  0x5134
+              ]
               for k in common_4byte + specific_4byte:
                   multi_keys.append(k.to_bytes(4, 'little'))
 
-              # さらにエミュレーション結果のレジスタ値もキーとして追加（例：x0=0x0c22dc4a, x1=0x52, x2=0x01000041）
+              # さらにエミュレーション結果のレジスタ値もキーとして追加
               reg_keys = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
               for k in reg_keys:
                   if k < 0x100:
@@ -487,7 +491,7 @@ jobs:
               funcs = get_functions(r2)
               xors = find_xor_loops_enhanced(r2)
               high_entropy_regions = find_high_entropy_regions(r2)
-              decoded_from_xor_all = search_all_xor_keys_on_all_regions(r2)  # ← これが「全域解析+全複合」
+              decoded_from_xor_all = search_all_xor_keys_on_all_regions(r2)
 
               oem_tables = find_oem_command_table(r2)
               unlock_vars = find_unlock_variables(r2)
