@@ -39,12 +39,6 @@ jobs:
           sudo cp avb/avbtool /usr/local/bin/
           sudo chmod +x /usr/local/bin/avbtool
 
-      - name: Download testkey_rsa2048.pem (for vbmeta_system chain)
-        run: |
-          mkdir -p keys
-          wget -q -O keys/testkey_rsa2048.pem \
-            https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/android-11.0.0_r39/test/data/testkey_rsa2048.pem
-
       - name: Download and extract ZIP
         run: |
           mkdir -p work
