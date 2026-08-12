@@ -1090,11 +1090,19 @@ jobs:
 
               fm = currentProgram.getFunctionManager()
               addr_factory = currentProgram.getAddressFactory()
+              addr_space = addr_factory.getDefaultAddressSpace()
 
               results = []
               for t in targets:
                   try:
-                      addr = addr_factory.getAddress(hex(t))
+                      addr = None
+                      try:
+                          addr = addr_space.getAddress(long(t))
+                      except:
+                          addr = None
+                      if addr is None:
+                          results.append({'target': hex(t), 'status': 'invalid_address'})
+                          continue
                       func = fm.getFunctionContaining(addr)
                       if func is None:
                           results.append({'target': hex(t), 'status': 'no_function_found'})
@@ -1111,8 +1119,8 @@ jobs:
                           })
                       else:
                           results.append({'target': hex(t), 'status': 'decompile_failed'})
-                  except Exception as e:
-                      results.append({'target': hex(t), 'status': 'error', 'error': str(e)})
+                  except:
+                      results.append({'target': hex(t), 'status': 'error'})
 
               out_path = os.path.join(out_dir, label + '_ghidra_decompiled.json')
               with open(out_path, 'w') as f:
