@@ -1,0 +1,1744 @@
+name: QCOM Bootloader Full Recursive Disassembly & Analysis
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Analysis ZIP URL"
+        required: true
+        type: string
+
+jobs:
+  full-disassembly:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --privileged
+
+    env:
+      ZIP_URL: ${{ inputs.zip_url || vars.ANALYSIS_ZIP_URL || secrets.ANALYSIS_ZIP_URL }}
+      ANALYSIS_ROOT: ${{ github.workspace }}/analysis
+      ARTIFACT_ROOT: ${{ github.workspace }}/artifacts
+
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates curl
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate URL
+        run: |
+          if [ -z "${ZIP_URL}" ]; then
+            echo "ZIP_URL is empty."
+            echo "Set workflow_dispatch input zip_url, repository variable ANALYSIS_ZIP_URL, or secret ANALYSIS_ZIP_URL."
+            exit 1
+          fi
+
+      - name: Install Analysis Tools
+        run: |
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            wget curl unzip zip \
+            p7zip-full p7zip-rar \
+            tar gzip bzip2 xz-utils zstd lz4 \
+            file binutils \
+            build-essential \
+            python3 python3-pip python3-dev \
+            git cmake pkg-config \
+            bsdmainutils \
+            default-jdk-headless \
+            binwalk \
+            liblzma-dev \
+            libmagic1 \
+            gdb-multiarch \
+            qemu-user-static \
+            ca-certificates
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          if ! command -v r2 >/dev/null 2>&1; then
+            git clone --depth 1 https://github.com/radareorg/radare2.git /tmp/radare2
+            cd /tmp/radare2
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            make install
+            cd /
+            rm -rf /tmp/radare2
+          fi
+
+          ldconfig
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/local/bin:${PATH}"
+          r2 -v
+          binwalk --help >/dev/null 2>&1 || true
+          7z i >/dev/null 2>&1
+
+      - name: Install Python Libraries
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install \
+            r2pipe \
+            pefile \
+            capstone \
+            pyelftools \
+            pycryptodome \
+            unicorn \
+            python-magic
+
+      - name: Prepare Analysis Directories
+        run: |
+          rm -rf "${ANALYSIS_ROOT}" "${ARTIFACT_ROOT}"
+          mkdir -p \
+            "${ANALYSIS_ROOT}/input" \
+            "${ANALYSIS_ROOT}/files" \
+            "${ANALYSIS_ROOT}/extracted" \
+            "${ANALYSIS_ROOT}/work" \
+            "${ARTIFACT_ROOT}/reports" \
+            "${ARTIFACT_ROOT}/raw" \
+            "${ARTIFACT_ROOT}/logs"
+
+      - name: Download ZIP
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 3600 \
+            --output "${ANALYSIS_ROOT}/input/source.zip" \
+            "${ZIP_URL}"
+
+          file "${ANALYSIS_ROOT}/input/source.zip"
+          sha256sum "${ANALYSIS_ROOT}/input/source.zip" | tee "${ARTIFACT_ROOT}/logs/source_sha256.txt"
+
+      - name: Create Recursive Analysis Script
+        run: |
+          cat > /tmp/recursive_analysis.py << 'PYEOF'
+          #!/usr/bin/env python3
+
+          import os
+          import sys
+          import re
+          import json
+          import math
+          import time
+          import shutil
+          import hashlib
+          import signal
+          import tarfile
+          import zipfile
+          import gzip
+          import bz2
+          import lzma
+          import subprocess
+          from pathlib import Path
+          from collections import Counter, deque
+
+          import r2pipe
+
+          ROOT = Path(os.environ["ANALYSIS_ROOT"])
+          ARTIFACT_ROOT = Path(os.environ["ARTIFACT_ROOT"])
+          INPUT = ROOT / "input" / "source.zip"
+          FILE_ROOT = ROOT / "files"
+          EXTRACT_ROOT = ROOT / "extracted"
+          WORK_ROOT = ROOT / "work"
+          REPORT_ROOT = ARTIFACT_ROOT / "reports"
+          RAW_ROOT = ARTIFACT_ROOT / "raw"
+
+          MAX_ARCHIVE_DEPTH = 32
+          R2_TIMEOUT = 900
+          STRING_MIN_LENGTH = 4
+          READ_CHUNK = 1024 * 1024
+
+          FASTBOOT_KEYWORDS = [
+              "flash",
+              "erase",
+              "reboot",
+              "getvar",
+              "setvar",
+              "oem",
+              "download",
+              "continue",
+              "boot",
+              "update",
+              "unlock",
+              "lock",
+              "device_state",
+              "secure",
+              "critical",
+              "slot",
+              "partition",
+              "flag",
+              "set",
+              "userdata",
+              "recovery",
+              "system",
+              "vendor",
+              "product",
+              "modem",
+              "xbl",
+              "abl",
+              "sbl",
+              "tz",
+              "hyp",
+              "devcfg"
+          ]
+
+          UNLOCK_KEYWORDS = [
+              "unlock",
+              "lock",
+              "oem_unlock",
+              "device_locked",
+              "device_unlocked",
+              "lock_state",
+              "secure_boot",
+              "unlock_ability",
+              "allow_unlock",
+              "unlock_code",
+              "unlock-go",
+              "unlock_go",
+              "is_unlocked",
+              "is_locked",
+              "critical_unlock",
+              "flashing_unlock"
+          ]
+
+          VENDOR_KEYWORDS = [
+              "qualcomm",
+              "qcom",
+              "snapdragon",
+              "littlekernel",
+              "lk",
+              "abl",
+              "xbl",
+              "sectools",
+              "sahara",
+              "firehose",
+              "edl",
+              "smem",
+              "rpm",
+              "tz",
+              "hyp",
+              "devcfg",
+              "uefi",
+              "fastboot"
+          ]
+
+          OEM_COMMAND_PATTERNS = [
+              r"oem\s+unlock",
+              r"oem\s+lock",
+              r"oem\s+device-info",
+              r"oem\s+getvar",
+              r"oem\s+setvar",
+              r"fastboot\s+oem",
+              r"androidboot\.unlocked",
+              r"androidboot\.verifiedbootstate",
+              r"ro\.oem_unlock",
+              r"oem\s+unlock-go",
+              r"oem\s+set",
+              r"oem\s+flag",
+              r"unlock-go",
+              r"unlock_go",
+              r"flashing\s+unlock",
+              r"get_unlock_ability",
+              r"allow_unlock"
+          ]
+
+          FILE_MAGIC_CATEGORIES = (
+              "ELF",
+              "PE32",
+              "MS-DOS",
+              "Mach-O",
+              "executable",
+              "shared object",
+              "DLL",
+              "relocatable",
+              "ARM",
+              "AArch64"
+          )
+
+          def run_command(command, timeout=300, cwd=None):
+              try:
+                  result = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      errors="replace",
+                      timeout=timeout,
+                      cwd=cwd
+                  )
+                  return result.returncode, result.stdout
+              except subprocess.TimeoutExpired as exc:
+                  output = exc.stdout if isinstance(exc.stdout, str) else ""
+                  return 124, output + "\nTIMEOUT\n"
+              except Exception as exc:
+                  return 125, str(exc)
+
+          def safe_name(value, limit=180):
+              value = value.replace("\\", "/")
+              value = re.sub(r"[^A-Za-z0-9._/@+-]+", "_", value)
+              value = value.strip("/.")
+              if not value:
+                  value = "file"
+              return value[:limit]
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  while True:
+                      chunk = f.read(READ_CHUNK)
+                      if not chunk:
+                          break
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def md5_file(path):
+              h = hashlib.md5()
+              with open(path, "rb") as f:
+                  while True:
+                      chunk = f.read(READ_CHUNK)
+                      if not chunk:
+                          break
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def calculate_entropy(path):
+              counts = [0] * 256
+              total = 0
+              with open(path, "rb") as f:
+                  while True:
+                      chunk = f.read(READ_CHUNK)
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      for b in chunk:
+                          counts[b] += 1
+              if total == 0:
+                  return 0.0
+              entropy_value = 0.0
+              for count in counts:
+                  if count:
+                      p = count / total
+                      entropy_value -= p * math.log2(p)
+              return entropy_value
+
+          def hex_preview(path, size=512):
+              with open(path, "rb") as f:
+                  data = f.read(size)
+              return " ".join(f"{b:02x}" for b in data)
+
+          def is_safe_member(base, member):
+              base = os.path.realpath(base)
+              target = os.path.realpath(os.path.join(base, member))
+              return target == base or target.startswith(base + os.sep)
+
+          def safe_extract_zip(path, destination):
+              extracted = []
+              with zipfile.ZipFile(path, "r") as zf:
+                  for member in zf.infolist():
+                      name = member.filename
+                      if not is_safe_member(destination, name):
+                          continue
+                      target = os.path.join(destination, name)
+                      if member.is_dir():
+                          os.makedirs(target, exist_ok=True)
+                          continue
+                      os.makedirs(os.path.dirname(target), exist_ok=True)
+                      with zf.open(member, "r") as src, open(target, "wb") as dst:
+                          shutil.copyfileobj(src, dst, length=READ_CHUNK)
+                      extracted.append(target)
+              return extracted
+
+          def safe_extract_tar(path, destination):
+              extracted = []
+              with tarfile.open(path, "r:*") as tf:
+                  for member in tf.getmembers():
+                      if member.issym() or member.islnk() or member.isdev():
+                          continue
+                      if not is_safe_member(destination, member.name):
+                          continue
+                      target = os.path.join(destination, member.name)
+                      if member.isdir():
+                          os.makedirs(target, exist_ok=True)
+                          continue
+                      src = tf.extractfile(member)
+                      if src is None:
+                          continue
+                      os.makedirs(os.path.dirname(target), exist_ok=True)
+                      with src, open(target, "wb") as dst:
+                          shutil.copyfileobj(src, dst, length=READ_CHUNK)
+                      try:
+                          os.chmod(target, member.mode & 0o777)
+                      except Exception:
+                          pass
+                      extracted.append(target)
+              return extracted
+
+          def extract_single_stream(path, destination):
+              magic = b""
+              with open(path, "rb") as f:
+                  magic = f.read(8)
+
+              out_name = safe_name(Path(path).name) + ".decompressed"
+              out_path = os.path.join(destination, out_name)
+
+              if magic.startswith(b"\x1f\x8b"):
+                  with gzip.open(path, "rb") as src, open(out_path, "wb") as dst:
+                      shutil.copyfileobj(src, dst, length=READ_CHUNK)
+                  return [out_path]
+
+              if magic.startswith(b"BZh"):
+                  with bz2.open(path, "rb") as src, open(out_path, "wb") as dst:
+                      shutil.copyfileobj(src, dst, length=READ_CHUNK)
+                  return [out_path]
+
+              if magic.startswith(b"\xfd7zXZ\x00"):
+                  with lzma.open(path, "rb") as src, open(out_path, "wb") as dst:
+                      shutil.copyfileobj(src, dst, length=READ_CHUNK)
+                  return [out_path]
+
+              return []
+
+          def extract_with_7z(path, destination):
+              os.makedirs(destination, exist_ok=True)
+              command = [
+                  "7z",
+                  "x",
+                  "-y",
+                  "-bd",
+                  f"-o{destination}",
+                  path
+              ]
+              code, output = run_command(command, timeout=900)
+              return {
+                  "code": code,
+                  "output": output
+              }
+
+          def extract_with_binwalk(path, destination):
+              os.makedirs(destination, exist_ok=True)
+              command = [
+                  "binwalk",
+                  "-Me",
+                  "--run-as=root",
+                  "--directory=" + destination,
+                  path
+              ]
+              code, output = run_command(command, timeout=1800)
+              return {
+                  "code": code,
+                  "output": output
+              }
+
+          def discover_archive_type(path):
+              result = {
+                  "zip": False,
+                  "tar": False,
+                  "stream": False,
+                  "7z": False
+              }
+
+              try:
+                  result["zip"] = zipfile.is_zipfile(path)
+              except Exception:
+                  pass
+
+              try:
+                  result["tar"] = tarfile.is_tarfile(path)
+              except Exception:
+                  pass
+
+              try:
+                  with open(path, "rb") as f:
+                      magic = f.read(16)
+                  if magic.startswith(b"7z\xbc\xaf'\x1c"):
+                      result["7z"] = True
+                  if (
+                      magic.startswith(b"\x1f\x8b")
+                      or magic.startswith(b"BZh")
+                      or magic.startswith(b"\xfd7zXZ\x00")
+                  ):
+                      result["stream"] = True
+              except Exception:
+                  pass
+
+              return result
+
+          def extract_recursive(current_path, relative_hint, depth, seen_hashes, discovered, extraction_log):
+              if depth > MAX_ARCHIVE_DEPTH:
+                  return
+
+              try:
+                  file_hash = sha256_file(current_path)
+              except Exception:
+                  return
+
+              if file_hash in seen_hashes:
+                  return
+
+              seen_hashes.add(file_hash)
+
+              destination = EXTRACT_ROOT / f"{file_hash[:16]}_{safe_name(relative_hint)}"
+              destination.mkdir(parents=True, exist_ok=True)
+
+              archive_info = discover_archive_type(current_path)
+
+              new_files = []
+
+              if archive_info["zip"]:
+                  try:
+                      new_files.extend(safe_extract_zip(current_path, str(destination / "zip")))
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "python_zip",
+                          "depth": depth,
+                          "success": True,
+                          "output": str(destination / "zip")
+                      })
+                  except Exception as exc:
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "python_zip",
+                          "depth": depth,
+                          "success": False,
+                          "output": str(exc)
+                      })
+
+              if archive_info["tar"]:
+                  try:
+                      new_files.extend(safe_extract_tar(current_path, str(destination / "tar")))
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "python_tar",
+                          "depth": depth,
+                          "success": True,
+                          "output": str(destination / "tar")
+                      })
+                  except Exception as exc:
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "python_tar",
+                          "depth": depth,
+                          "success": False,
+                          "output": str(exc)
+                      })
+
+              if archive_info["stream"]:
+                  try:
+                      new_files.extend(extract_single_stream(current_path, str(destination / "stream")))
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "single_stream",
+                          "depth": depth,
+                          "success": True,
+                          "output": str(destination / "stream")
+                      })
+                  except Exception as exc:
+                      extraction_log.append({
+                          "source": str(current_path),
+                          "method": "single_stream",
+                          "depth": depth,
+                          "success": False,
+                          "output": str(exc)
+                      })
+
+              if archive_info["7z"]:
+                  result = extract_with_7z(current_path, str(destination / "7z"))
+                  extracted_candidates = []
+                  for root, dirs, files in os.walk(destination / "7z"):
+                      for filename in files:
+                          extracted_candidates.append(os.path.join(root, filename))
+                  new_files.extend(extracted_candidates)
+                  extraction_log.append({
+                      "source": str(current_path),
+                      "method": "7z",
+                      "depth": depth,
+                      "success": result["code"] == 0,
+                      "output": result["output"][-10000:]
+                  })
+
+              binwalk_dir = destination / "binwalk"
+              result = extract_with_binwalk(current_path, str(binwalk_dir))
+              binwalk_candidates = []
+              for root, dirs, files in os.walk(binwalk_dir):
+                  for filename in files:
+                      binwalk_candidates.append(os.path.join(root, filename))
+              new_files.extend(binwalk_candidates)
+              extraction_log.append({
+                  "source": str(current_path),
+                  "method": "binwalk",
+                  "depth": depth,
+                  "success": result["code"] == 0,
+                  "output": result["output"][-10000:]
+              })
+
+              unique = set()
+              for item in new_files:
+                  if not os.path.isfile(item):
+                      continue
+                  try:
+                      item_hash = sha256_file(item)
+                  except Exception:
+                      continue
+                  if item_hash == file_hash:
+                      continue
+                  if item_hash in unique:
+                      continue
+                  unique.add(item_hash)
+                  discovered.append({
+                      "path": item,
+                      "parent": str(current_path),
+                      "depth": depth + 1,
+                      "sha256": item_hash
+                  })
+
+                  next_hint = str(Path(relative_hint) / Path(item).name)
+                  extract_recursive(
+                      item,
+                      next_hint,
+                      depth + 1,
+                      seen_hashes,
+                      discovered,
+                      extraction_log
+                  )
+
+          def strings_command(path, mode):
+              if mode == "ascii":
+                  command = ["strings", "-a", "-n", str(STRING_MIN_LENGTH), "-t", "x", path]
+              else:
+                  command = ["strings", "-a", "-el", "-n", str(STRING_MIN_LENGTH), "-t", "x", path]
+              return run_command(command, timeout=600)
+
+          def run_file_command(path):
+              return run_command(["file", "-b", "--mime", path], timeout=60)
+
+          def run_file_description(path):
+              return run_command(["file", "-b", path], timeout=60)
+
+          def r2_open(path):
+              return r2pipe.open(
+                  path,
+                  flags=["-2"],
+                  timeout=R2_TIMEOUT
+              )
+
+          def extract_r2_json(r2, command):
+              try:
+                  return r2.cmdj(command)
+              except Exception:
+                  return None
+
+          def get_r2_analysis(path, base_name):
+              result = {
+                  "available": False,
+                  "info": {},
+                  "analysis_info": {},
+                  "sections": [],
+                  "symbols": [],
+                  "imports": [],
+                  "exports": [],
+                  "strings": [],
+                  "functions": [],
+                  "function_count": 0,
+                  "disassembly_file": None,
+                  "command_log": []
+              }
+
+              try:
+                  r2 = r2_open(path)
+              except Exception as exc:
+                  result["error"] = str(exc)
+                  return result
+
+              result["available"] = True
+
+              try:
+                  r2.cmd("e io.cache=true")
+                  r2.cmd("e bin.cache=true")
+              except Exception:
+                  pass
+
+              try:
+                  info = extract_r2_json(r2, "ij")
+                  if info:
+                      result["info"] = info
+              except Exception:
+                  pass
+
+              try:
+                  analysis_info = extract_r2_json(r2, "iIj")
+                  if analysis_info:
+                      result["analysis_info"] = analysis_info
+              except Exception:
+                  pass
+
+              try:
+                  result["sections"] = extract_r2_json(r2, "iSj") or []
+              except Exception:
+                  pass
+
+              try:
+                  result["symbols"] = extract_r2_json(r2, "isj") or []
+              except Exception:
+                  pass
+
+              try:
+                  result["imports"] = extract_r2_json(r2, "iij") or []
+              except Exception:
+                  pass
+
+              try:
+                  result["exports"] = extract_r2_json(r2, "iEj") or []
+              except Exception:
+                  pass
+
+              try:
+                  result["strings"] = extract_r2_json(r2, "izzj") or []
+              except Exception:
+                  pass
+
+              analysis_commands = [
+                  "aaaa",
+                  "aac",
+                  "aav",
+                  "aaf"
+              ]
+
+              for command in analysis_commands:
+                  try:
+                      output = r2.cmd(command)
+                      result["command_log"].append({
+                          "command": command,
+                          "success": True,
+                          "output_tail": output[-5000:]
+                      })
+                  except Exception as exc:
+                      result["command_log"].append({
+                          "command": command,
+                          "success": False,
+                          "error": str(exc)
+                      })
+
+              try:
+                  functions = extract_r2_json(r2, "aflj") or []
+                  result["functions"] = functions
+                  result["function_count"] = len(functions)
+              except Exception:
+                  result["functions"] = []
+
+              disassembly_path = REPORT_ROOT / "disassembly" / f"{base_name}.asm"
+              disassembly_path.parent.mkdir(parents=True, exist_ok=True)
+
+              with open(disassembly_path, "w", encoding="utf-8", errors="replace") as asm:
+                  entry = None
+                  try:
+                      entry = extract_r2_json(r2, "iej")
+                  except Exception:
+                      entry = None
+
+                  if entry:
+                      asm.write("===== ENTRY POINTS =====\n")
+                      asm.write(json.dumps(entry, indent=2, ensure_ascii=False))
+                      asm.write("\n\n")
+
+                  functions = result["functions"]
+
+                  for index, function in enumerate(functions):
+                      address = function.get("offset")
+                      if address is None:
+                          address = function.get("addr")
+                      if address is None:
+                          continue
+
+                      name = function.get("name", "")
+                      asm.write("\n")
+                      asm.write("=" * 100)
+                      asm.write("\n")
+                      asm.write(f"FUNCTION_INDEX={index}\n")
+                      asm.write(f"NAME={name}\n")
+                      asm.write(f"ADDRESS={address:#x}\n")
+                      asm.write("=" * 100)
+                      asm.write("\n")
+
+                      try:
+                          disasm = r2.cmd(f"pdf @ {address}")
+                      except Exception as exc:
+                          disasm = f"DISASSEMBLY_ERROR: {exc}\n"
+
+                      asm.write(disasm)
+                      asm.write("\n")
+
+              result["disassembly_file"] = str(disassembly_path)
+
+              try:
+                  asm_entry = r2.cmd("pd 512 @ entry0")
+                  with open(
+                      REPORT_ROOT / "disassembly" / f"{base_name}_entry.asm",
+                      "w",
+                      encoding="utf-8",
+                      errors="replace"
+                  ) as f:
+                      f.write(asm_entry)
+              except Exception:
+                  pass
+
+              try:
+                  r2.quit()
+              except Exception:
+                  pass
+
+              return result
+
+          def keyword_matches(strings):
+              fastboot_matches = []
+              unlock_matches = []
+              vendor_matches = []
+              oem_matches = []
+
+              for entry in strings:
+                  text = str(entry.get("string", ""))
+                  lower = text.lower()
+                  address = entry.get("vaddr", entry.get("paddr", entry.get("addr")))
+
+                  for keyword in FASTBOOT_KEYWORDS:
+                      if keyword in lower:
+                          fastboot_matches.append({
+                              "address": address,
+                              "string": text,
+                              "keyword": keyword
+                          })
+                          break
+
+                  for keyword in UNLOCK_KEYWORDS:
+                      if keyword in lower:
+                          unlock_matches.append({
+                              "address": address,
+                              "string": text,
+                              "keyword": keyword
+                          })
+                          break
+
+                  for keyword in VENDOR_KEYWORDS:
+                      if keyword in lower:
+                          vendor_matches.append({
+                              "address": address,
+                              "string": text,
+                              "keyword": keyword
+                          })
+                          break
+
+                  for pattern in OEM_COMMAND_PATTERNS:
+                      try:
+                          if re.search(pattern, lower):
+                              oem_matches.append({
+                                  "address": address,
+                                  "string": text,
+                                  "pattern": pattern
+                              })
+                              break
+                      except Exception:
+                          pass
+
+              return {
+                  "fastboot": fastboot_matches,
+                  "unlock": unlock_matches,
+                  "vendor": vendor_matches,
+                  "oem": oem_matches
+              }
+
+          def discover_partition_strings(strings):
+              candidates = set()
+              keywords = [
+                  "partition",
+                  "xbl",
+                  "xbl_config",
+                  "abl",
+                  "aop",
+                  "boot",
+                  "vendor_boot",
+                  "system",
+                  "system_ext",
+                  "product",
+                  "userdata",
+                  "cache",
+                  "recovery",
+                  "misc",
+                  "modem",
+                  "modemst1",
+                  "modemst2",
+                  "fsg",
+                  "persist",
+                  "metadata",
+                  "super",
+                  "vbmeta",
+                  "vbmeta_system",
+                  "vbmeta_vendor",
+                  "dtbo",
+                  "devcfg",
+                  "rpm",
+                  "tz",
+                  "hyp",
+                  "keymaster",
+                  "frp"
+              ]
+
+              for entry in strings:
+                  text = str(entry.get("string", ""))
+                  lower = text.lower()
+                  if any(k in lower for k in keywords):
+                      candidates.add(text)
+
+              return sorted(candidates)
+
+          def entropy_regions(path, block_size=65536, threshold=7.0):
+              results = []
+              offset = 0
+
+              with open(path, "rb") as f:
+                  while True:
+                      block = f.read(block_size)
+                      if not block:
+                          break
+
+                      counts = [0] * 256
+                      for b in block:
+                          counts[b] += 1
+
+                      e = 0.0
+                      n = len(block)
+
+                      if n:
+                          for c in counts:
+                              if c:
+                                  p = c / n
+                                  e -= p * math.log2(p)
+
+                      if e >= threshold:
+                          results.append({
+                              "offset": offset,
+                              "size": len(block),
+                              "entropy": round(e, 6)
+                          })
+
+                      offset += len(block)
+
+              return results
+
+          def analyze_one_file(path, relative_name, sequence):
+              file_hash = sha256_file(path)
+              base = f"{sequence:06d}_{safe_name(relative_name)}_{file_hash[:16]}"
+
+              report_dir = REPORT_ROOT / "files"
+              report_dir.mkdir(parents=True, exist_ok=True)
+
+              raw_dir = RAW_ROOT / base
+              raw_dir.mkdir(parents=True, exist_ok=True)
+
+              metadata_result = run_file_description(path)
+              mime_result = run_file_command(path)
+
+              description = metadata_result[1].strip()
+              mime = mime_result[1].strip()
+
+              size = os.path.getsize(path)
+              entropy_value = calculate_entropy(path)
+              md5_value = md5_file(path)
+
+              ascii_result = strings_command(path, "ascii")
+              utf16_result = strings_command(path, "utf16")
+
+              ascii_strings = ascii_result[1]
+              utf16_strings = utf16_result[1]
+
+              with open(raw_dir / "ascii_strings.txt", "w", encoding="utf-8", errors="replace") as f:
+                  f.write(ascii_strings)
+
+              with open(raw_dir / "utf16le_strings.txt", "w", encoding="utf-8", errors="replace") as f:
+                  f.write(utf16_strings)
+
+              with open(raw_dir / "hex_preview.txt", "w", encoding="utf-8") as f:
+                  f.write(hex_preview(path))
+
+              r2_result = get_r2_analysis(path, base)
+
+              r2_strings = r2_result.get("strings", []) or []
+              matches = keyword_matches(r2_strings)
+              partition_candidates = discover_partition_strings(r2_strings)
+
+              entropy_blocks = entropy_regions(path)
+
+              raw_copy_path = None
+              if size <= 64 * 1024 * 1024:
+                  raw_copy = raw_dir / "original.bin"
+                  shutil.copy2(path, raw_copy)
+                  raw_copy_path = str(raw_copy)
+
+              metadata = {
+                  "sequence": sequence,
+                  "relative_name": relative_name,
+                  "path": str(path),
+                  "size": size,
+                  "sha256": file_hash,
+                  "md5": md5_value,
+                  "file_description": description,
+                  "mime": mime,
+                  "entropy": entropy_value,
+                  "ascii_strings_command_exit_code": ascii_result[0],
+                  "utf16_strings_command_exit_code": utf16_result[0],
+                  "ascii_strings_file": str(raw_dir / "ascii_strings.txt"),
+                  "utf16le_strings_file": str(raw_dir / "utf16le_strings.txt"),
+                  "hex_preview_file": str(raw_dir / "hex_preview.txt"),
+                  "original_copy": raw_copy_path,
+                  "r2": r2_result,
+                  "fastboot_matches": matches["fastboot"],
+                  "unlock_matches": matches["unlock"],
+                  "vendor_matches": matches["vendor"],
+                  "oem_matches": matches["oem"],
+                  "partition_candidates": partition_candidates,
+                  "high_entropy_blocks": entropy_blocks,
+                  "high_entropy_block_count": len(entropy_blocks)
+              }
+
+              json_path = report_dir / f"{base}.json"
+              md_path = report_dir / f"{base}.md"
+
+              with open(json_path, "w", encoding="utf-8") as f:
+                  json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+              with open(md_path, "w", encoding="utf-8") as f:
+                  f.write(f"# Recursive Analysis Report\n\n")
+                  f.write(f"## File\n\n")
+                  f.write(f"`{relative_name}`\n\n")
+                  f.write(f"## Metadata\n\n")
+                  f.write(f"| Field | Value |\n")
+                  f.write(f"|---|---|\n")
+                  f.write(f"| Size | {size} bytes |\n")
+                  f.write(f"| SHA256 | `{file_hash}` |\n")
+                  f.write(f"| MD5 | `{md5_value}` |\n")
+                  f.write(f"| File | `{description}` |\n")
+                  f.write(f"| MIME | `{mime}` |\n")
+                  f.write(f"| Entropy | `{entropy_value:.6f}` |\n")
+                  f.write(f"| R2 Available | `{r2_result.get('available')}` |\n")
+                  f.write(f"| R2 Function Count | `{r2_result.get('function_count', 0)}` |\n")
+                  f.write(f"\n## Fastboot-related Strings\n\n")
+
+                  if matches["fastboot"]:
+                      f.write("| Address | Keyword | String |\n")
+                      f.write("|---:|---|---|\n")
+                      for item in matches["fastboot"]:
+                          f.write(
+                              f"| `{item['address']}` | `{item['keyword']}` | "
+                              f"`{str(item['string']).replace('|', ' ' )}` |\n"
+                          )
+                  else:
+                      f.write("No fastboot-related strings detected.\n")
+
+                  f.write("\n## Unlock/Lock-related Strings\n\n")
+
+                  if matches["unlock"]:
+                      f.write("| Address | Keyword | String |\n")
+                      f.write("|---:|---|---|\n")
+                      for item in matches["unlock"]:
+                          f.write(
+                              f"| `{item['address']}` | `{item['keyword']}` | "
+                              f"`{str(item['string']).replace('|', ' ')}` |\n"
+                          )
+                  else:
+                      f.write("No unlock/lock-related strings detected.\n")
+
+                  f.write("\n## Vendor-related Strings\n\n")
+
+                  if matches["vendor"]:
+                      f.write("| Address | Keyword | String |\n")
+                      f.write("|---:|---|---|\n")
+                      for item in matches["vendor"]:
+                          f.write(
+                              f"| `{item['address']}` | `{item['keyword']}` | "
+                              f"`{str(item['string']).replace('|', ' ')}` |\n"
+                          )
+                  else:
+                      f.write("No vendor-related strings detected.\n")
+
+                  f.write("\n## OEM Command Patterns\n\n")
+
+                  if matches["oem"]:
+                      f.write("| Address | Pattern | String |\n")
+                      f.write("|---:|---|---|\n")
+                      for item in matches["oem"]:
+                          f.write(
+                              f"| `{item['address']}` | `{item['pattern']}` | "
+                              f"`{str(item['string']).replace('|', ' ')}` |\n"
+                          )
+                  else:
+                      f.write("No explicit OEM command patterns detected.\n")
+
+                  f.write("\n## Partition Candidates\n\n")
+
+                  if partition_candidates:
+                      for item in partition_candidates:
+                          f.write(f"- `{item}`\n")
+                  else:
+                      f.write("No partition candidates detected.\n")
+
+                  f.write("\n## High Entropy Regions\n\n")
+
+                  if entropy_blocks:
+                      f.write("| Offset | Size | Entropy |\n")
+                      f.write("|---:|---:|---:|\n")
+                      for block in entropy_blocks:
+                          f.write(
+                              f"| `0x{block['offset']:x}` | `{block['size']}` | "
+                              f"`{block['entropy']}` |\n"
+                          )
+                  else:
+                      f.write("No blocks above the high-entropy threshold were detected.\n")
+
+                  f.write("\n## R2 Binary Information\n\n")
+                  f.write("```json\n")
+                  f.write(
+                      json.dumps(
+                          r2_result.get("info", {}),
+                          indent=2,
+                          ensure_ascii=False
+                      )
+                  )
+                  f.write("\n```\n")
+
+                  f.write("\n## R2 Analysis Information\n\n")
+                  f.write("```json\n")
+                  f.write(
+                      json.dumps(
+                          r2_result.get("analysis_info", {}),
+                          indent=2,
+                          ensure_ascii=False
+                      )
+                  )
+                  f.write("\n```\n")
+
+                  f.write("\n## R2 Sections\n\n")
+                  f.write("```json\n")
+                  f.write(
+                      json.dumps(
+                          r2_result.get("sections", []),
+                          indent=2,
+                          ensure_ascii=False
+                      )
+                  )
+                  f.write("\n```\n")
+
+                  f.write("\n## R2 Functions\n\n")
+                  if r2_result.get("functions"):
+                      f.write("| Address | Name | Size | Type |\n")
+                      f.write("|---:|---|---:|---|\n")
+                      for function in r2_result["functions"]:
+                          address = function.get("offset", function.get("addr"))
+                          name = str(function.get("name", ""))
+                          function_size = function.get("size", "")
+                          function_type = function.get("type", "")
+                          f.write(
+                              f"| `{address}` | `{name.replace('|', ' ')}` | "
+                              f"`{function_size}` | `{function_type}` |\n"
+                          )
+                  else:
+                      f.write("No functions identified by radare2.\n")
+
+                  f.write("\n## Raw String Files\n\n")
+                  f.write(f"- ASCII: `{raw_dir / 'ascii_strings.txt'}`\n")
+                  f.write(f"- UTF-16LE: `{raw_dir / 'utf16le_strings.txt'}`\n")
+                  f.write(f"- Hex preview: `{raw_dir / 'hex_preview.txt'}`\n")
+
+                  if r2_result.get("disassembly_file"):
+                      f.write(
+                          f"\n## Full Function Disassembly\n\n"
+                          f"`{r2_result['disassembly_file']}`\n"
+                      )
+
+              return {
+                  "sequence": sequence,
+                  "relative_name": relative_name,
+                  "path": str(path),
+                  "size": size,
+                  "sha256": file_hash,
+                  "md5": md5_value,
+                  "file_description": description,
+                  "mime": mime,
+                  "entropy": entropy_value,
+                  "function_count": r2_result.get("function_count", 0),
+                  "fastboot_match_count": len(matches["fastboot"]),
+                  "unlock_match_count": len(matches["unlock"]),
+                  "vendor_match_count": len(matches["vendor"]),
+                  "oem_match_count": len(matches["oem"]),
+                  "partition_candidate_count": len(partition_candidates),
+                  "high_entropy_block_count": len(entropy_blocks),
+                  "report_markdown": str(md_path),
+                  "report_json": str(json_path),
+                  "raw_directory": str(raw_dir)
+              }
+
+          def main():
+              FILE_ROOT.mkdir(parents=True, exist_ok=True)
+              EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
+              WORK_ROOT.mkdir(parents=True, exist_ok=True)
+              REPORT_ROOT.mkdir(parents=True, exist_ok=True)
+              RAW_ROOT.mkdir(parents=True, exist_ok=True)
+
+              initial_extract = FILE_ROOT / "source"
+              initial_extract.mkdir(parents=True, exist_ok=True)
+
+              initial_files = []
+
+              try:
+                  initial_files.extend(
+                      safe_extract_zip(
+                          str(INPUT),
+                          str(initial_extract)
+                      )
+                  )
+              except Exception as exc:
+                  print(f"Initial ZIP extraction failed: {exc}")
+                  sys.exit(1)
+
+              extraction_log = []
+              discovered = []
+              seen_hashes = set()
+
+              source_manifest = []
+
+              for item in initial_files:
+                  if os.path.isfile(item):
+                      try:
+                          item_hash = sha256_file(item)
+                      except Exception:
+                          continue
+                      discovered.append({
+                          "path": item,
+                          "parent": str(INPUT),
+                          "depth": 1,
+                          "sha256": item_hash
+                      })
+
+              queue = deque(discovered)
+
+              all_discovered_by_hash = {}
+              while queue:
+                  current = queue.popleft()
+                  current_path = current["path"]
+                  current_hash = current["sha256"]
+
+                  if current_hash in all_discovered_by_hash:
+                      continue
+
+                  all_discovered_by_hash[current_hash] = current
+
+                  before = len(discovered)
+
+                  extract_recursive(
+                      current_path,
+                      str(
+                          Path(current.get("parent", "root")).name
+                          / Path(current_path).name
+                      ),
+                      int(current.get("depth", 1)),
+                      seen_hashes,
+                      discovered,
+                      extraction_log
+                  )
+
+                  if len(discovered) > before:
+                      for item in discovered[before:]:
+                          queue.append(item)
+
+              files_to_analyze = []
+              unique_file_hashes = set()
+
+              for item in discovered:
+                  path = item["path"]
+                  if not os.path.isfile(path):
+                      continue
+
+                  try:
+                      item_hash = sha256_file(path)
+                  except Exception:
+                      continue
+
+                  if item_hash in unique_file_hashes:
+                      continue
+
+                  unique_file_hashes.add(item_hash)
+                  files_to_analyze.append({
+                      "path": path,
+                      "parent": item.get("parent"),
+                      "depth": item.get("depth", 0),
+                      "sha256": item_hash
+                  })
+
+              files_to_analyze.sort(
+                  key=lambda x: (
+                      int(x.get("depth", 0)),
+                      str(x.get("path", ""))
+                  )
+              )
+
+              summaries = []
+              failures = []
+
+              for index, item in enumerate(files_to_analyze, 1):
+                  path = item["path"]
+                  relative_name = os.path.relpath(path, str(FILE_ROOT))
+
+                  print(
+                      f"[{index}/{len(files_to_analyze)}] "
+                      f"Analyzing {relative_name}"
+                  )
+
+                  try:
+                      summary = analyze_one_file(
+                          path,
+                          relative_name,
+                          index
+                      )
+
+                      summary["parent"] = item.get("parent")
+                      summary["depth"] = item.get("depth", 0)
+
+                      summaries.append(summary)
+
+                  except Exception as exc:
+                      failure = {
+                          "sequence": index,
+                          "path": path,
+                          "relative_name": relative_name,
+                          "error": str(exc)
+                      }
+                      failures.append(failure)
+
+                      with open(
+                          REPORT_ROOT / "failures.log",
+                          "a",
+                          encoding="utf-8"
+                      ) as f:
+                          f.write(json.dumps(failure, ensure_ascii=False))
+                          f.write("\n")
+
+              archive_log_path = ARTIFACT_ROOT / "logs" / "recursive_extraction.json"
+              with open(
+                  archive_log_path,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(
+                      extraction_log,
+                      f,
+                      indent=2,
+                      ensure_ascii=False
+                  )
+
+              manifest = {
+                  "input_zip": str(INPUT),
+                  "input_sha256": sha256_file(INPUT),
+                  "analysis_root": str(ROOT),
+                  "artifact_root": str(ARTIFACT_ROOT),
+                  "max_archive_depth": MAX_ARCHIVE_DEPTH,
+                  "file_count_discovered": len(files_to_analyze),
+                  "file_count_analyzed": len(summaries),
+                  "file_count_failed": len(failures),
+                  "files": summaries,
+                  "failures": failures
+              }
+
+              manifest_path = ARTIFACT_ROOT / "analysis_manifest.json"
+              with open(
+                  manifest_path,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  json.dump(
+                      manifest,
+                      f,
+                      indent=2,
+                      ensure_ascii=False
+                  )
+
+              csv_path = ARTIFACT_ROOT / "analysis_index.csv"
+              with open(
+                  csv_path,
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write(
+                      "sequence,depth,relative_name,size,sha256,"
+                      "entropy,function_count,fastboot_match_count,"
+                      "unlock_match_count,vendor_match_count,"
+                      "oem_match_count,partition_candidate_count,"
+                      "high_entropy_block_count,report_markdown,report_json\n"
+                  )
+
+                  for item in summaries:
+                      def csv_escape(value):
+                          value = str(value)
+                          return '"' + value.replace('"', '""') + '"'
+
+                      f.write(
+                          ",".join([
+                              str(item.get("sequence", "")),
+                              str(item.get("depth", "")),
+                              csv_escape(item.get("relative_name", "")),
+                              str(item.get("size", "")),
+                              csv_escape(item.get("sha256", "")),
+                              str(item.get("entropy", "")),
+                              str(item.get("function_count", "")),
+                              str(item.get("fastboot_match_count", "")),
+                              str(item.get("unlock_match_count", "")),
+                              str(item.get("vendor_match_count", "")),
+                              str(item.get("oem_match_count", "")),
+                              str(item.get("partition_candidate_count", "")),
+                              str(item.get("high_entropy_block_count", "")),
+                              csv_escape(item.get("report_markdown", "")),
+                              csv_escape(item.get("report_json", ""))
+                          ])
+                      )
+                      f.write("\n")
+
+              print("")
+              print("==============================================")
+              print("Recursive Analysis Complete")
+              print("Discovered files :", len(files_to_analyze))
+              print("Analyzed files   :", len(summaries))
+              print("Failed files     :", len(failures))
+              print("Reports          :", REPORT_ROOT)
+              print("==============================================")
+
+              if not summaries:
+                  sys.exit(2)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          chmod +x /tmp/recursive_analysis.py
+
+      - name: Run Recursive Analysis
+        env:
+          PYTHONUNBUFFERED: "1"
+          PATH: /usr/local/bin:/usr/bin:/bin
+          LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
+        run: |
+          python3 /tmp/recursive_analysis.py 2>&1 | tee "${ARTIFACT_ROOT}/logs/analysis.log"
+
+      - name: Generate Global Report
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import json
+          from pathlib import Path
+
+          artifact_root = Path(os.environ["ARTIFACT_ROOT"])
+          manifest_path = artifact_root / "analysis_manifest.json"
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+
+          report_path = artifact_root / "reports" / "FULL_ANALYSIS_REPORT.md"
+
+          files = manifest.get("files", [])
+          failures = manifest.get("failures", [])
+
+          unlock_hits = []
+          fastboot_hits = []
+          vendor_hits = []
+          oem_hits = []
+          high_entropy = []
+
+          for item in files:
+              if item.get("unlock_match_count", 0) > 0:
+                  unlock_hits.append(item)
+              if item.get("fastboot_match_count", 0) > 0:
+                  fastboot_hits.append(item)
+              if item.get("vendor_match_count", 0) > 0:
+                  vendor_hits.append(item)
+              if item.get("oem_match_count", 0) > 0:
+                  oem_hits.append(item)
+              if item.get("high_entropy_block_count", 0) > 0:
+                  high_entropy.append(item)
+
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write("# QCOM Bootloader Full Recursive Analysis\n\n")
+
+              f.write("## Input\n\n")
+              f.write(f"- Input ZIP: `{manifest.get('input_zip')}`\n")
+              f.write(f"- Input SHA256: `{manifest.get('input_sha256')}`\n")
+              f.write(f"- Discovered files: `{manifest.get('file_count_discovered')}`\n")
+              f.write(f"- Analyzed files: `{manifest.get('file_count_analyzed')}`\n")
+              f.write(f"- Failed files: `{manifest.get('file_count_failed')}`\n")
+              f.write("\n")
+
+              f.write("## Analysis Coverage\n\n")
+              f.write("Every discovered regular file is analyzed without using file extensions as an inclusion condition. ")
+              f.write("Analysis includes hashes, MIME/file identification, entropy, ASCII strings, UTF-16LE strings, ")
+              f.write("binary metadata, sections, symbols, imports, exports, radare2 function discovery, ")
+              f.write("and complete function-level disassembly when radare2 can identify code.\n\n")
+
+              f.write("## Files With Unlock-related Matches\n\n")
+              if unlock_hits:
+                  f.write("| File | Unlock Matches | Functions |\n")
+                  f.write("|---|---:|---:|\n")
+                  for item in unlock_hits:
+                      f.write(
+                          f"| `{item.get('relative_name')}` | "
+                          f"{item.get('unlock_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  f.write("No unlock-related matches were detected.\n")
+              f.write("\n")
+
+              f.write("## Files With Fastboot-related Matches\n\n")
+              if fastboot_hits:
+                  f.write("| File | Fastboot Matches | Functions |\n")
+                  f.write("|---|---:|---:|\n")
+                  for item in fastboot_hits:
+                      f.write(
+                          f"| `{item.get('relative_name')}` | "
+                          f"{item.get('fastboot_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  f.write("No fastboot-related matches were detected.\n")
+              f.write("\n")
+
+              f.write("## Files With OEM Command Matches\n\n")
+              if oem_hits:
+                  f.write("| File | OEM Matches | Functions |\n")
+                  f.write("|---|---:|---:|\n")
+                  for item in oem_hits:
+                      f.write(
+                          f"| `{item.get('relative_name')}` | "
+                          f"{item.get('oem_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  f.write("No explicit OEM command patterns were detected.\n")
+              f.write("\n")
+
+              f.write("## Files With Vendor-related Matches\n\n")
+              if vendor_hits:
+                  f.write("| File | Vendor Matches | Functions |\n")
+                  f.write("|---|---:|---:|\n")
+                  for item in vendor_hits:
+                      f.write(
+                          f"| `{item.get('relative_name')}` | "
+                          f"{item.get('vendor_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  f.write("No vendor-related matches were detected.\n")
+              f.write("\n")
+
+              f.write("## High Entropy Files\n\n")
+              if high_entropy:
+                  f.write("| File | Entropy Blocks | Size |\n")
+                  f.write("|---|---:|---:|\n")
+                  for item in sorted(
+                      high_entropy,
+                      key=lambda x: x.get("high_entropy_block_count", 0),
+                      reverse=True
+                  ):
+                      f.write(
+                          f"| `{item.get('relative_name')}` | "
+                          f"{item.get('high_entropy_block_count', 0)} | "
+                          f"{item.get('size', 0)} |\n"
+                      )
+              else:
+                  f.write("No high entropy blocks were detected.\n")
+              f.write("\n")
+
+              f.write("## All Analyzed Files\n\n")
+              f.write("| # | Depth | File | Size | SHA256 | Entropy | Functions |\n")
+              f.write("|---:|---:|---|---:|---|---:|---:|\n")
+
+              for item in files:
+                  f.write(
+                      f"| {item.get('sequence', '')} | "
+                      f"{item.get('depth', '')} | "
+                      f"`{item.get('relative_name', '')}` | "
+                      f"{item.get('size', '')} | "
+                      f"`{item.get('sha256', '')}` | "
+                      f"{item.get('entropy', 0):.4f} | "
+                      f"{item.get('function_count', 0)} |\n"
+                  )
+
+              f.write("\n## Failed Files\n\n")
+
+              if failures:
+                  for failure in failures:
+                      f.write(
+                          f"- `{failure.get('relative_name', '')}`: "
+                          f"{failure.get('error', '')}\n"
+                      )
+              else:
+                  f.write("No file analysis failures were recorded.\n")
+
+              f.write("\n## Artifact Structure\n\n")
+              f.write("```text\n")
+              f.write("artifacts/\n")
+              f.write("├── analysis_manifest.json\n")
+              f.write("├── analysis_index.csv\n")
+              f.write("├── logs/\n")
+              f.write("│   ├── analysis.log\n")
+              f.write("│   ├── recursive_extraction.json\n")
+              f.write("│   └── source_sha256.txt\n")
+              f.write("├── reports/\n")
+              f.write("│   ├── FULL_ANALYSIS_REPORT.md\n")
+              f.write("│   ├── files/\n")
+              f.write("│   └── disassembly/\n")
+              f.write("└── raw/\n")
+              f.write("    └── per-file analysis data\n")
+              f.write("```\n")
+
+          print(report_path)
+          PYEOF
+
+      - name: Generate HTML Summary
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import json
+          import html
+          from pathlib import Path
+
+          artifact_root = Path(os.environ["ARTIFACT_ROOT"])
+          manifest_path = artifact_root / "analysis_manifest.json"
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = json.load(f)
+
+          files = manifest.get("files", [])
+          failures = manifest.get("failures", [])
+
+          rows = []
+
+          for item in files:
+              rows.append(
+                  "<tr>"
+                  f"<td>{html.escape(str(item.get('sequence', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('depth', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('relative_name', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('size', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('sha256', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('entropy', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('function_count', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('unlock_match_count', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('fastboot_match_count', '')))}</td>"
+                  f"<td>{html.escape(str(item.get('oem_match_count', '')))}</td>"
+                  "</tr>"
+              )
+
+          report_html = artifact_root / "reports" / "index.html"
+
+          with open(report_html, "w", encoding="utf-8") as f:
+              f.write(
+                  "<!doctype html>"
+                  "<html>"
+                  "<head>"
+                  "<meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>QCOM Bootloader Full Recursive Analysis</title>"
+                  "<style>"
+                  "body{font-family:Arial,Helvetica,sans-serif;margin:32px;background:#f5f5f5;color:#222}"
+                  "h1,h2{color:#222}"
+                  ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}"
+                  ".card{background:white;border:1px solid #ddd;border-radius:8px;padding:16px}"
+                  ".value{font-size:28px;font-weight:bold}"
+                  "table{border-collapse:collapse;width:100%;background:white}"
+                  "th,td{border:1px solid #ddd;padding:7px;text-align:left;vertical-align:top}"
+                  "th{background:#333;color:white;position:sticky;top:0}"
+                  "tr:nth-child(even){background:#fafafa}"
+                  "a{color:#0057b8}"
+                  ".danger{color:#c00}"
+                  "</style>"
+                  "</head>"
+                  "<body>"
+              )
+
+              f.write(
+                  "<h1>QCOM Bootloader Full Recursive Analysis</h1>"
+              )
+
+              f.write("<div class='cards'>")
+              f.write(
+                  f"<div class='card'><div>Discovered</div><div class='value'>"
+                  f"{manifest.get('file_count_discovered', 0)}</div></div>"
+              )
+              f.write(
+                  f"<div class='card'><div>Analyzed</div><div class='value'>"
+                  f"{manifest.get('file_count_analyzed', 0)}</div></div>"
+              )
+              f.write(
+                  f"<div class='card'><div>Failed</div><div class='value danger'>"
+                  f"{manifest.get('file_count_failed', 0)}</div></div>"
+              )
+              f.write("</div>")
+
+              f.write("<h2>Reports</h2><ul>")
+              f.write(
+                  "<li><a href='FULL_ANALYSIS_REPORT.md'>FULL_ANALYSIS_REPORT.md</a></li>"
+              )
+              f.write(
+                  "<li><a href='../analysis_manifest.json'>analysis_manifest.json</a></li>"
+              )
+              f.write(
+                  "<li><a href='../analysis_index.csv'>analysis_index.csv</a></li>"
+              )
+              f.write("</ul>")
+
+              f.write("<h2>Files</h2>")
+
+              f.write(
+                  "<table><thead><tr>"
+                  "<th>#</th>"
+                  "<th>Depth</th>"
+                  "<th>File</th>"
+                  "<th>Size</th>"
+                  "<th>SHA256</th>"
+                  "<th>Entropy</th>"
+                  "<th>Functions</th>"
+                  "<th>Unlock</th>"
+                  "<th>Fastboot</th>"
+                  "<th>OEM</th>"
+                  "</tr></thead><tbody>"
+              )
+
+              for row in rows:
+                  f.write(row)
+
+              f.write("</tbody></table>")
+              f.write("</body></html>")
+
+          print(report_html)
+          PYEOF
+
+      - name: Upload All Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcom_bootloader_full_recursive_analysis
+          path: |
+            artifacts/**
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Notify Completion
+        if: success()
+        run: |
+          echo "::notice title=Recursive Bootloader Analysis Complete::ZIP downloaded, recursively extracted, all discovered files analyzed, and reports uploaded as GitHub Artifact."
