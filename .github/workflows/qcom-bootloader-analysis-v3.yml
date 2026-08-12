@@ -1048,8 +1048,19 @@ jobs:
           GHIDRA_DATE="20240709"
           GHIDRA_URL="https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip"
           wget -q "$GHIDRA_URL" -O /tmp/ghidra.zip
+          if ! file /tmp/ghidra.zip | grep -q "Zip archive"; then
+            echo "Downloaded file is not a valid zip archive. Check GHIDRA_VERSION/GHIDRA_DATE/URL." >&2
+            head -c 500 /tmp/ghidra.zip >&2
+            exit 1
+          fi
+          mkdir -p /tmp/ghidra_install
           unzip -q /tmp/ghidra.zip -d /tmp/ghidra_install
-          GHIDRA_DIR=$(find /tmp/ghidra_install -maxdepth 1 -type d -name 'ghidra_*')
+          GHIDRA_DIR=$(find /tmp/ghidra_install -mindepth 1 -maxdepth 1 -type d -name 'ghidra_*' | head -n1)
+          if [ -z "$GHIDRA_DIR" ]; then
+            echo "Ghidra extraction directory not found under /tmp/ghidra_install" >&2
+            find /tmp/ghidra_install -maxdepth 2 >&2
+            exit 1
+          fi
           echo "GHIDRA_HOME=$GHIDRA_DIR" >> "$GITHUB_ENV"
 
       - name: Create Ghidra headless decompile script (Jython)
