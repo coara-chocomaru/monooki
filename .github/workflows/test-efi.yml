@@ -5,14 +5,16 @@ on:
     branches:
       - main
       - dev
+
   pull_request:
     branches:
       - main
+
   workflow_dispatch:
     inputs:
       zip_url:
         description: ZIP URL
-        required: false
+        required: true
         type: string
         default: https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish2.zip
 
@@ -29,11 +31,11 @@ jobs:
       ANALYSIS_ROOT: ${{ github.workspace }}/analysis
       ARTIFACT_ROOT: ${{ github.workspace }}/artifacts
       PYTHONUNBUFFERED: "1"
-      PATH: /usr/local/bin:/usr/bin:/bin
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
 
     steps:
-      - name: Prepare Artifact Directory
+      - name: Initialize Directories
         shell: bash
         run: |
           set -e
@@ -50,13 +52,26 @@ jobs:
             "${ARTIFACT_ROOT}/reports/disassembly" \
             "${ARTIFACT_ROOT}/raw"
 
-          printf '%s\n' \
-            "workflow_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            > "${ARTIFACT_ROOT}/logs/workflow_status.txt"
+          {
+            echo "workflow_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_ref=${GITHUB_REF}"
+            echo "zip_url=${ZIP_URL}"
+          } > "${ARTIFACT_ROOT}/logs/workflow_status.txt"
 
-          printf '%s\n' \
-            "ZIP_URL=${ZIP_URL}" \
-            >> "${ARTIFACT_ROOT}/logs/workflow_status.txt"
+      - name: Verify System PATH
+        shell: bash
+        run: |
+          set -e
+
+          echo "${PATH}"
+
+          command -v sh
+          command -v bash
+          command -v env
+          command -v ls
+          command -v mkdir
 
       - name: Install Base Packages
         shell: bash
@@ -81,11 +96,12 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
           command -v ldconfig
-          ldconfig --version
-
+          command -v ld.so
           command -v curl
           command -v wget
           command -v git
+
+          ldconfig --version
 
       - name: Install Analysis Packages
         shell: bash
@@ -106,6 +122,7 @@ jobs:
             zstd \
             lz4 \
             p7zip-full \
+            p7zip-rar \
             file \
             binutils \
             build-essential \
@@ -139,18 +156,27 @@ jobs:
 
           command -v python3
           command -v pip3
+          command -v gcc
+          command -v g++
+          command -v make
+          command -v cmake
           command -v file
+          command -v strings
           command -v 7z
+          command -v unzip
           command -v tar
           command -v xz
+          command -v gzip
+          command -v bzip2
           command -v ldconfig
 
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+          python3 --version
+          gcc --version | head -n 1
+          make --version | head -n 1
+          file --version | head -n 1
+          ldconfig --version | head -n 1
 
-      - name: Verify Environment
+      - name: Verify Container Environment
         shell: bash
         run: |
           set -e
@@ -171,31 +197,40 @@ jobs:
             echo "===== DISK ====="
             df -h
 
+            echo "===== PATH ====="
+            echo "${PATH}"
+
+            echo "===== LD_LIBRARY_PATH ====="
+            echo "${LD_LIBRARY_PATH}"
+
             echo "===== PYTHON ====="
             python3 --version
 
             echo "===== GCC ====="
             gcc --version | head -n 1
 
-            echo "===== MAKE ====="
-            make --version | head -n 1
+            echo "===== LD CONFIG ====="
+            command -v ldconfig
+            ldconfig --version | head -n 1
 
             echo "===== FILE ====="
             file --version | head -n 1
 
-            echo "===== LD CONFIG ====="
-            ldconfig --version | head -n 1
-
-            echo "===== RADARE PATH ====="
-            echo "${PATH}"
-
-            echo "===== LIBRARY PATH ====="
-            echo "${LD_LIBRARY_PATH}"
+            echo "===== TOOLS ====="
+            command -v strings
+            command -v 7z
+            command -v unzip
+            command -v binwalk
 
           } | tee \
             "${ARTIFACT_ROOT}/logs/environment.txt"
 
-      - name: Install Radare2
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and Install Radare2
         shell: bash
         run: |
           set -e
@@ -220,23 +255,33 @@ jobs:
 
           rm -rf /tmp/radare2
 
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib:/lib"
+
           mkdir -p \
-            /usr/local/lib \
-            /usr/local/bin
+            /usr/local/bin \
+            /usr/local/lib
+
+          command -v ldconfig
 
           ldconfig
 
-          export PATH="/usr/local/bin:${PATH}"
-          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
-
           command -v r2
-          command -v rabin2
           command -v rabin2
           command -v rasm2
 
           r2 -v
           rabin2 -v
-          rabin2 -L
+          rasm2 -v
+
+          {
+            echo "r2=$(command -v r2)"
+            echo "rabin2=$(command -v rabin2)"
+            echo "rasm2=$(command -v rasm2)"
+            r2 -v
+          } | tee \
+            "${ARTIFACT_ROOT}/logs/radare2.txt"
 
       - name: Install Python Libraries
         shell: bash
@@ -273,7 +318,7 @@ jobs:
 
           for module in modules:
               importlib.import_module(module)
-              print(f"OK: {module}")
+              print(f"OK {module}")
           PYEOF
 
       - name: Download ZIP
@@ -333,7 +378,7 @@ jobs:
             -t \
             "${ANALYSIS_ROOT}/input/source.zip" \
             | tee \
-            "${ARTIFACT_ROOT}/logs/zip_test.txt"
+            "${ARTIFACT_ROOT}/logs/source_zip_test.txt"
 
       - name: Create Recursive Analysis Script
         shell: bash
@@ -356,8 +401,9 @@ jobs:
           import bz2
           import lzma
           import re
-          import mimetypes
           import traceback
+          import csv
+          import html
 
           from pathlib import Path
           from collections import deque
@@ -372,7 +418,7 @@ jobs:
               os.environ["ARTIFACT_ROOT"]
           )
 
-          INPUT = (
+          INPUT_ZIP = (
               ROOT
               / "input"
               / "source.zip"
@@ -383,7 +429,7 @@ jobs:
               / "files"
           )
 
-          EXTRACT_ROOT = (
+          EXTRACTION_ROOT = (
               ROOT
               / "extracted"
           )
@@ -403,7 +449,7 @@ jobs:
               / "files"
           )
 
-          REPORT_DISASM_ROOT = (
+          DISASSEMBLY_ROOT = (
               REPORT_ROOT
               / "disassembly"
           )
@@ -421,7 +467,8 @@ jobs:
           MAX_ARCHIVE_DEPTH = 32
           MAX_FILES = 100000
           MAX_DECOMPRESSED_FILE_SIZE = 1024 * 1024 * 1024
-          MAX_STRING_OUTPUT = 2000000
+          MAX_STRING_OUTPUT = 5000000
+          BLOCK_SIZE = 65536
           READ_CHUNK = 1024 * 1024
 
           FASTBOOT_KEYWORDS = [
@@ -461,20 +508,19 @@ jobs:
 
           UNLOCK_KEYWORDS = [
               "unlock",
-              "locked",
               "unlocked",
-              "oem_unlock",
-              "device_locked",
-              "device_unlocked",
-              "lock_state",
-              "secure_boot",
               "unlock_ability",
               "allow_unlock",
               "unlock_code",
               "unlock-go",
               "unlock_go",
+              "oem_unlock",
+              "device_unlocked",
+              "device_locked",
               "is_unlocked",
               "is_locked",
+              "lock_state",
+              "secure_boot",
               "flashing_unlock",
               "get_unlock_ability"
           ]
@@ -498,7 +544,7 @@ jobs:
               "abl"
           ]
 
-          OEM_COMMAND_PATTERNS = [
+          OEM_PATTERNS = [
               r"oem\s+unlock",
               r"oem\s+lock",
               r"oem\s+device-info",
@@ -518,25 +564,26 @@ jobs:
               r"allow_unlock"
           ]
 
-          FILE_MAGIC_PATTERNS = {
-              "elf": b"\x7fELF",
-              "pe": b"MZ",
-              "zip": b"PK\x03\x04",
-              "gzip": b"\x1f\x8b",
-              "bzip2": b"BZh",
-              "xz": b"\xfd7zXZ\x00",
-              "7z": b"7z\xbc\xaf\x27\x1c",
-              "png": b"\x89PNG\r\n\x1a\n",
-              "jpeg": b"\xff\xd8\xff",
-              "bmp": b"BM",
-              "pdf": b"%PDF",
-              "sqlite": b"SQLite format 3\x00"
+          MAGIC_PATTERNS = {
+              "ELF": b"\x7fELF",
+              "PE": b"MZ",
+              "ZIP": b"PK\x03\x04",
+              "ZIP_EMPTY": b"PK\x05\x06",
+              "ZIP_SPANNED": b"PK\x07\x08",
+              "GZIP": b"\x1f\x8b",
+              "BZIP2": b"BZh",
+              "XZ": b"\xfd7zXZ\x00",
+              "7Z": b"7z\xbc\xaf\x27\x1c",
+              "PDF": b"%PDF",
+              "PNG": b"\x89PNG\r\n\x1a\n",
+              "JPEG": b"\xff\xd8\xff",
+              "BMP": b"BM",
+              "SQLITE": b"SQLite format 3\x00"
           }
 
           def run_command(
               command,
-              timeout=300,
-              cwd=None
+              timeout=300
           ):
               try:
                   process = subprocess.run(
@@ -545,8 +592,7 @@ jobs:
                       stderr=subprocess.STDOUT,
                       text=True,
                       errors="replace",
-                      timeout=timeout,
-                      cwd=cwd
+                      timeout=timeout
                   )
 
                   return (
@@ -578,11 +624,9 @@ jobs:
 
           def safe_name(
               value,
-              limit=180
+              maximum=180
           ):
-              value = str(
-                  value
-              )
+              value = str(value)
 
               value = value.replace(
                   "\\",
@@ -595,7 +639,7 @@ jobs:
               )
 
               value = re.sub(
-                  r"[^A-Za-z0-9._@+-]+",
+                  r"[^A-Za-z0-9._@+\-=]+",
                   "_",
                   value
               )
@@ -607,9 +651,7 @@ jobs:
               if not value:
                   value = "file"
 
-              return value[
-                  :limit
-              ]
+              return value[:maximum]
 
           def sha256_file(
               path
@@ -657,7 +699,40 @@ jobs:
 
               return digest.hexdigest()
 
-          def calculate_entropy(
+          def entropy_bytes(
+              data
+          ):
+              if not data:
+                  return 0.0
+
+              counts = [
+                  0
+                  for _ in range(256)
+              ]
+
+              for value in data:
+                  counts[value] += 1
+
+              total = len(data)
+              result = 0.0
+
+              for count in counts:
+                  if count:
+                      probability = (
+                          count
+                          / total
+                      )
+
+                      result -= (
+                          probability
+                          * math.log2(
+                              probability
+                          )
+                      )
+
+              return result
+
+          def entropy_file(
               path
           ):
               counts = [
@@ -707,45 +782,8 @@ jobs:
 
               return result
 
-          def calculate_block_entropy(
-              data
-          ):
-              if not data:
-                  return 0.0
-
-              counts = [
-                  0
-                  for _ in range(256)
-              ]
-
-              for value in data:
-                  counts[value] += 1
-
-              total = len(
-                  data
-              )
-
-              result = 0.0
-
-              for count in counts:
-                  if count:
-                      probability = (
-                          count
-                          / total
-                      )
-
-                      result -= (
-                          probability
-                          * math.log2(
-                              probability
-                          )
-                      )
-
-              return result
-
           def entropy_regions(
               path,
-              block_size=65536,
               threshold=7.0
           ):
               result = []
@@ -757,16 +795,14 @@ jobs:
               ) as source:
                   while True:
                       block = source.read(
-                          block_size
+                          BLOCK_SIZE
                       )
 
                       if not block:
                           break
 
-                      value = (
-                          calculate_block_entropy(
-                              block
-                          )
+                      value = entropy_bytes(
+                          block
                       )
 
                       if value >= threshold:
@@ -789,52 +825,7 @@ jobs:
 
               return result
 
-          def hex_preview(
-              path,
-              size=4096
-          ):
-              with open(
-                  path,
-                  "rb"
-              ) as source:
-                  data = source.read(
-                      size
-                  )
-
-              result = []
-
-              for index in range(
-                  0,
-                  len(data),
-                  16
-              ):
-                  block = data[
-                      index:index + 16
-                  ]
-
-                  hex_part = " ".join(
-                      f"{value:02x}"
-                      for value in block
-                  )
-
-                  ascii_part = "".join(
-                      chr(value)
-                      if 32 <= value <= 126
-                      else "."
-                      for value in block
-                  )
-
-                  result.append(
-                      f"{index:08x}  "
-                      f"{hex_part:<47}  "
-                      f"{ascii_part}"
-                  )
-
-              return "\n".join(
-                  result
-              )
-
-          def initial_magic(
+          def first_magic(
               path
           ):
               try:
@@ -846,7 +837,7 @@ jobs:
                           64
                       )
 
-                  for name, magic in FILE_MAGIC_PATTERNS.items():
+                  for name, magic in MAGIC_PATTERNS.items():
                       if data.startswith(
                           magic
                       ):
@@ -855,9 +846,9 @@ jobs:
               except Exception:
                   pass
 
-              return "unknown"
+              return "UNKNOWN"
 
-          def detect_file(
+          def file_information(
               path
           ):
               code, output = run_command(
@@ -884,15 +875,15 @@ jobs:
                   "description_exit_code": code,
                   "mime": mime_output.strip(),
                   "mime_exit_code": mime_code,
-                  "magic_prefix": initial_magic(
+                  "magic_prefix": first_magic(
                       path
                   )
               }
 
-          def extract_strings(
+          def string_information(
               path
           ):
-              code_ascii, ascii_output = run_command(
+              ascii_code, ascii_output = run_command(
                   [
                       "strings",
                       "-a",
@@ -905,7 +896,7 @@ jobs:
                   timeout=1200
               )
 
-              code_utf16, utf16_output = run_command(
+              utf16_code, utf16_output = run_command(
                   [
                       "strings",
                       "-a",
@@ -919,12 +910,16 @@ jobs:
                   timeout=1200
               )
 
-              if len(ascii_output) > MAX_STRING_OUTPUT:
+              if len(
+                  ascii_output
+              ) > MAX_STRING_OUTPUT:
                   ascii_output = ascii_output[
                       :MAX_STRING_OUTPUT
                   ]
 
-              if len(utf16_output) > MAX_STRING_OUTPUT:
+              if len(
+                  utf16_output
+              ) > MAX_STRING_OUTPUT:
                   utf16_output = utf16_output[
                       :MAX_STRING_OUTPUT
                   ]
@@ -932,13 +927,58 @@ jobs:
               return {
                   "ascii": ascii_output,
                   "utf16le": utf16_output,
-                  "ascii_exit_code": code_ascii,
-                  "utf16le_exit_code": code_utf16
+                  "ascii_exit_code": ascii_code,
+                  "utf16le_exit_code": utf16_code
               }
+
+          def hex_dump(
+              path,
+              limit=16384
+          ):
+              with open(
+                  path,
+                  "rb"
+              ) as source:
+                  data = source.read(
+                      limit
+                  )
+
+              lines = []
+
+              for offset in range(
+                  0,
+                  len(data),
+                  16
+              ):
+                  block = data[
+                      offset:offset + 16
+                  ]
+
+                  hex_part = " ".join(
+                      f"{value:02x}"
+                      for value in block
+                  )
+
+                  ascii_part = "".join(
+                      chr(value)
+                      if 32 <= value <= 126
+                      else "."
+                      for value in block
+                  )
+
+                  lines.append(
+                      f"{offset:08x}  "
+                      f"{hex_part:<47}  "
+                      f"{ascii_part}"
+                  )
+
+              return "\n".join(
+                  lines
+              )
 
           def safe_extract_path(
               destination,
-              name
+              member_name
           ):
               destination_real = os.path.realpath(
                   destination
@@ -947,7 +987,7 @@ jobs:
               target_real = os.path.realpath(
                   os.path.join(
                       destination,
-                      name
+                      member_name
                   )
               )
 
@@ -960,33 +1000,37 @@ jobs:
               )
 
           def extract_zip(
-              path,
+              source,
               destination
           ):
+              destination = str(
+                  destination
+              )
+
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              result = []
+              files = []
 
               with zipfile.ZipFile(
-                  path,
+                  source,
                   "r"
               ) as archive:
 
                   for member in archive.infolist():
-                      name = member.filename
+                      member_name = member.filename
 
                       if not safe_extract_path(
                           destination,
-                          name
+                          member_name
                       ):
                           continue
 
                       target = os.path.join(
                           destination,
-                          name
+                          member_name
                       )
 
                       if member.is_dir():
@@ -1007,49 +1051,64 @@ jobs:
                       with archive.open(
                           member,
                           "r"
-                      ) as source:
+                      ) as input_file:
                           with open(
                               target,
                               "wb"
-                          ) as output:
-                              shutil.copyfileobj(
-                                  source,
-                                  output,
-                                  READ_CHUNK
-                              )
+                          ) as output_file:
 
-                      if not os.path.isfile(
+                              total = 0
+
+                              while True:
+                                  chunk = input_file.read(
+                                      READ_CHUNK
+                                  )
+
+                                  if not chunk:
+                                      break
+
+                                  total += len(
+                                      chunk
+                                  )
+
+                                  if (
+                                      total
+                                      > MAX_DECOMPRESSED_FILE_SIZE
+                                  ):
+                                      raise RuntimeError(
+                                          f"Archive member too large: {member_name}"
+                                      )
+
+                                  output_file.write(
+                                      chunk
+                                  )
+
+                      if os.path.isfile(
                           target
                       ):
-                          continue
-
-                      size = os.path.getsize(
-                          target
-                      )
-
-                      if (
-                          size
-                          <= MAX_DECOMPRESSED_FILE_SIZE
-                      ):
-                          result.append(
+                          files.append(
                               target
                           )
 
-              return result
+              return files
 
           def extract_tar(
-              path,
+              source,
               destination
           ):
+              destination = str(
+                  destination
+              )
+
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              result = []
+              files = []
 
               with tarfile.open(
-                  path,
+                  source,
                   "r:*"
               ) as archive:
 
@@ -1081,11 +1140,11 @@ jobs:
 
                           continue
 
-                      source = archive.extractfile(
+                      input_file = archive.extractfile(
                           member
                       )
 
-                      if source is None:
+                      if input_file is None:
                           continue
 
                       os.makedirs(
@@ -1095,40 +1154,55 @@ jobs:
                           exist_ok=True
                       )
 
-                      with source:
+                      with input_file:
                           with open(
                               target,
                               "wb"
-                          ) as output:
-                              shutil.copyfileobj(
-                                  source,
-                                  output,
-                                  READ_CHUNK
-                              )
+                          ) as output_file:
 
-                      if not os.path.isfile(
+                              total = 0
+
+                              while True:
+                                  chunk = input_file.read(
+                                      READ_CHUNK
+                                  )
+
+                                  if not chunk:
+                                      break
+
+                                  total += len(
+                                      chunk
+                                  )
+
+                                  if (
+                                      total
+                                      > MAX_DECOMPRESSED_FILE_SIZE
+                                  ):
+                                      raise RuntimeError(
+                                          f"Archive member too large: {member.name}"
+                                      )
+
+                                  output_file.write(
+                                      chunk
+                                  )
+
+                      if os.path.isfile(
                           target
                       ):
-                          continue
-
-                      size = os.path.getsize(
-                          target
-                      )
-
-                      if (
-                          size
-                          <= MAX_DECOMPRESSED_FILE_SIZE
-                      ):
-                          result.append(
+                          files.append(
                               target
                           )
 
-              return result
+              return files
 
           def extract_7z(
-              path,
+              source,
               destination
           ):
+              destination = str(
+                  destination
+              )
+
               os.makedirs(
                   destination,
                   exist_ok=True
@@ -1141,27 +1215,20 @@ jobs:
                       "-y",
                       "-bd",
                       f"-o{destination}",
-                      path
+                      str(source)
                   ],
                   timeout=1800
               )
 
-              result = []
+              files = []
 
-              if code != 0:
-                  return (
-                      result,
-                      code,
-                      output
-                  )
-
-              for root, _, filenames in os.walk(
+              for root, _, names in os.walk(
                   destination
               ):
-                  for filename in filenames:
+                  for name in names:
                       current = os.path.join(
                           root,
-                          filename
+                          name
                       )
 
                       if not os.path.isfile(
@@ -1180,31 +1247,35 @@ jobs:
                           size
                           <= MAX_DECOMPRESSED_FILE_SIZE
                       ):
-                          result.append(
+                          files.append(
                               current
                           )
 
               return (
-                  result,
+                  files,
                   code,
                   output
               )
 
           def extract_stream(
-              path,
+              source,
               destination
           ):
-              os.makedirs(
-                  destination,
+              destination = Path(
+                  destination
+              )
+
+              destination.mkdir(
+                  parents=True,
                   exist_ok=True
               )
 
               try:
                   with open(
-                      path,
+                      source,
                       "rb"
-                  ) as source:
-                      magic = source.read(
+                  ) as input_file:
+                      magic = input_file.read(
                           16
                       )
               except Exception:
@@ -1228,29 +1299,33 @@ jobs:
               else:
                   return []
 
-              output_path = (
-                  Path(destination)
+              output = (
+                  destination
                   / (
                       safe_name(
-                          Path(path).name
+                          Path(
+                              source
+                          ).name
                       )
                       + ".decompressed"
                   )
               )
 
               try:
+                  total = 0
+
                   with opener(
-                      path,
+                      source,
                       "rb"
-                  ) as source:
+                  ) as input_file:
+
                       with open(
-                          output_path,
+                          output,
                           "wb"
-                      ) as output:
-                          total = 0
+                      ) as output_file:
 
                           while True:
-                              chunk = source.read(
+                              chunk = input_file.read(
                                   READ_CHUNK
                               )
 
@@ -1266,26 +1341,26 @@ jobs:
                                   > MAX_DECOMPRESSED_FILE_SIZE
                               ):
                                   raise RuntimeError(
-                                      "Decompressed size limit exceeded"
+                                      "Decompressed stream exceeded size limit"
                                   )
 
-                              output.write(
+                              output_file.write(
                                   chunk
                               )
 
                   if (
-                      not output_path.is_file()
-                      or output_path.stat().st_size <= 0
+                      not output.is_file()
+                      or output.stat().st_size <= 0
                   ):
                       return []
 
                   return [
-                      str(output_path)
+                      str(output)
                   ]
 
               except Exception:
                   try:
-                      output_path.unlink(
+                      output.unlink(
                           missing_ok=True
                       )
                   except Exception:
@@ -1294,9 +1369,13 @@ jobs:
                   return []
 
           def extract_binwalk(
-              path,
+              source,
               destination
           ):
+              destination = str(
+                  destination
+              )
+
               os.makedirs(
                   destination,
                   exist_ok=True
@@ -1308,20 +1387,20 @@ jobs:
                       "-Me",
                       "--run-as=root",
                       "--directory=" + destination,
-                      path
+                      str(source)
                   ],
                   timeout=1800
               )
 
-              result = []
+              files = []
 
-              for root, _, filenames in os.walk(
+              for root, _, names in os.walk(
                   destination
               ):
-                  for filename in filenames:
+                  for name in names:
                       current = os.path.join(
                           root,
-                          filename
+                          name
                       )
 
                       if not os.path.isfile(
@@ -1340,44 +1419,60 @@ jobs:
                           size
                           <= MAX_DECOMPRESSED_FILE_SIZE
                       ):
-                          result.append(
+                          files.append(
                               current
                           )
 
               return (
-                  result,
+                  files,
                   code,
                   output
               )
 
-          def extract_recursive_layers(
-              source_path,
+          def recursively_extract(
+              current_path,
               relative_name,
               depth,
-              known_hashes,
-              extraction_records
+              expansion_hashes,
+              extraction_log
           ):
               if depth > MAX_ARCHIVE_DEPTH:
                   return []
 
-              generated = []
+              try:
+                  current_hash = sha256_file(
+                      current_path
+                  )
+              except Exception as exc:
+                  extraction_log.append(
+                      {
+                          "source": str(
+                              current_path
+                          ),
+                          "depth": depth,
+                          "method": "hash",
+                          "success": False,
+                          "error": str(exc)
+                      }
+                  )
 
-              source_hash = sha256_file(
-                  source_path
-              )
-
-              if source_hash in known_hashes:
                   return []
 
-              known_hashes.add(
-                  source_hash
+              if current_hash in expansion_hashes:
+                  return []
+
+              expansion_hashes.add(
+                  current_hash
               )
 
               base = (
-                  EXTRACT_ROOT
+                  EXTRACTION_ROOT
                   / (
-                      f"{source_hash[:16]}_"
-                      f"{safe_name(relative_name)}"
+                      current_hash[:16]
+                      + "_"
+                      + safe_name(
+                          relative_name
+                      )
                   )
               )
 
@@ -1386,9 +1481,11 @@ jobs:
                   exist_ok=True
               )
 
+              generated = []
+
               try:
                   if zipfile.is_zipfile(
-                      source_path
+                      current_path
                   ):
                       destination = (
                           base
@@ -1397,7 +1494,7 @@ jobs:
 
                       try:
                           files = extract_zip(
-                              source_path,
+                              current_path,
                               destination
                           )
 
@@ -1405,9 +1502,11 @@ jobs:
                               files
                           )
 
-                          extraction_records.append(
+                          extraction_log.append(
                               {
-                                  "source": source_path,
+                                  "source": str(
+                                      current_path
+                                  ),
                                   "depth": depth,
                                   "method": "zip",
                                   "success": True,
@@ -1418,9 +1517,11 @@ jobs:
                           )
 
                       except Exception as exc:
-                          extraction_records.append(
+                          extraction_log.append(
                               {
-                                  "source": source_path,
+                                  "source": str(
+                                      current_path
+                                  ),
                                   "depth": depth,
                                   "method": "zip",
                                   "success": False,
@@ -1429,21 +1530,12 @@ jobs:
                               }
                           )
 
-              except Exception as exc:
-                  extraction_records.append(
-                      {
-                          "source": source_path,
-                          "depth": depth,
-                          "method": "zip_detection",
-                          "success": False,
-                          "count": 0,
-                          "error": str(exc)
-                      }
-                  )
+              except Exception:
+                  pass
 
               try:
                   if tarfile.is_tarfile(
-                      source_path
+                      current_path
                   ):
                       destination = (
                           base
@@ -1452,7 +1544,7 @@ jobs:
 
                       try:
                           files = extract_tar(
-                              source_path,
+                              current_path,
                               destination
                           )
 
@@ -1460,9 +1552,11 @@ jobs:
                               files
                           )
 
-                          extraction_records.append(
+                          extraction_log.append(
                               {
-                                  "source": source_path,
+                                  "source": str(
+                                      current_path
+                                  ),
                                   "depth": depth,
                                   "method": "tar",
                                   "success": True,
@@ -1473,9 +1567,11 @@ jobs:
                           )
 
                       except Exception as exc:
-                          extraction_records.append(
+                          extraction_log.append(
                               {
-                                  "source": source_path,
+                                  "source": str(
+                                      current_path
+                                  ),
                                   "depth": depth,
                                   "method": "tar",
                                   "success": False,
@@ -1489,7 +1585,7 @@ jobs:
 
               try:
                   with open(
-                      source_path,
+                      current_path,
                       "rb"
                   ) as source:
                       magic = source.read(
@@ -1509,7 +1605,7 @@ jobs:
                           code,
                           output
                       ) = extract_7z(
-                          source_path,
+                          current_path,
                           destination
                       )
 
@@ -1517,9 +1613,11 @@ jobs:
                           files
                       )
 
-                      extraction_records.append(
+                      extraction_log.append(
                           {
-                              "source": source_path,
+                              "source": str(
+                                  current_path
+                              ),
                               "depth": depth,
                               "method": "7z",
                               "success": code == 0,
@@ -1542,7 +1640,7 @@ jobs:
                   )
 
                   files = extract_stream(
-                      source_path,
+                      current_path,
                       destination
                   )
 
@@ -1550,19 +1648,20 @@ jobs:
                       files
                   )
 
-                  extraction_records.append(
-                      {
-                          "source": source_path,
-                          "depth": depth,
-                          "method": "stream",
-                          "success": bool(
-                              files
-                          ),
-                          "count": len(
-                              files
-                          )
-                      }
-                  )
+                  if files:
+                      extraction_log.append(
+                          {
+                              "source": str(
+                                  current_path
+                              ),
+                              "depth": depth,
+                              "method": "stream",
+                              "success": True,
+                              "count": len(
+                                  files
+                              )
+                          }
+                      )
 
               except Exception:
                   pass
@@ -1578,7 +1677,7 @@ jobs:
                       code,
                       output
                   ) = extract_binwalk(
-                      source_path,
+                      current_path,
                       destination
                   )
 
@@ -1586,9 +1685,11 @@ jobs:
                       files
                   )
 
-                  extraction_records.append(
+                  extraction_log.append(
                       {
-                          "source": source_path,
+                          "source": str(
+                              current_path
+                          ),
                           "depth": depth,
                           "method": "binwalk",
                           "success": code == 0,
@@ -1602,9 +1703,11 @@ jobs:
                   )
 
               except Exception as exc:
-                  extraction_records.append(
+                  extraction_log.append(
                       {
-                          "source": source_path,
+                          "source": str(
+                              current_path
+                          ),
                           "depth": depth,
                           "method": "binwalk",
                           "success": False,
@@ -1613,47 +1716,44 @@ jobs:
                       }
                   )
 
-              unique = []
+              generated_unique = []
               local_hashes = set()
 
-              for generated_path in generated:
+              for item in generated:
                   if not os.path.isfile(
-                      generated_path
+                      item
                   ):
                       continue
 
                   try:
-                      generated_hash = (
-                          sha256_file(
-                              generated_path
-                          )
+                      item_hash = sha256_file(
+                          item
                       )
                   except Exception:
                       continue
 
-                  if generated_hash == source_hash:
+                  if item_hash == current_hash:
                       continue
 
-                  if generated_hash in local_hashes:
-                      continue
-
-                  if generated_hash in known_hashes:
+                  if item_hash in local_hashes:
                       continue
 
                   local_hashes.add(
-                      generated_hash
+                      item_hash
                   )
 
-                  unique.append(
+                  generated_unique.append(
                       {
-                          "path": generated_path,
-                          "parent": source_path,
+                          "path": item,
+                          "parent": str(
+                              current_path
+                          ),
                           "depth": depth + 1,
-                          "sha256": generated_hash
+                          "sha256": item_hash
                       }
                   )
 
-              return unique
+              return generated_unique
 
           def r2_json(
               r2,
@@ -1672,7 +1772,7 @@ jobs:
               except Exception:
                   return []
 
-          def analyze_with_r2(
+          def r2_analysis(
               path,
               base_name
           ):
@@ -1704,7 +1804,9 @@ jobs:
               except Exception as exc:
                   result[
                       "open_error"
-                  ] = str(exc)
+                  ] = str(
+                      exc
+                  )
 
                   return result
 
@@ -1762,18 +1864,33 @@ jobs:
                       "iej"
                   )
 
-                  for command in [
-                      "aaa",
-                      "aac",
-                      "aav",
-                      "aaf"
-                  ]:
-                      try:
-                          r2.cmd(
-                              command
-                          )
-                      except Exception:
-                          pass
+                  try:
+                      r2.cmd(
+                          "aaa"
+                      )
+                  except Exception:
+                      pass
+
+                  try:
+                      r2.cmd(
+                          "aac"
+                      )
+                  except Exception:
+                      pass
+
+                  try:
+                      r2.cmd(
+                          "aav"
+                      )
+                  except Exception:
+                      pass
+
+                  try:
+                      r2.cmd(
+                          "aaf"
+                      )
+                  except Exception:
+                      pass
 
                   result[
                       "functions"
@@ -1801,7 +1918,7 @@ jobs:
                   )
 
                   disassembly_path = (
-                      REPORT_DISASM_ROOT
+                      DISASSEMBLY_ROOT
                       / f"{base_name}.asm"
                   )
 
@@ -1818,11 +1935,35 @@ jobs:
                   ) as output:
 
                       output.write(
-                          "===== FILE =====\n"
+                          "===== FILE INFORMATION =====\n"
                       )
 
                       output.write(
-                          str(path)
+                          json.dumps(
+                              result[
+                                  "info"
+                              ],
+                              indent=2,
+                              ensure_ascii=False
+                          )
+                      )
+
+                      output.write(
+                          "\n\n"
+                      )
+
+                      output.write(
+                          "===== ENTRYPOINTS =====\n"
+                      )
+
+                      output.write(
+                          json.dumps(
+                              result[
+                                  "entrypoints"
+                              ],
+                              indent=2,
+                              ensure_ascii=False
+                          )
                       )
 
                       output.write(
@@ -1859,7 +2000,7 @@ jobs:
                           )
 
                           output.write(
-                              f"INDEX={index}\n"
+                              f"FUNCTION_INDEX={index}\n"
                           )
 
                           output.write(
@@ -1876,18 +2017,18 @@ jobs:
                           )
 
                           try:
-                              disassembly = r2.cmd(
+                              text = r2.cmd(
                                   f"pdf @ {address}"
                               )
                           except Exception as exc:
-                              disassembly = (
+                              text = (
                                   "DISASSEMBLY_ERROR: "
                                   + str(exc)
                                   + "\n"
                               )
 
                           output.write(
-                              disassembly
+                              text
                           )
 
                           output.write(
@@ -1901,7 +2042,7 @@ jobs:
                   )
 
                   entry_path = (
-                      REPORT_DISASM_ROOT
+                      DISASSEMBLY_ROOT
                       / f"{base_name}_entry.asm"
                   )
 
@@ -1910,23 +2051,14 @@ jobs:
                       exist_ok=True
                   )
 
-                  entry_text = ""
-
                   try:
                       entry_text = r2.cmd(
-                          "pd 1024 @ entry0"
+                          "pd 2048 @ entry0"
                       )
-
-                  except Exception:
-                      try:
-                          entry_text = r2.cmd(
-                              "pd 1024 @ eip"
-                          )
-
-                      except Exception as exc:
-                          entry_text = str(
-                              exc
-                          )
+                  except Exception as exc:
+                      entry_text = str(
+                          exc
+                      )
 
                   with open(
                       entry_path,
@@ -1947,7 +2079,9 @@ jobs:
               except Exception as exc:
                   result[
                       "analysis_error"
-                  ] = str(exc)
+                  ] = str(
+                      exc
+                  )
 
               finally:
                   try:
@@ -1957,7 +2091,7 @@ jobs:
 
               return result
 
-          def match_strings(
+          def keyword_matches(
               strings
           ):
               result = {
@@ -2041,7 +2175,7 @@ jobs:
 
                           break
 
-                  for pattern in OEM_COMMAND_PATTERNS:
+                  for pattern in OEM_PATTERNS:
                       try:
                           if re.search(
                               pattern,
@@ -2144,6 +2278,10 @@ jobs:
               parent,
               depth
           ):
+              path = str(
+                  path
+              )
+
               file_hash = sha256_file(
                   path
               )
@@ -2192,11 +2330,11 @@ jobs:
                   exist_ok=True
               )
 
-              detection = detect_file(
+              info = file_information(
                   path
               )
 
-              strings = extract_strings(
+              strings = string_information(
                   path
               )
 
@@ -2228,36 +2366,36 @@ jobs:
 
               with open(
                   raw_dir
-                  / "hex_preview.txt",
+                  / "hex_dump.txt",
                   "w",
                   encoding="utf-8"
               ) as output:
                   output.write(
-                      hex_preview(
+                      hex_dump(
                           path
                       )
                   )
 
               try:
-                  entropy = calculate_entropy(
+                  entropy = entropy_file(
                       path
                   )
               except Exception:
                   entropy = 0.0
 
               try:
-                  entropy_blocks = entropy_regions(
+                  high_entropy = entropy_regions(
                       path
                   )
               except Exception:
-                  entropy_blocks = []
+                  high_entropy = []
 
-              r2 = analyze_with_r2(
+              r2 = r2_analysis(
                   path,
                   base_name
               )
 
-              matches = match_strings(
+              matches = keyword_matches(
                   r2.get(
                       "strings",
                       []
@@ -2273,7 +2411,10 @@ jobs:
 
               original_copy = None
 
-              if size <= 64 * 1024 * 1024:
+              if (
+                  size
+                  <= 64 * 1024 * 1024
+              ):
                   target = (
                       raw_dir
                       / "original.bin"
@@ -2292,7 +2433,7 @@ jobs:
                   except Exception:
                       original_copy = None
 
-              result = {
+              data = {
                   "sequence": sequence,
                   "relative_name": relative_name,
                   "path": path,
@@ -2301,19 +2442,25 @@ jobs:
                   "size": size,
                   "sha256": file_hash,
                   "md5": file_md5,
-                  "file_description": detection[
+                  "file_description": info[
                       "description"
                   ],
-                  "mime": detection[
+                  "file_description_exit_code": info[
+                      "description_exit_code"
+                  ],
+                  "mime": info[
                       "mime"
                   ],
-                  "magic_prefix": detection[
+                  "mime_exit_code": info[
+                      "mime_exit_code"
+                  ],
+                  "magic_prefix": info[
                       "magic_prefix"
                   ],
                   "entropy": entropy,
-                  "high_entropy_blocks": entropy_blocks,
+                  "high_entropy_blocks": high_entropy,
                   "high_entropy_block_count": len(
-                      entropy_blocks
+                      high_entropy
                   ),
                   "fastboot_matches": matches[
                       "fastboot"
@@ -2332,25 +2479,19 @@ jobs:
                   "raw_directory": str(
                       raw_dir
                   ),
-                  "ascii_strings": str(
+                  "ascii_strings_file": str(
                       raw_dir
                       / "ascii_strings.txt"
                   ),
-                  "utf16le_strings": str(
+                  "utf16le_strings_file": str(
                       raw_dir
                       / "utf16le_strings.txt"
                   ),
-                  "hex_preview": str(
+                  "hex_dump_file": str(
                       raw_dir
-                      / "hex_preview.txt"
+                      / "hex_dump.txt"
                   ),
-                  "original_copy": original_copy,
-                  "disassembly_file": r2.get(
-                      "disassembly_file"
-                  ),
-                  "entry_disassembly_file": r2.get(
-                      "entry_disassembly_file"
-                  )
+                  "original_copy": original_copy
               }
 
               with open(
@@ -2359,7 +2500,7 @@ jobs:
                   encoding="utf-8"
               ) as output:
                   json.dump(
-                      result,
+                      data,
                       output,
                       indent=2,
                       ensure_ascii=False
@@ -2404,15 +2545,15 @@ jobs:
                   )
 
                   output.write(
-                      f"| File | `{detection['description']}` |\n"
+                      f"| Type | `{info['description']}` |\n"
                   )
 
                   output.write(
-                      f"| MIME | `{detection['mime']}` |\n"
+                      f"| MIME | `{info['mime']}` |\n"
                   )
 
                   output.write(
-                      f"| Magic | `{detection['magic_prefix']}` |\n"
+                      f"| Magic | `{info['magic_prefix']}` |\n"
                   )
 
                   output.write(
@@ -2420,7 +2561,7 @@ jobs:
                   )
 
                   output.write(
-                      f"| Depth | `{depth}` |\n"
+                      f"| Recursion Depth | `{depth}` |\n"
                   )
 
                   output.write(
@@ -2449,6 +2590,7 @@ jobs:
                       for item in matches[
                           "fastboot"
                       ]:
+
                           text = str(
                               item[
                                   "string"
@@ -2463,7 +2605,6 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
-
                   else:
                       output.write(
                           "No matches.\n"
@@ -2488,6 +2629,7 @@ jobs:
                       for item in matches[
                           "unlock"
                       ]:
+
                           text = str(
                               item[
                                   "string"
@@ -2502,7 +2644,6 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
-
                   else:
                       output.write(
                           "No matches.\n"
@@ -2527,6 +2668,7 @@ jobs:
                       for item in matches[
                           "vendor"
                       ]:
+
                           text = str(
                               item[
                                   "string"
@@ -2541,7 +2683,6 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
-
                   else:
                       output.write(
                           "No matches.\n"
@@ -2566,6 +2707,7 @@ jobs:
                       for item in matches[
                           "oem"
                       ]:
+
                           text = str(
                               item[
                                   "string"
@@ -2580,7 +2722,6 @@ jobs:
                               f"`{item['pattern']}` | "
                               f"`{text}` |\n"
                           )
-
                   else:
                       output.write(
                           "No matches.\n"
@@ -2596,7 +2737,6 @@ jobs:
                           output.write(
                               f"- `{value}`\n"
                           )
-
                   else:
                       output.write(
                           "No partition candidates.\n"
@@ -2607,7 +2747,7 @@ jobs:
                       "## High Entropy Blocks\n\n"
                   )
 
-                  if entropy_blocks:
+                  if high_entropy:
                       output.write(
                           "| Offset | Size | Entropy |\n"
                       )
@@ -2616,13 +2756,12 @@ jobs:
                           "|---:|---:|---:|\n"
                       )
 
-                      for block in entropy_blocks:
+                      for block in high_entropy:
                           output.write(
                               f"| `0x{block['offset']:x}` | "
                               f"`{block['size']}` | "
                               f"`{block['entropy']}` |\n"
                           )
-
                   else:
                       output.write(
                           "No high entropy blocks.\n"
@@ -2630,7 +2769,7 @@ jobs:
 
                   output.write(
                       "\n"
-                      "## R2 Information\n\n"
+                      "## Radare2 Analysis\n\n"
                   )
 
                   output.write(
@@ -2651,7 +2790,7 @@ jobs:
 
                   output.write(
                       "\n"
-                      "## Generated Files\n\n"
+                      "## Generated Raw Files\n\n"
                   )
 
                   output.write(
@@ -2663,7 +2802,7 @@ jobs:
                   )
 
                   output.write(
-                      f"- `{raw_dir / 'hex_preview.txt'}`\n"
+                      f"- `{raw_dir / 'hex_dump.txt'}`\n"
                   )
 
                   if original_copy:
@@ -2694,13 +2833,13 @@ jobs:
                   "size": size,
                   "sha256": file_hash,
                   "md5": file_md5,
-                  "file_description": detection[
+                  "file_description": info[
                       "description"
                   ],
-                  "mime": detection[
+                  "mime": info[
                       "mime"
                   ],
-                  "magic_prefix": detection[
+                  "magic_prefix": info[
                       "magic_prefix"
                   ],
                   "entropy": entropy,
@@ -2735,7 +2874,7 @@ jobs:
                       partitions
                   ),
                   "high_entropy_block_count": len(
-                      entropy_blocks
+                      high_entropy
                   ),
                   "report_markdown": str(
                       report_markdown
@@ -2754,30 +2893,14 @@ jobs:
                   )
               }
 
-          def csv_escape(
-              value
-          ):
-              value = str(
-                  value
-              )
-
-              return (
-                  '"'
-                  + value.replace(
-                      '"',
-                      '""'
-                  )
-                  + '"'
-              )
-
           def main():
               for directory in [
                   FILE_ROOT,
-                  EXTRACT_ROOT,
+                  EXTRACTION_ROOT,
                   WORK_ROOT,
                   REPORT_ROOT,
                   REPORT_FILES_ROOT,
-                  REPORT_DISASM_ROOT,
+                  DISASSEMBLY_ROOT,
                   RAW_ROOT,
                   LOG_ROOT
               ]:
@@ -2786,14 +2909,14 @@ jobs:
                       exist_ok=True
                   )
 
-              if not INPUT.is_file():
+              if not INPUT_ZIP.is_file():
                   print(
-                      f"Input ZIP not found: {INPUT}"
+                      f"Input ZIP not found: {INPUT_ZIP}"
                   )
 
                   return 10
 
-              if INPUT.stat().st_size <= 0:
+              if INPUT_ZIP.stat().st_size <= 0:
                   print(
                       "Input ZIP is empty."
                   )
@@ -2812,8 +2935,8 @@ jobs:
 
               try:
                   initial_files = extract_zip(
-                      str(INPUT),
-                      str(source_root)
+                      INPUT_ZIP,
+                      source_root
                   )
 
               except Exception as exc:
@@ -2852,47 +2975,38 @@ jobs:
                       {
                           "path": item,
                           "parent": str(
-                              INPUT
+                              INPUT_ZIP
                           ),
                           "depth": 1,
                           "sha256": item_hash
                       }
                   )
 
-              queue = deque(
+              extraction_queue = deque(
                   discovered
               )
 
-              known_hashes = set(
-                  item[
-                      "sha256"
-                  ]
-                  for item in discovered
-              )
+              expansion_hashes = set()
+              extraction_log = []
 
-              extraction_records = []
+              while extraction_queue:
 
-              processed = set()
-
-              while queue:
-                  current = queue.popleft()
+                  current = extraction_queue.popleft()
 
                   current_path = current[
                       "path"
                   ]
 
-                  current_hash = current[
-                      "sha256"
-                  ]
-
-                  if current_hash in processed:
-                      continue
-
-                  processed.add(
-                      current_hash
+                  current_depth = int(
+                      current.get(
+                          "depth",
+                          1
+                      )
                   )
 
-                  if len(discovered) >= MAX_FILES:
+                  if len(
+                      discovered
+                  ) >= MAX_FILES:
                       break
 
                   relative_name = os.path.relpath(
@@ -2900,38 +3014,44 @@ jobs:
                       FILE_ROOT
                   )
 
-                  generated = (
-                      extract_recursive_layers(
-                          current_path,
-                          relative_name,
-                          int(
-                              current.get(
-                                  "depth",
-                                  1
-                              )
-                          ),
-                          known_hashes,
-                          extraction_records
-                      )
+                  generated = recursively_extract(
+                      current_path,
+                      relative_name,
+                      current_depth,
+                      expansion_hashes,
+                      extraction_log
                   )
 
                   for item in generated:
-                      if (
-                          len(discovered)
-                          >= MAX_FILES
-                      ):
+
+                      if len(
+                          discovered
+                      ) >= MAX_FILES:
                           break
 
                       discovered.append(
                           item
                       )
 
-                      queue.append(
+                      extraction_queue.append(
                           item
                       )
 
-              unique = []
-              unique_hashes = set()
+              with open(
+                  LOG_ROOT
+                  / "recursive_extraction.json",
+                  "w",
+                  encoding="utf-8"
+              ) as output:
+
+                  json.dump(
+                      extraction_log,
+                      output,
+                      indent=2,
+                      ensure_ascii=False
+                  )
+
+              unique_file_instances = []
 
               for item in discovered:
                   path = item[
@@ -2943,22 +3063,11 @@ jobs:
                   ):
                       continue
 
-                  current_hash = item[
-                      "sha256"
-                  ]
-
-                  if current_hash in unique_hashes:
-                      continue
-
-                  unique_hashes.add(
-                      current_hash
-                  )
-
-                  unique.append(
+                  unique_file_instances.append(
                       item
                   )
 
-              unique.sort(
+              unique_file_instances.sort(
                   key=lambda item: (
                       int(
                           item.get(
@@ -2975,34 +3084,18 @@ jobs:
                   )
               )
 
-              extraction_log = (
-                  LOG_ROOT
-                  / "recursive_extraction.json"
-              )
-
-              with open(
-                  extraction_log,
-                  "w",
-                  encoding="utf-8"
-              ) as output:
-                  json.dump(
-                      extraction_records,
-                      output,
-                      indent=2,
-                      ensure_ascii=False
-                  )
-
               summaries = []
               failures = []
 
-              total = len(
-                  unique
+              total_files = len(
+                  unique_file_instances
               )
 
               for index, item in enumerate(
-                  unique,
+                  unique_file_instances,
                   1
               ):
+
                   path = item[
                       "path"
                   ]
@@ -3013,13 +3106,13 @@ jobs:
                   )
 
                   print(
-                      f"[{index}/{total}] "
-                      f"Analyzing {relative_name}",
+                      f"[{index}/{total_files}] "
+                      f"{relative_name}",
                       flush=True
                   )
 
                   try:
-                      summary = analyze_file(
+                      result = analyze_file(
                           path,
                           relative_name,
                           index,
@@ -3029,16 +3122,17 @@ jobs:
                           int(
                               item.get(
                                   "depth",
-                                  0
+                                  1
                               )
                           )
                       )
 
                       summaries.append(
-                          summary
+                          result
                       )
 
                   except Exception as exc:
+
                       failure = {
                           "sequence": index,
                           "relative_name": relative_name,
@@ -3048,7 +3142,7 @@ jobs:
                           ),
                           "depth": item.get(
                               "depth",
-                              0
+                              1
                           ),
                           "error": str(exc)
                       }
@@ -3063,6 +3157,7 @@ jobs:
                           "a",
                           encoding="utf-8"
                       ) as output:
+
                           output.write(
                               json.dumps(
                                   failure,
@@ -3075,7 +3170,7 @@ jobs:
                           )
 
                       print(
-                          f"Analysis failed: "
+                          f"FAILED: "
                           f"{relative_name}: "
                           f"{exc}",
                           flush=True
@@ -3083,11 +3178,11 @@ jobs:
 
               manifest = {
                   "input_zip": str(
-                      INPUT
+                      INPUT_ZIP
                   ),
-                  "input_size": INPUT.stat().st_size,
+                  "input_size": INPUT_ZIP.stat().st_size,
                   "input_sha256": sha256_file(
-                      INPUT
+                      INPUT_ZIP
                   ),
                   "analysis_root": str(
                       ROOT
@@ -3099,7 +3194,7 @@ jobs:
                   "max_files": MAX_FILES,
                   "max_decompressed_file_size": MAX_DECOMPRESSED_FILE_SIZE,
                   "file_count_discovered": len(
-                      unique
+                      unique_file_instances
                   ),
                   "file_count_analyzed": len(
                       summaries
@@ -3121,6 +3216,7 @@ jobs:
                   "w",
                   encoding="utf-8"
               ) as output:
+
                   json.dump(
                       manifest,
                       output,
@@ -3133,135 +3229,595 @@ jobs:
                   / "analysis_index.csv"
               )
 
+              fields = [
+                  "sequence",
+                  "depth",
+                  "relative_name",
+                  "size",
+                  "sha256",
+                  "md5",
+                  "entropy",
+                  "function_count",
+                  "fastboot_match_count",
+                  "unlock_match_count",
+                  "vendor_match_count",
+                  "oem_match_count",
+                  "partition_candidate_count",
+                  "high_entropy_block_count",
+                  "report_markdown",
+                  "report_json",
+                  "disassembly_file",
+                  "entry_disassembly_file"
+              ]
+
               with open(
                   csv_path,
+                  "w",
+                  encoding="utf-8",
+                  newline=""
+              ) as output:
+
+                  writer = csv.DictWriter(
+                      output,
+                      fieldnames=fields
+                  )
+
+                  writer.writeheader()
+
+                  for item in summaries:
+                      writer.writerow(
+                          {
+                              key: item.get(
+                                  key,
+                                  ""
+                              )
+                              for key in fields
+                          }
+                      )
+
+              unlock_files = [
+                  item
+                  for item in summaries
+                  if int(
+                      item.get(
+                          "unlock_match_count",
+                          0
+                      )
+                      or 0
+                  ) > 0
+              ]
+
+              fastboot_files = [
+                  item
+                  for item in summaries
+                  if int(
+                      item.get(
+                          "fastboot_match_count",
+                          0
+                      )
+                      or 0
+                  ) > 0
+              ]
+
+              vendor_files = [
+                  item
+                  for item in summaries
+                  if int(
+                      item.get(
+                          "vendor_match_count",
+                          0
+                      )
+                      or 0
+                  ) > 0
+              ]
+
+              oem_files = [
+                  item
+                  for item in summaries
+                  if int(
+                      item.get(
+                          "oem_match_count",
+                          0
+                      )
+                      or 0
+                  ) > 0
+              ]
+
+              total_functions = sum(
+                  int(
+                      item.get(
+                          "function_count",
+                          0
+                      )
+                      or 0
+                  )
+                  for item in summaries
+              )
+
+              total_unlock = sum(
+                  int(
+                      item.get(
+                          "unlock_match_count",
+                          0
+                      )
+                      or 0
+                  )
+                  for item in summaries
+              )
+
+              total_fastboot = sum(
+                  int(
+                      item.get(
+                          "fastboot_match_count",
+                          0
+                      )
+                      or 0
+                  )
+                  for item in summaries
+              )
+
+              total_vendor = sum(
+                  int(
+                      item.get(
+                          "vendor_match_count",
+                          0
+                      )
+                      or 0
+                  )
+                  for item in summaries
+              )
+
+              total_oem = sum(
+                  int(
+                      item.get(
+                          "oem_match_count",
+                          0
+                      )
+                      or 0
+                  )
+                  for item in summaries
+              )
+
+              markdown_path = (
+                  REPORT_ROOT
+                  / "FULL_ANALYSIS_REPORT.md"
+              )
+
+              with open(
+                  markdown_path,
                   "w",
                   encoding="utf-8"
               ) as output:
 
                   output.write(
-                      "sequence,"
-                      "depth,"
-                      "relative_name,"
-                      "size,"
-                      "sha256,"
-                      "md5,"
-                      "entropy,"
-                      "function_count,"
-                      "fastboot_match_count,"
-                      "unlock_match_count,"
-                      "vendor_match_count,"
-                      "oem_match_count,"
-                      "partition_candidate_count,"
-                      "high_entropy_block_count,"
-                      "report_markdown,"
-                      "report_json,"
-                      "disassembly_file,"
-                      "entry_disassembly_file\n"
+                      "# QCOM Bootloader Full Recursive Analysis\n\n"
+                  )
+
+                  output.write(
+                      "## Input\n\n"
+                  )
+
+                  output.write(
+                      f"- ZIP: `{INPUT_ZIP}`\n"
+                  )
+
+                  output.write(
+                      f"- Size: `{INPUT_ZIP.stat().st_size}` bytes\n"
+                  )
+
+                  output.write(
+                      f"- SHA256: `{manifest['input_sha256']}`\n"
+                  )
+
+                  output.write(
+                      f"- Discovered files: `{len(unique_file_instances)}`\n"
+                  )
+
+                  output.write(
+                      f"- Analyzed files: `{len(summaries)}`\n"
+                  )
+
+                  output.write(
+                      f"- Failed files: `{len(failures)}`\n"
+                  )
+
+                  output.write(
+                      f"- Total functions: `{total_functions}`\n"
+                  )
+
+                  output.write(
+                      f"- Fastboot matches: `{total_fastboot}`\n"
+                  )
+
+                  output.write(
+                      f"- Unlock matches: `{total_unlock}`\n"
+                  )
+
+                  output.write(
+                      f"- Vendor matches: `{total_vendor}`\n"
+                  )
+
+                  output.write(
+                      f"- OEM matches: `{total_oem}`\n"
+                  )
+
+                  output.write(
+                      "\n"
+                  )
+
+                  output.write(
+                      "## Scope\n\n"
+                  )
+
+                  output.write(
+                      "Every regular file discovered from the input ZIP "
+                      "is analyzed without using file extensions as an "
+                      "inclusion condition. Recursive processing also "
+                      "handles nested ZIP, TAR, 7z, gzip, bzip2, XZ and "
+                      "binwalk-discovered embedded content.\n\n"
+                  )
+
+                  output.write(
+                      "## Unlock-related Files\n\n"
+                  )
+
+                  if unlock_files:
+
+                      output.write(
+                          "| File | Matches | Functions |\n"
+                      )
+
+                      output.write(
+                          "|---|---:|---:|\n"
+                      )
+
+                      for item in unlock_files:
+
+                          output.write(
+                              f"| `{item['relative_name']}` | "
+                              f"{item['unlock_match_count']} | "
+                              f"{item['function_count']} |\n"
+                          )
+
+                  else:
+
+                      output.write(
+                          "No unlock-related matches detected.\n"
+                      )
+
+                  output.write(
+                      "\n"
+                      "## Fastboot-related Files\n\n"
+                  )
+
+                  if fastboot_files:
+
+                      output.write(
+                          "| File | Matches | Functions |\n"
+                      )
+
+                      output.write(
+                          "|---|---:|---:|\n"
+                      )
+
+                      for item in fastboot_files:
+
+                          output.write(
+                              f"| `{item['relative_name']}` | "
+                              f"{item['fastboot_match_count']} | "
+                              f"{item['function_count']} |\n"
+                          )
+
+                  else:
+
+                      output.write(
+                          "No fastboot-related matches detected.\n"
+                      )
+
+                  output.write(
+                      "\n"
+                      "## Vendor-related Files\n\n"
+                  )
+
+                  if vendor_files:
+
+                      output.write(
+                          "| File | Matches | Functions |\n"
+                      )
+
+                      output.write(
+                          "|---|---:|---:|\n"
+                      )
+
+                      for item in vendor_files:
+
+                          output.write(
+                              f"| `{item['relative_name']}` | "
+                              f"{item['vendor_match_count']} | "
+                              f"{item['function_count']} |\n"
+                          )
+
+                  else:
+
+                      output.write(
+                          "No vendor-related matches detected.\n"
+                      )
+
+                  output.write(
+                      "\n"
+                      "## OEM-related Files\n\n"
+                  )
+
+                  if oem_files:
+
+                      output.write(
+                          "| File | Matches | Functions |\n"
+                      )
+
+                      output.write(
+                          "|---|---:|---:|\n"
+                      )
+
+                      for item in oem_files:
+
+                          output.write(
+                              f"| `{item['relative_name']}` | "
+                              f"{item['oem_match_count']} | "
+                              f"{item['function_count']} |\n"
+                          )
+
+                  else:
+
+                      output.write(
+                          "No OEM-related matches detected.\n"
+                      )
+
+                  output.write(
+                      "\n"
+                      "## All Files\n\n"
+                  )
+
+                  output.write(
+                      "| # | Depth | File | Size | SHA256 | Entropy | Functions | Unlock | Fastboot | Vendor | OEM |\n"
+                  )
+
+                  output.write(
+                      "|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|\n"
                   )
 
                   for item in summaries:
-                      row = [
-                          item.get(
-                              "sequence",
-                              ""
-                          ),
-                          item.get(
-                              "depth",
-                              ""
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "relative_name",
-                                  ""
-                              )
-                          ),
-                          item.get(
-                              "size",
-                              ""
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "sha256",
-                                  ""
-                              )
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "md5",
-                                  ""
-                              )
-                          ),
-                          item.get(
-                              "entropy",
-                              ""
-                          ),
-                          item.get(
-                              "function_count",
-                              ""
-                          ),
-                          item.get(
-                              "fastboot_match_count",
-                              ""
-                          ),
-                          item.get(
-                              "unlock_match_count",
-                              ""
-                          ),
-                          item.get(
-                              "vendor_match_count",
-                              ""
-                          ),
-                          item.get(
-                              "oem_match_count",
-                              ""
-                          ),
-                          item.get(
-                              "partition_candidate_count",
-                              ""
-                          ),
-                          item.get(
-                              "high_entropy_block_count",
-                              ""
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "report_markdown",
-                                  ""
-                              )
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "report_json",
-                                  ""
-                              )
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "disassembly_file",
-                                  ""
-                              )
-                          ),
-                          csv_escape(
-                              item.get(
-                                  "entry_disassembly_file",
-                                  ""
-                              )
-                          )
-                      ]
 
                       output.write(
-                          ",".join(
-                              map(
-                                  str,
-                                  row
-                              )
-                          )
+                          f"| {item['sequence']} | "
+                          f"{item['depth']} | "
+                          f"`{item['relative_name']}` | "
+                          f"{item['size']} | "
+                          f"`{item['sha256']}` | "
+                          f"{item['entropy']:.6f} | "
+                          f"{item['function_count']} | "
+                          f"{item['unlock_match_count']} | "
+                          f"{item['fastboot_match_count']} | "
+                          f"{item['vendor_match_count']} | "
+                          f"{item['oem_match_count']} |\n"
                       )
 
+                  output.write(
+                      "\n"
+                      "## Failed Files\n\n"
+                  )
+
+                  if failures:
+
+                      for failure in failures:
+
+                          output.write(
+                              f"- `{failure['relative_name']}`: "
+                              f"{failure['error']}\n"
+                          )
+
+                  else:
+
                       output.write(
-                          "\n"
+                          "No analysis failures.\n"
                       )
+
+              html_path = (
+                  REPORT_ROOT
+                  / "index.html"
+              )
+
+              with open(
+                  html_path,
+                  "w",
+                  encoding="utf-8"
+              ) as output:
+
+                  output.write(
+                      "<!doctype html>"
+                      "<html>"
+                      "<head>"
+                      "<meta charset='utf-8'>"
+                      "<meta name='viewport' "
+                      "content='width=device-width,initial-scale=1'>"
+                      "<title>QCOM Bootloader Full Recursive Analysis</title>"
+                      "<style>"
+                      "body{"
+                      "font-family:Arial,Helvetica,sans-serif;"
+                      "margin:30px;"
+                      "background:#f4f4f4;"
+                      "color:#222"
+                      "}"
+                      ".grid{"
+                      "display:grid;"
+                      "grid-template-columns:"
+                      "repeat(auto-fit,minmax(180px,1fr));"
+                      "gap:16px;"
+                      "margin-bottom:24px"
+                      "}"
+                      ".card{"
+                      "background:white;"
+                      "border:1px solid #ddd;"
+                      "border-radius:8px;"
+                      "padding:18px"
+                      "}"
+                      ".value{"
+                      "font-size:30px;"
+                      "font-weight:bold;"
+                      "margin-top:6px"
+                      "}"
+                      "table{"
+                      "border-collapse:collapse;"
+                      "width:100%;"
+                      "background:white"
+                      "}"
+                      "th,td{"
+                      "border:1px solid #ddd;"
+                      "padding:7px;"
+                      "text-align:left;"
+                      "vertical-align:top"
+                      "}"
+                      "th{"
+                      "background:#333;"
+                      "color:white"
+                      "}"
+                      "tr:nth-child(even){"
+                      "background:#fafafa"
+                      "}"
+                      "</style>"
+                      "</head>"
+                      "<body>"
+                  )
+
+                  output.write(
+                      "<h1>"
+                      "QCOM Bootloader Full Recursive Analysis"
+                      "</h1>"
+                  )
+
+                  output.write(
+                      "<div class='grid'>"
+                  )
+
+                  cards = [
+                      (
+                          "Discovered",
+                          len(
+                              unique_file_instances
+                          )
+                      ),
+                      (
+                          "Analyzed",
+                          len(
+                              summaries
+                          )
+                      ),
+                      (
+                          "Failed",
+                          len(
+                              failures
+                          )
+                      ),
+                      (
+                          "Functions",
+                          total_functions
+                      ),
+                      (
+                          "Unlock",
+                          total_unlock
+                      ),
+                      (
+                          "Fastboot",
+                          total_fastboot
+                      ),
+                      (
+                          "Vendor",
+                          total_vendor
+                      ),
+                      (
+                          "OEM",
+                          total_oem
+                      )
+                  ]
+
+                  for label, value in cards:
+
+                      output.write(
+                          "<div class='card'>"
+                          f"<div>{html.escape(str(label))}</div>"
+                          f"<div class='value'>{html.escape(str(value))}</div>"
+                          "</div>"
+                      )
+
+                  output.write(
+                      "</div>"
+                  )
+
+                  output.write(
+                      "<p>"
+                      "<a href='FULL_ANALYSIS_REPORT.md'>"
+                      "FULL_ANALYSIS_REPORT.md"
+                      "</a>"
+                      "</p>"
+                  )
+
+                  output.write(
+                      "<p>"
+                      "<a href='../analysis_manifest.json'>"
+                      "analysis_manifest.json"
+                      "</a>"
+                      "</p>"
+                  )
+
+                  output.write(
+                      "<p>"
+                      "<a href='../analysis_index.csv'>"
+                      "analysis_index.csv"
+                      "</a>"
+                      "</p>"
+                  )
+
+                  output.write(
+                      "<table>"
+                      "<thead>"
+                      "<tr>"
+                      "<th>#</th>"
+                      "<th>Depth</th>"
+                      "<th>File</th>"
+                      "<th>Size</th>"
+                      "<th>Entropy</th>"
+                      "<th>Functions</th>"
+                      "<th>Unlock</th>"
+                      "<th>Fastboot</th>"
+                      "<th>Vendor</th>"
+                      "<th>OEM</th>"
+                      "</tr>"
+                      "</thead>"
+                      "<tbody>"
+                  )
+
+                  for item in summaries:
+
+                      output.write(
+                          "<tr>"
+                          f"<td>{html.escape(str(item['sequence']))}</td>"
+                          f"<td>{html.escape(str(item['depth']))}</td>"
+                          f"<td>{html.escape(str(item['relative_name']))}</td>"
+                          f"<td>{html.escape(str(item['size']))}</td>"
+                          f"<td>{html.escape(f'{item['entropy']:.6f}')}</td>"
+                          f"<td>{html.escape(str(item['function_count']))}</td>"
+                          f"<td>{html.escape(str(item['unlock_match_count']))}</td>"
+                          f"<td>{html.escape(str(item['fastboot_match_count']))}</td>"
+                          f"<td>{html.escape(str(item['vendor_match_count']))}</td>"
+                          f"<td>{html.escape(str(item['oem_match_count']))}</td>"
+                          "</tr>"
+                      )
+
+                  output.write(
+                      "</tbody>"
+                      "</table>"
+                      "</body>"
+                      "</html>"
+                  )
 
               print(
                   "=============================================="
@@ -3272,19 +3828,33 @@ jobs:
               )
 
               print(
-                  f"Discovered files : {len(unique)}"
+                  f"Discovered files : "
+                  f"{len(unique_file_instances)}"
               )
 
               print(
-                  f"Analyzed files   : {len(summaries)}"
+                  f"Analyzed files   : "
+                  f"{len(summaries)}"
               )
 
               print(
-                  f"Failed files     : {len(failures)}"
+                  f"Failed files     : "
+                  f"{len(failures)}"
               )
 
               print(
-                  f"Manifest         : {manifest_path}"
+                  f"Manifest         : "
+                  f"{manifest_path}"
+              )
+
+              print(
+                  f"Markdown         : "
+                  f"{markdown_path}"
+              )
+
+              print(
+                  f"HTML             : "
+                  f"{html_path}"
               )
 
               print(
@@ -3317,728 +3887,22 @@ jobs:
             | tee \
             "${ARTIFACT_ROOT}/logs/analysis.log"
 
+      - name: Validate Analysis Results
+        shell: bash
+        run: |
+          set -e
+
           test -f \
             "${ARTIFACT_ROOT}/analysis_manifest.json"
 
           test -f \
             "${ARTIFACT_ROOT}/analysis_index.csv"
-
-      - name: Create Global Report Generator
-        shell: bash
-        run: |
-          set -e
-
-          cat > /tmp/generate_global_report.py <<'PYEOF'
-          #!/usr/bin/env python3
-
-          import os
-          import json
-          import html
-          from pathlib import Path
-
-          ARTIFACT_ROOT = Path(
-              os.environ["ARTIFACT_ROOT"]
-          )
-
-          manifest_path = (
-              ARTIFACT_ROOT
-              / "analysis_manifest.json"
-          )
-
-          if not manifest_path.is_file():
-              raise SystemExit(
-                  f"Manifest not found: {manifest_path}"
-              )
-
-          with open(
-              manifest_path,
-              "r",
-              encoding="utf-8"
-          ) as source:
-              manifest = json.load(
-                  source
-              )
-
-          files = manifest.get(
-              "files",
-              []
-          )
-
-          failures = manifest.get(
-              "failures",
-              []
-          )
-
-          def integer(
-              value
-          ):
-              try:
-                  return int(
-                      value
-                      or 0
-                  )
-              except Exception:
-                  return 0
-
-          total_functions = sum(
-              integer(
-                  item.get(
-                      "function_count",
-                      0
-                  )
-              )
-              for item in files
-          )
-
-          total_fastboot = sum(
-              integer(
-                  item.get(
-                      "fastboot_match_count",
-                      0
-                  )
-              )
-              for item in files
-          )
-
-          total_unlock = sum(
-              integer(
-                  item.get(
-                      "unlock_match_count",
-                      0
-                  )
-              )
-              for item in files
-          )
-
-          total_vendor = sum(
-              integer(
-                  item.get(
-                      "vendor_match_count",
-                      0
-                  )
-              )
-              for item in files
-          )
-
-          total_oem = sum(
-              integer(
-                  item.get(
-                      "oem_match_count",
-                      0
-                  )
-              )
-              for item in files
-          )
-
-          report_root = (
-              ARTIFACT_ROOT
-              / "reports"
-          )
-
-          report_root.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          markdown_path = (
-              report_root
-              / "FULL_ANALYSIS_REPORT.md"
-          )
-
-          with open(
-              markdown_path,
-              "w",
-              encoding="utf-8"
-          ) as output:
-
-              output.write(
-                  "# QCOM Bootloader Full Recursive Analysis\n\n"
-              )
-
-              output.write(
-                  "## Input\n\n"
-              )
-
-              output.write(
-                  f"- ZIP URL: `{manifest.get('input_zip', '')}`\n"
-              )
-
-              output.write(
-                  f"- ZIP Size: `{manifest.get('input_size', 0)}` bytes\n"
-              )
-
-              output.write(
-                  f"- ZIP SHA256: `{manifest.get('input_sha256', '')}`\n"
-              )
-
-              output.write(
-                  f"- Discovered Files: `{manifest.get('file_count_discovered', 0)}`\n"
-              )
-
-              output.write(
-                  f"- Analyzed Files: `{manifest.get('file_count_analyzed', 0)}`\n"
-              )
-
-              output.write(
-                  f"- Failed Files: `{manifest.get('file_count_failed', 0)}`\n"
-              )
-
-              output.write(
-                  f"- Total Functions: `{total_functions}`\n"
-              )
-
-              output.write(
-                  f"- Total Fastboot Matches: `{total_fastboot}`\n"
-              )
-
-              output.write(
-                  f"- Total Unlock Matches: `{total_unlock}`\n"
-              )
-
-              output.write(
-                  f"- Total Vendor Matches: `{total_vendor}`\n"
-              )
-
-              output.write(
-                  f"- Total OEM Matches: `{total_oem}`\n"
-              )
-
-              output.write(
-                  "\n"
-              )
-
-              output.write(
-                  "## Analysis Coverage\n\n"
-              )
-
-              output.write(
-                  "Every discovered regular file is analyzed "
-                  "without using its file extension as an "
-                  "inclusion condition. The workflow performs "
-                  "file identification, MIME detection, SHA256, "
-                  "MD5, entropy analysis, ASCII strings, "
-                  "UTF-16LE strings, hexadecimal inspection, "
-                  "recursive archive extraction, compressed "
-                  "stream extraction, binwalk extraction, "
-                  "radare2 binary information, sections, "
-                  "symbols, imports, exports, entry points, "
-                  "function discovery and function-level "
-                  "disassembly where supported.\n\n"
-              )
-
-              output.write(
-                  "## Unlock-related Files\n\n"
-              )
-
-              unlock_files = [
-                  item
-                  for item in files
-                  if integer(
-                      item.get(
-                          "unlock_match_count",
-                          0
-                      )
-                  ) > 0
-              ]
-
-              if unlock_files:
-                  output.write(
-                      "| File | Unlock Matches | Functions |\n"
-                  )
-
-                  output.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in unlock_files:
-                      output.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{integer(item.get('unlock_match_count', 0))} | "
-                          f"{integer(item.get('function_count', 0))} |\n"
-                      )
-
-              else:
-                  output.write(
-                      "No unlock-related matches detected.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## Fastboot-related Files\n\n"
-              )
-
-              fastboot_files = [
-                  item
-                  for item in files
-                  if integer(
-                      item.get(
-                          "fastboot_match_count",
-                          0
-                      )
-                  ) > 0
-              ]
-
-              if fastboot_files:
-                  output.write(
-                      "| File | Fastboot Matches | Functions |\n"
-                  )
-
-                  output.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in fastboot_files:
-                      output.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{integer(item.get('fastboot_match_count', 0))} | "
-                          f"{integer(item.get('function_count', 0))} |\n"
-                      )
-
-              else:
-                  output.write(
-                      "No fastboot-related matches detected.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## OEM-related Files\n\n"
-              )
-
-              oem_files = [
-                  item
-                  for item in files
-                  if integer(
-                      item.get(
-                          "oem_match_count",
-                          0
-                      )
-                  ) > 0
-              ]
-
-              if oem_files:
-                  output.write(
-                      "| File | OEM Matches | Functions |\n"
-                  )
-
-                  output.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in oem_files:
-                      output.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{integer(item.get('oem_match_count', 0))} | "
-                          f"{integer(item.get('function_count', 0))} |\n"
-                      )
-
-              else:
-                  output.write(
-                      "No OEM-related matches detected.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## Vendor-related Files\n\n"
-              )
-
-              vendor_files = [
-                  item
-                  for item in files
-                  if integer(
-                      item.get(
-                          "vendor_match_count",
-                          0
-                      )
-                  ) > 0
-              ]
-
-              if vendor_files:
-                  output.write(
-                      "| File | Vendor Matches | Functions |\n"
-                  )
-
-                  output.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in vendor_files:
-                      output.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{integer(item.get('vendor_match_count', 0))} | "
-                          f"{integer(item.get('function_count', 0))} |\n"
-                      )
-
-              else:
-                  output.write(
-                      "No vendor-related matches detected.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## High Entropy Files\n\n"
-              )
-
-              high_entropy_files = [
-                  item
-                  for item in files
-                  if integer(
-                      item.get(
-                          "high_entropy_block_count",
-                          0
-                      )
-                  ) > 0
-              ]
-
-              high_entropy_files.sort(
-                  key=lambda item: integer(
-                      item.get(
-                          "high_entropy_block_count",
-                          0
-                      )
-                  ),
-                  reverse=True
-              )
-
-              if high_entropy_files:
-                  output.write(
-                      "| File | High Entropy Blocks | Size |\n"
-                  )
-
-                  output.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in high_entropy_files:
-                      output.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{integer(item.get('high_entropy_block_count', 0))} | "
-                          f"{item.get('size', 0)} |\n"
-                      )
-
-              else:
-                  output.write(
-                      "No high entropy files detected.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## All Analyzed Files\n\n"
-              )
-
-              output.write(
-                  "| # | Depth | File | Size | SHA256 | Entropy | "
-                  "Functions | Unlock | Fastboot | Vendor | OEM |\n"
-              )
-
-              output.write(
-                  "|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|\n"
-              )
-
-              for item in files:
-                  output.write(
-                      f"| {item.get('sequence', '')} | "
-                      f"{item.get('depth', '')} | "
-                      f"`{item.get('relative_name', '')}` | "
-                      f"{item.get('size', '')} | "
-                      f"`{item.get('sha256', '')}` | "
-                      f"{float(item.get('entropy', 0) or 0):.6f} | "
-                      f"{integer(item.get('function_count', 0))} | "
-                      f"{integer(item.get('unlock_match_count', 0))} | "
-                      f"{integer(item.get('fastboot_match_count', 0))} | "
-                      f"{integer(item.get('vendor_match_count', 0))} | "
-                      f"{integer(item.get('oem_match_count', 0))} |\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## Failed Files\n\n"
-              )
-
-              if failures:
-                  for item in failures:
-                      output.write(
-                          f"- `{item.get('relative_name', '')}`: "
-                          f"{item.get('error', '')}\n"
-                      )
-
-              else:
-                  output.write(
-                      "No file analysis failures.\n"
-                  )
-
-              output.write(
-                  "\n"
-                  "## Important Generated Files\n\n"
-              )
-
-              output.write(
-                  "- `analysis_manifest.json`\n"
-              )
-
-              output.write(
-                  "- `analysis_index.csv`\n"
-              )
-
-              output.write(
-                  "- `reports/FULL_ANALYSIS_REPORT.md`\n"
-              )
-
-              output.write(
-                  "- `reports/index.html`\n"
-              )
-
-              output.write(
-                  "- `reports/files/`\n"
-              )
-
-              output.write(
-                  "- `reports/disassembly/`\n"
-              )
-
-              output.write(
-                  "- `raw/`\n"
-              )
-
-          html_path = (
-              report_root
-              / "index.html"
-          )
-
-          with open(
-              html_path,
-              "w",
-              encoding="utf-8"
-          ) as output:
-
-              output.write(
-                  "<!doctype html>\n"
-              )
-
-              output.write(
-                  "<html lang='en'>\n"
-              )
-
-              output.write(
-                  "<head>\n"
-                  "<meta charset='utf-8'>\n"
-                  "<meta name='viewport' "
-                  "content='width=device-width,initial-scale=1'>\n"
-                  "<title>QCOM Bootloader Full Recursive Analysis</title>\n"
-                  "<style>"
-                  "body{font-family:Arial,Helvetica,sans-serif;"
-                  "margin:30px;background:#f5f5f5;color:#222}"
-                  ".grid{display:grid;"
-                  "grid-template-columns:repeat(auto-fit,minmax(180px,1fr));"
-                  "gap:16px;margin:20px 0}"
-                  ".card{background:#fff;border:1px solid #ddd;"
-                  "border-radius:8px;padding:18px}"
-                  ".value{font-size:28px;font-weight:700;"
-                  "margin-top:8px}"
-                  "table{border-collapse:collapse;"
-                  "width:100%;background:#fff}"
-                  "th,td{border:1px solid #ddd;"
-                  "padding:7px;text-align:left;"
-                  "vertical-align:top}"
-                  "th{background:#333;color:#fff}"
-                  "tr:nth-child(even){background:#fafafa}"
-                  "a{color:#0645ad}"
-                  "code{word-break:break-word}"
-                  "</style>\n"
-                  "</head>\n"
-              )
-
-              output.write(
-                  "<body>\n"
-              )
-
-              output.write(
-                  "<h1>QCOM Bootloader Full Recursive Analysis</h1>\n"
-              )
-
-              output.write(
-                  "<div class='grid'>\n"
-              )
-
-              cards = [
-                  (
-                      "Discovered Files",
-                      manifest.get(
-                          "file_count_discovered",
-                          0
-                      )
-                  ),
-                  (
-                      "Analyzed Files",
-                      manifest.get(
-                          "file_count_analyzed",
-                          0
-                      )
-                  ),
-                  (
-                      "Failed Files",
-                      manifest.get(
-                          "file_count_failed",
-                          0
-                      )
-                  ),
-                  (
-                      "Functions",
-                      total_functions
-                  ),
-                  (
-                      "Unlock Matches",
-                      total_unlock
-                  ),
-                  (
-                      "Fastboot Matches",
-                      total_fastboot
-                  ),
-                  (
-                      "Vendor Matches",
-                      total_vendor
-                  ),
-                  (
-                      "OEM Matches",
-                      total_oem
-                  )
-              ]
-
-              for label, value in cards:
-                  output.write(
-                      "<div class='card'>"
-                      f"<div>{html.escape(str(label))}</div>"
-                      f"<div class='value'>{html.escape(str(value))}</div>"
-                      "</div>\n"
-                  )
-
-              output.write(
-                  "</div>\n"
-              )
-
-              output.write(
-                  "<p>"
-                  "<a href='FULL_ANALYSIS_REPORT.md'>"
-                  "FULL_ANALYSIS_REPORT.md"
-                  "</a>"
-                  "</p>\n"
-              )
-
-              output.write(
-                  "<p>"
-                  "<a href='../analysis_manifest.json'>"
-                  "analysis_manifest.json"
-                  "</a>"
-                  "</p>\n"
-              )
-
-              output.write(
-                  "<p>"
-                  "<a href='../analysis_index.csv'>"
-                  "analysis_index.csv"
-                  "</a>"
-                  "</p>\n"
-              )
-
-              output.write(
-                  "<table>\n"
-              )
-
-              output.write(
-                  "<thead>"
-                  "<tr>"
-                  "<th>#</th>"
-                  "<th>Depth</th>"
-                  "<th>File</th>"
-                  "<th>Size</th>"
-                  "<th>Entropy</th>"
-                  "<th>Functions</th>"
-                  "<th>Unlock</th>"
-                  "<th>Fastboot</th>"
-                  "<th>Vendor</th>"
-                  "<th>OEM</th>"
-                  "</tr>"
-                  "</thead>\n"
-              )
-
-              output.write(
-                  "<tbody>\n"
-              )
-
-              for item in files:
-                  output.write(
-                      "<tr>"
-                      f"<td>{html.escape(str(item.get('sequence', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('depth', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('relative_name', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('size', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('entropy', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('function_count', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('unlock_match_count', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('fastboot_match_count', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('vendor_match_count', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('oem_match_count', '')))}</td>"
-                      "</tr>\n"
-                  )
-
-              output.write(
-                  "</tbody>\n"
-              )
-
-              output.write(
-                  "</table>\n"
-              )
-
-              output.write(
-                  "</body>\n"
-              )
-
-              output.write(
-                  "</html>\n"
-              )
-
-          print(
-              f"Markdown report: {markdown_path}"
-          )
-
-          print(
-              f"HTML report: {html_path}"
-          )
-          PYEOF
-
-          python3 \
-            -m py_compile \
-            /tmp/generate_global_report.py
-
-          chmod +x \
-            /tmp/generate_global_report.py
-
-      - name: Generate Global Report
-        shell: bash
-        run: |
-          set -e
-
-          python3 \
-            /tmp/generate_global_report.py
 
           test -f \
             "${ARTIFACT_ROOT}/reports/FULL_ANALYSIS_REPORT.md"
 
           test -f \
             "${ARTIFACT_ROOT}/reports/index.html"
-
-      - name: Validate Manifest
-        shell: bash
-        run: |
-          set -e
-
-          test -d \
-            "${ARTIFACT_ROOT}"
-
-          test -f \
-            "${ARTIFACT_ROOT}/analysis_manifest.json"
-
-          test -f \
-            "${ARTIFACT_ROOT}/analysis_index.csv"
 
           python3 - <<'PYEOF'
           import json
@@ -4059,16 +3923,15 @@ jobs:
               "r",
               encoding="utf-8"
           ) as source:
+
               manifest = json.load(
                   source
               )
 
-          required_keys = [
+          required = [
               "input_zip",
               "input_size",
               "input_sha256",
-              "analysis_root",
-              "artifact_root",
               "file_count_discovered",
               "file_count_analyzed",
               "file_count_failed",
@@ -4076,10 +3939,10 @@ jobs:
               "failures"
           ]
 
-          for key in required_keys:
+          for key in required:
               if key not in manifest:
                   raise SystemExit(
-                      f"Manifest key missing: {key}"
+                      f"Missing manifest field: {key}"
                   )
 
           discovered = int(
@@ -4100,29 +3963,12 @@ jobs:
               ]
           )
 
-          if discovered < 0:
+          if analyzed + failed != discovered:
               raise SystemExit(
-                  "Invalid discovered count."
-              )
-
-          if analyzed < 0:
-              raise SystemExit(
-                  "Invalid analyzed count."
-              )
-
-          if failed < 0:
-              raise SystemExit(
-                  "Invalid failed count."
-              )
-
-          if analyzed > discovered:
-              raise SystemExit(
-                  "Analyzed count exceeds discovered count."
-              )
-
-          if analyzed + failed < discovered:
-              raise SystemExit(
-                  "Analysis accounting is incomplete."
+                  "Manifest accounting mismatch: "
+                  f"discovered={discovered}, "
+                  f"analyzed={analyzed}, "
+                  f"failed={failed}"
               )
 
           if not isinstance(
@@ -4132,7 +3978,7 @@ jobs:
               list
           ):
               raise SystemExit(
-                  "Manifest files is not a list."
+                  "Manifest files must be a list."
               )
 
           if not isinstance(
@@ -4142,27 +3988,27 @@ jobs:
               list
           ):
               raise SystemExit(
-                  "Manifest failures is not a list."
+                  "Manifest failures must be a list."
               )
 
           print(
-              f"Discovered: {discovered}"
+              f"Discovered={discovered}"
           )
 
           print(
-              f"Analyzed: {analyzed}"
+              f"Analyzed={analyzed}"
           )
 
           print(
-              f"Failed: {failed}"
+              f"Failed={failed}"
           )
 
           print(
-              f"Manifest: {manifest_path}"
+              f"Manifest={manifest_path}"
           )
           PYEOF
 
-      - name: Collect Diagnostics
+      - name: Generate Final Diagnostics
         if: always()
         shell: bash
         run: |
@@ -4175,7 +4021,7 @@ jobs:
             echo "===== DATE ====="
             date -u
 
-            echo "===== HOST ====="
+            echo "===== UNAME ====="
             uname -a
 
             echo "===== CPU ====="
@@ -4193,52 +4039,55 @@ jobs:
             echo "===== LD_LIBRARY_PATH ====="
             echo "${LD_LIBRARY_PATH}"
 
-            echo "===== COMMANDS ====="
+            echo "===== TOOLS ====="
             command -v r2
             command -v rabin2
             command -v rasm2
             command -v ldconfig
             command -v python3
             command -v file
+            command -v strings
             command -v 7z
+            command -v binwalk
 
             echo "===== VERSIONS ====="
             r2 -v
             rabin2 -v
             python3 --version
-            file --version
+            file --version | head -n 1
+            ldconfig --version | head -n 1
 
-            echo "===== ANALYSIS FILES ====="
+            echo "===== ANALYSIS FILE TREE ====="
 
             if [ -d "${ANALYSIS_ROOT}" ]; then
               find \
                 "${ANALYSIS_ROOT}" \
-                -maxdepth 8 \
-                -type f \
-                -printf '%p %s bytes\n' \
-                | sort
-            else
-              echo "ANALYSIS_ROOT not found"
-            fi
-
-            echo "===== ARTIFACT FILES ====="
-
-            if [ -d "${ARTIFACT_ROOT}" ]; then
-              find \
-                "${ARTIFACT_ROOT}" \
                 -maxdepth 10 \
                 -type f \
                 -printf '%p %s bytes\n' \
                 | sort
             else
-              echo "ARTIFACT_ROOT not found"
+              echo "ANALYSIS_ROOT does not exist"
+            fi
+
+            echo "===== ARTIFACT FILE TREE ====="
+
+            if [ -d "${ARTIFACT_ROOT}" ]; then
+              find \
+                "${ARTIFACT_ROOT}" \
+                -maxdepth 12 \
+                -type f \
+                -printf '%p %s bytes\n' \
+                | sort
+            else
+              echo "ARTIFACT_ROOT does not exist"
             fi
 
           } > \
-            "${ARTIFACT_ROOT}/logs/diagnostics.log" \
+            "${ARTIFACT_ROOT}/logs/final_diagnostics.log" \
             2>&1
 
-      - name: Upload All Artifacts
+      - name: Upload All Analysis Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -4250,37 +4099,15 @@ jobs:
           compression-level: 0
           include-hidden-files: true
 
-      - name: Final Status
-        if: always()
+      - name: Completion Notice
+        if: success()
         shell: bash
         run: |
-          set +e
+          echo "::notice title=QCOM Bootloader Analysis Complete::Recursive analysis, disassembly, reports and artifacts completed successfully."
 
-          if [ -f "${ARTIFACT_ROOT}/analysis_manifest.json" ]; then
-            echo "::notice title=Analysis Manifest Created::analysis_manifest.json was generated successfully."
-          else
-            echo "::warning title=Analysis Manifest Missing::analysis_manifest.json was not generated. Check artifacts/logs/diagnostics.log."
-          fi
-
-          if [ -f "${ARTIFACT_ROOT}/reports/FULL_ANALYSIS_REPORT.md" ]; then
-            echo "::notice title=Full Report Created::FULL_ANALYSIS_REPORT.md was generated successfully."
-          else
-            echo "::warning title=Full Report Missing::FULL_ANALYSIS_REPORT.md was not generated."
-          fi
-
-          if [ -f "${ARTIFACT_ROOT}/reports/index.html" ]; then
-            echo "::notice title=HTML Report Created::reports/index.html was generated successfully."
-          else
-            echo "::warning title=HTML Report Missing::reports/index.html was not generated."
-          fi
-
-          if [ -f "${ARTIFACT_ROOT}/logs/analysis.log" ]; then
-            echo "::notice title=Analysis Log Created::analysis.log was generated successfully."
-          fi
-
-      - name: Fail Workflow When Analysis Failed
+      - name: Failure Notice
         if: failure()
         shell: bash
         run: |
-          echo "::error title=Bootloader Analysis Failed::The workflow failed. Diagnostic logs and any generated artifacts were uploaded."
+          echo "::error title=QCOM Bootloader Analysis Failed::The workflow failed. Generated diagnostics and artifacts were uploaded."
           exit 1
