@@ -64,24 +64,6 @@ jobs:
       - name: Create Ultra-Comprehensive Analysis Script
         run: |
           cat > /tmp/analyze_bootloader.py << 'EOF'
-          #!/usr/bin/env python3
-          # -*- coding: utf-8 -*-
-          """
-          Ultimate Bootloader Analysis v3 - Multi-stage, exhaustive, multi-angle
-          - Recursive extraction (XZ, LZMA, binwalk) with carving
-          - Full disassembly with radare2 (multiple passes, error recovery)
-          - ELF-aware metadata dump (readelf + pyelftools) - v3
-          - Strict word-boundary keyword matching to suppress false positives - v3
-          - Known Qualcomm ABL/XBL fastboot/oem symbol dictionary matching - v3
-          - Exhaustive XOR brute-force: single, 2-byte, 4-byte, rotated, multi-pass
-          - Printable-ratio gated XOR candidate filtering - v3
-          - Entropy-based region prioritization
-          - UTF-16LE string extraction
-          - String -> function xref chain walking with pseudocode dump - v3
-          - Targeted emulation of oem/unlock dispatch candidates - v3
-          - Re-assembly of fragmented strings
-          - Comprehensive reporting with all potential commands
-          """
           import os, sys, json, re, subprocess, tempfile, struct, math, binascii, time, hashlib, itertools
           import r2pipe
           from collections import defaultdict, Counter
@@ -89,7 +71,6 @@ jobs:
           import lzma
           import traceback
 
-          # ---------- Configuration ----------
           FASTBOOT_KEYWORDS = [
               'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
               'download', 'continue', 'boot', 'update', 'unlock', 'lock',
@@ -110,9 +91,6 @@ jobs:
               r'unlock-go', r'oem\s+.*-go'
           ]
 
-          # v3: Qualcomm ABL/XBL 実装で頻出するfastboot/oem関連シンボル名の辞書。
-          # strip されていないビルド(今回のxblのように)ではシンボルテーブルから直接
-          # ヒットする可能性が高く、XORブルートフォースより遥かに信頼できる手掛かりになる。
           KNOWN_OEM_SYMBOLS = [
               'fastboot_oem_cmd', 'fastboot_oem_unlock', 'fastboot_oem_lock',
               'fastboot_register', 'fastboot_publish', 'fastboot_getvar_all',
@@ -130,8 +108,6 @@ jobs:
               'fastboot_oem_unlock_critical', 'fastboot_oem_lock_critical'
           ]
 
-          # v3: 単語境界を要求する正規表現ビルダ。
-          # 「go」のような短いキーワードが乱数バイナリ内で偶然一致する誤検出を大幅に削減する。
           def build_boundary_regex(words):
               escaped = sorted((re.escape(w) for w in words), key=len, reverse=True)
               pattern = r'(?<![A-Za-z0-9_])(' + '|'.join(escaped) + r')(?![A-Za-z0-9_])'
@@ -147,7 +123,6 @@ jobs:
               printable = sum(1 for c in s if 32 <= ord(c) <= 126 or c in '\t\n\r')
               return printable / len(s)
 
-          # ---------- Recursive extraction ----------
           def find_xz_magic_offsets(filepath):
               magic = b'\xFD\x37\x7A\x58\x5A\x00'
               offsets = []
@@ -276,23 +251,18 @@ jobs:
                       unique_results.append(f)
               return unique_results
 
-          # ---------- Exhaustive XOR key generation ----------
           def generate_xor_keys():
               keys = []
-              # Single-byte
               for i in range(0x100):
                   keys.append(bytes([i]))
-              # Common single-byte extras
               extras = [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C, 0x00, 0x80, 0x7F]
               for v in extras:
                   keys.append(bytes([v]))
-              # 2-byte
               common_2 = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA,
                           0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA,
                           0x4F45, 0x454D, 0x4D00, 0x004D, 0x0D0A, 0x0A0D, 0x2020, 0x0909]
               spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343,
                         0x4F4F, 0x4545, 0x4D4D, 0x004F, 0x4F00, 0x454D, 0x4D45]
-              # ASCII pairs: "OE", "EM", "M ", " O", etc.
               for c1 in ' OEM':
                   for c2 in ' OEMlock':
                       v = ord(c1)<<8 | ord(c2)
@@ -300,7 +270,6 @@ jobs:
               for k in common_2 + spec_2:
                   keys.append(k.to_bytes(2, 'little'))
                   keys.append(k.to_bytes(2, 'big'))
-              # 4-byte
               common_4 = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202,
                           0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0x0D15EA5E,
                           0x4F454D00, 0x004D454F, 0x4F454D20, 0x4F454D4F]
@@ -309,7 +278,6 @@ jobs:
               for k in common_4 + spec_4 + ascii_4:
                   keys.append(k.to_bytes(4, 'little'))
                   keys.append(k.to_bytes(4, 'big'))
-              # Register values from previous emulation
               reg_vals = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
               for v in reg_vals:
                   if v < 0x100:
@@ -320,7 +288,6 @@ jobs:
                   else:
                       keys.append(v.to_bytes(4, 'little'))
                       keys.append(v.to_bytes(4, 'big'))
-              # Remove duplicates
               seen = set()
               unique = []
               for k in keys:
@@ -358,7 +325,6 @@ jobs:
                   return bytes(dec)
               return None
 
-          # ---------- Extract strings from binary (ASCII + UTF-16LE) ----------
           def extract_all_strings_from_data(data):
               results = set()
               ascii_re = re.compile(b'[ -~]{4,}')
@@ -377,7 +343,6 @@ jobs:
                   results.add(''.join(utf16_str))
               return list(results)
 
-          # ---------- Entropy ----------
           def entropy(data):
               if not data:
                   return 0
@@ -388,7 +353,6 @@ jobs:
                       e += - p_x * math.log(p_x, 2)
               return e
 
-          # ---------- Analyze XOR function ----------
           def analyze_xor_function(r2, addr):
               info = {'addr': addr, 'key': None, 'data_addr': None}
               disasm = r2.cmd(f'pdr @ {addr}')
@@ -413,7 +377,6 @@ jobs:
                               pass
               return info
 
-          # ---------- v3: ELF-aware metadata dump (readelf + pyelftools) ----------
           def dump_elf_metadata(img_path):
               meta = {'is_elf': False, 'readelf_header': '', 'readelf_sections': '',
                       'readelf_symbols': '', 'pyelftools_symbols': [], 'pyelftools_sections': []}
@@ -458,7 +421,6 @@ jobs:
                   meta['pyelftools_error'] = str(e)
               return meta
 
-          # ---------- v3: 既知シンボル辞書とのクロスチェック ----------
           def match_known_oem_symbols(all_symbol_names):
               hits = []
               lowered = {s.lower(): s for s in all_symbol_names if s}
@@ -468,7 +430,6 @@ jobs:
                           hits.append({'known_pattern': known, 'matched_symbol': orig_name})
               return hits
 
-          # ---------- v3: 文字列 -> 関数 xrefチェーン + 疑似コード ----------
           def build_xref_chains(r2, string_addrs, keyword_regex, max_strings=80):
               chains = []
               count = 0
@@ -504,13 +465,11 @@ jobs:
                       })
               return chains
 
-          # ---------- Main analysis ----------
           def analyze_file(img_path, label):
               print(f"[+] Analyzing {label} : {img_path}")
               out_dir = "/tmp/artifacts"
               os.makedirs(out_dir, exist_ok=True)
 
-              # v3: ELFメタデータを先に取得(生バイナリがそのままELFであることを確認する)
               elf_meta = dump_elf_metadata(img_path)
 
               r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
@@ -539,7 +498,6 @@ jobs:
               funcs = r2.cmdj('aflj') or []
               symbols = r2.cmdj('isj') or []
 
-              # XOR loops
               xors = []
               for f in funcs:
                   addr = f.get('addr')
@@ -554,7 +512,6 @@ jobs:
                           'disasm': disasm[:800]
                       })
 
-              # High entropy regions
               high_entropy_regions = []
               sections = r2.cmdj('iSj') or []
               for sec in sections:
@@ -571,7 +528,6 @@ jobs:
                           if e > 6.0:
                               high_entropy_regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
 
-              # ---------- Exhaustive XOR on all data sections (v3: printable-ratio + strict boundary gated) ----------
               decoded_xor = []
               decoded_xor_loose = []
               all_keys = generate_xor_keys()
@@ -605,7 +561,6 @@ jobs:
                       except:
                           continue
 
-                      # v3: strict word-boundary match first (低ノイズ)
                       m = UNLOCK_RE_STRICT.search(dec_str) or re.search(r'(?<![A-Za-z0-9_])(oem|fastboot)(?![A-Za-z0-9_])', dec_str, re.IGNORECASE)
                       if m:
                           window_start = max(0, m.start() - 60)
@@ -622,7 +577,6 @@ jobs:
                                   'printable_ratio': round(ratio, 3),
                                   'section': sec_name
                               })
-                      # v3: 旧来のloose substring一致も参考情報として別枠で残す(既存処理踏襲)
                       if len(decoded_xor_loose) <= 1000 and any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
                           decoded_xor_loose.append({
                               'addr': addr,
@@ -636,7 +590,6 @@ jobs:
                   if len(decoded_xor) > 500 and len(decoded_xor_loose) > 1000:
                       break
 
-              # ---------- OEM command table (既存処理) ----------
               oem_tables = []
               string_addrs = {}
               for s in strings:
@@ -670,15 +623,12 @@ jobs:
                                   'section': r2.cmd(f'iS. @ {ptr:#x}').strip()
                               })
 
-              # ---------- v3: 既知シンボル辞書とのクロスチェック ----------
               symbol_names = [sym.get('name', '') for sym in symbols] + [ps.get('name', '') for ps in elf_meta.get('pyelftools_symbols', [])]
               known_symbol_hits = match_known_oem_symbols(symbol_names)
 
-              # ---------- v3: 文字列 -> 関数 xrefチェーン + 疑似コード ----------
               oem_unlock_regex = build_boundary_regex(['oem', 'unlock', 'fastboot', 'lock'])
               xref_chains = build_xref_chains(r2, string_addrs, oem_unlock_regex, max_strings=80)
 
-              # ---------- Categorize strings (v3: strict + loose 併記) ----------
               fastboot_matches = []
               fastboot_matches_strict = []
               unlock_matches = []
@@ -716,7 +666,6 @@ jobs:
                   if 'partition' in lower_s or any(p in lower_s for p in ['aboot','misc','persist','frp','userdata','boot','xbl','abl']):
                       partition_candidates.add(s)
 
-              # Unlock functions (既存処理)
               unlock_functions = []
               for f in funcs:
                   addr = f.get('addr')
@@ -737,7 +686,6 @@ jobs:
                               unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
                               break
 
-              # Unlock variables (既存処理)
               unlock_vars = []
               for sym in symbols:
                   name = sym.get('name', '')
@@ -753,8 +701,6 @@ jobs:
                               if ref.get('type') == 'data':
                                   unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
 
-              # ---------- v3: ターゲットを絞ったエミュレーション ----------
-              # 既存のXORループ関数だけでなく、oem/unlock文字列を参照するディスパッチ候補関数も対象にする
               emu_results = []
               emu_targets = list({x['addr'] for x in xors[:10]})
               for chain in xref_chains[:10]:
@@ -774,7 +720,6 @@ jobs:
                   except Exception as e:
                       emu_results.append({'function': target_addr, 'error': str(e)[:100]})
 
-              # ---------- Report ----------
               safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
               report_path = f"{out_dir}/{safe_label}_detailed_report.md"
               with open(report_path, 'w') as f:
@@ -956,7 +901,6 @@ jobs:
                   f.write("The input file was scanned for embedded XZ magic bytes. Any successfully decompressed streams have been analyzed as separate 'parts'.\n")
                   f.write("Check the JSON output for detailed carving offsets.\n")
 
-              # ---------- v3: 候補関数アドレス一覧をGhidra連携用に別出力 ----------
               ghidra_targets = sorted({c['function_addr'] for c in xref_chains if isinstance(c.get('function_addr'), int)})
               ghidra_targets += sorted({x['addr'] for x in xors if isinstance(x.get('addr'), int)})
               with open(f"{out_dir}/{safe_label}_ghidra_targets.json", 'w') as f:
@@ -989,7 +933,6 @@ jobs:
               r2.quit()
               print(f"[+] Report for {label} generated.")
 
-          # ---------- Main ----------
           def main():
               if len(sys.argv) < 3:
                   print("Usage: python3 analyze_bootloader.py <xbl.img> <abl.img>")
@@ -1113,10 +1056,6 @@ jobs:
         run: |
           mkdir -p /tmp/ghidra_scripts
           cat > /tmp/ghidra_scripts/DumpOemCandidates.py << 'EOF'
-          # Ghidra headless post-script (Jython)
-          # 対象アドレスリスト(*_ghidra_targets.json)を読み込み、各アドレスを含む関数を
-          # Ghidraのデコンパイラで疑似C化して出力する。radare2側の疑似コード(pdc)とは
-          # 別系統のデコンパイラなので、相互チェックにより解析の信頼性を上げる目的。
           import json
           import os
           from ghidra.app.decompiler import DecompInterface
