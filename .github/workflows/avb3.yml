@@ -3,7 +3,7 @@ name: Next
 on:
   push:
     branches:
-      - main  # 実行するブランチを指定
+      -  実行するブランチを指定
 
 jobs:
   build:
