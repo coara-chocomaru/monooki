@@ -1,0 +1,1219 @@
+name: QCOM Bootloader Full Disassembly & Analysis3 (XBL & ABL, Multi-Angle)
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  full-disassembly:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --privileged
+
+    outputs:
+      artifact-name: ${{ steps.set-artifact-name.outputs.name }}
+
+    steps:
+      - name: Install Git
+        run: |
+          apt-get update -y
+          apt-get install -y git
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Radare2 and Tools
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            wget unzip build-essential \
+            python3 python3-pip python3-dev \
+            git cmake \
+            bsdmainutils \
+            default-jdk-headless \
+            binwalk xz-utils p7zip-full file \
+            liblzma-dev \
+            binutils \
+            gdb-multiarch qemu-user-static
+          apt-get clean
+
+          git clone --depth 1 https://github.com/radareorg/radare2
+          cd radare2
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          make install
+          cd ..
+          rm -rf radare2
+
+          ldconfig
+          export PATH="/usr/local/bin:$PATH"
+          echo "/usr/local/bin" >> $GITHUB_PATH
+          r2 -v
+
+      - name: Install Python libraries
+        run: |
+          pip3 install --upgrade pip
+          pip3 install r2pipe pefile capstone pyelftools binwalk pycryptodome unicorn
+
+      - name: Create Ultra-Comprehensive Analysis Script
+        run: |
+          cat > /tmp/analyze_bootloader.py << 'EOF'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          Ultimate Bootloader Analysis v3 - Multi-stage, exhaustive, multi-angle
+          - Recursive extraction (XZ, LZMA, binwalk) with carving
+          - Full disassembly with radare2 (multiple passes, error recovery)
+          - ELF-aware metadata dump (readelf + pyelftools) - v3
+          - Strict word-boundary keyword matching to suppress false positives - v3
+          - Known Qualcomm ABL/XBL fastboot/oem symbol dictionary matching - v3
+          - Exhaustive XOR brute-force: single, 2-byte, 4-byte, rotated, multi-pass
+          - Printable-ratio gated XOR candidate filtering - v3
+          - Entropy-based region prioritization
+          - UTF-16LE string extraction
+          - String -> function xref chain walking with pseudocode dump - v3
+          - Targeted emulation of oem/unlock dispatch candidates - v3
+          - Re-assembly of fragmented strings
+          - Comprehensive reporting with all potential commands
+          """
+          import os, sys, json, re, subprocess, tempfile, struct, math, binascii, time, hashlib, itertools
+          import r2pipe
+          from collections import defaultdict, Counter
+          import binwalk
+          import lzma
+          import traceback
+
+          # ---------- Configuration ----------
+          FASTBOOT_KEYWORDS = [
+              'flash', 'erase', 'reboot', 'getvar', 'setvar', 'oem',
+              'download', 'continue', 'boot', 'update', 'unlock', 'lock',
+              'device_state', 'secure', 'critical', 'slot', 'partition',
+              'flag', 'set'
+          ]
+          UNLOCK_KEYWORDS = ['unlock', 'lock', 'oem_unlock', 'device_locked',
+                             'device_unlocked', 'lock_state', 'secure_boot',
+                             'unlock_ability', 'allow_unlock', 'unlock_code',
+                             'go', 'flag']
+          VENDOR_KEYWORDS = ['tinno', 'gcom', 'rakuten', 'hand5g', 'rakuten_hand',
+                             'p780', 'oem', 'qcom', 'qualcomm', 'sectools']
+          OEM_COMMAND_PATTERNS = [
+              r'oem\s+unlock', r'oem\s+lock', r'oem\s+device-info',
+              r'oem\s+getvar', r'oem\s+setvar', r'fastboot\s+oem',
+              r'androidboot\.unlocked', r'ro\.oem_unlock',
+              r'oem\s+unlock-go', r'oem\s+set', r'oem\s+flag',
+              r'unlock-go', r'oem\s+.*-go'
+          ]
+
+          # v3: Qualcomm ABL/XBL 実装で頻出するfastboot/oem関連シンボル名の辞書。
+          # strip されていないビルド(今回のxblのように)ではシンボルテーブルから直接
+          # ヒットする可能性が高く、XORブルートフォースより遥かに信頼できる手掛かりになる。
+          KNOWN_OEM_SYMBOLS = [
+              'fastboot_oem_cmd', 'fastboot_oem_unlock', 'fastboot_oem_lock',
+              'fastboot_register', 'fastboot_publish', 'fastboot_getvar_all',
+              'fastboot_init', 'fastboot_usb_init', 'fastboot_handle_command',
+              'oem_unlock_allowed', 'oem_unlock_get_value_from_efs',
+              'oem_unlock_set_value_to_efs', 'set_fastboot_unlock_value',
+              'get_fastboot_unlock_value', 'boot_unlock_check',
+              'device_info_unlock', 'target_is_device_unlocked',
+              'target_unlock_ability', 'aboot_fastboot_register_all',
+              'handle_fastboot_oem', 'fastboot_oem_dispatch',
+              'unlock_device', 'lock_device', 'frp_check', 'oem_lock_state',
+              'is_device_locked', 'is_device_unlocked', 'get_device_lock_state',
+              'set_device_lock_state', 'boot_verify_unlock',
+              'display_unlock_menu', 'unlock_critical_partitions',
+              'fastboot_oem_unlock_critical', 'fastboot_oem_lock_critical'
+          ]
+
+          # v3: 単語境界を要求する正規表現ビルダ。
+          # 「go」のような短いキーワードが乱数バイナリ内で偶然一致する誤検出を大幅に削減する。
+          def build_boundary_regex(words):
+              escaped = sorted((re.escape(w) for w in words), key=len, reverse=True)
+              pattern = r'(?<![A-Za-z0-9_])(' + '|'.join(escaped) + r')(?![A-Za-z0-9_])'
+              return re.compile(pattern, re.IGNORECASE)
+
+          FASTBOOT_RE_STRICT = build_boundary_regex(FASTBOOT_KEYWORDS)
+          UNLOCK_RE_STRICT = build_boundary_regex(UNLOCK_KEYWORDS)
+          VENDOR_RE_STRICT = build_boundary_regex(VENDOR_KEYWORDS)
+
+          def printable_ratio(s):
+              if not s:
+                  return 0.0
+              printable = sum(1 for c in s if 32 <= ord(c) <= 126 or c in '\t\n\r')
+              return printable / len(s)
+
+          # ---------- Recursive extraction ----------
+          def find_xz_magic_offsets(filepath):
+              magic = b'\xFD\x37\x7A\x58\x5A\x00'
+              offsets = []
+              with open(filepath, 'rb') as f:
+                  data = f.read()
+              start = 0
+              while True:
+                  pos = data.find(magic, start)
+                  if pos == -1:
+                      break
+                  offsets.append(pos)
+                  start = pos + 1
+              return offsets
+
+          def carve_xz_streams(filepath, outdir):
+              carved_files = []
+              offsets = find_xz_magic_offsets(filepath)
+              if not offsets:
+                  return carved_files
+              print(f"[*] Found {len(offsets)} XZ magic occurrences in {filepath}")
+              for idx, off in enumerate(offsets):
+                  carved_raw = os.path.join(outdir, f"xz_carved_{idx}_{off:x}.xz")
+                  with open(filepath, 'rb') as fin:
+                      fin.seek(off)
+                      data = fin.read()
+                  with open(carved_raw, 'wb') as fout:
+                      fout.write(data)
+                  decompressed = carved_raw + '.decomp'
+                  try:
+                      subprocess.check_call(
+                          ['xz', '-d', '-k', '-c', carved_raw],
+                          stdout=open(decompressed, 'wb'),
+                          stderr=subprocess.DEVNULL
+                      )
+                      if os.path.exists(decompressed) and os.path.getsize(decompressed) > 0:
+                          carved_files.append(decompressed)
+                          print(f"[+] Successfully decompressed carved stream at offset 0x{off:x}")
+                      else:
+                          os.unlink(decompressed) if os.path.exists(decompressed) else None
+                  except Exception as e:
+                      try:
+                          with open(carved_raw, 'rb') as f:
+                              compressed = f.read()
+                          decomp_data = lzma.decompress(compressed)
+                          with open(decompressed, 'wb') as f:
+                              f.write(decomp_data)
+                          if os.path.getsize(decompressed) > 0:
+                              carved_files.append(decompressed)
+                              print(f"[+] lzma module decompressed carved stream at offset 0x{off:x}")
+                      except Exception as e2:
+                          print(f"[-] Failed to decompress carved stream at 0x{off:x} (xz: {e}, lzma: {e2})")
+                  finally:
+                      if os.path.exists(carved_raw):
+                          os.unlink(carved_raw)
+              return carved_files
+
+          def is_xz_compressed(filepath):
+              with open(filepath, 'rb') as f:
+                  return f.read(6) == b'\xFD\x37\x7A\x58\x5A\x00'
+
+          def decompress_xz(filepath):
+              outpath = filepath + '.decompressed'
+              try:
+                  subprocess.check_call(['xz', '-d', '-k', '-c', filepath], stdout=open(outpath, 'wb'))
+              except:
+                  with open(filepath, 'rb') as f:
+                      compressed = f.read()
+                  decomp_data = lzma.decompress(compressed)
+                  with open(outpath, 'wb') as f:
+                      f.write(decomp_data)
+              return outpath
+
+          def extract_with_binwalk(filepath, outdir):
+              try:
+                  subprocess.check_call(
+                      ['binwalk', '-Me', '--directory='+outdir, filepath],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  )
+              except subprocess.CalledProcessError:
+                  return []
+              extracted_files = []
+              for root, dirs, files in os.walk(outdir):
+                  for f in files:
+                      full = os.path.join(root, f)
+                      if os.path.isfile(full) and not os.path.islink(full):
+                          extracted_files.append(full)
+              return extracted_files
+
+          def prepare_files(filepath):
+              results = []
+              temp_dir = tempfile.mkdtemp(prefix='bootloader_')
+              to_process = [filepath]
+              processed = set()
+              while to_process:
+                  current = to_process.pop()
+                  if current in processed:
+                      continue
+                  processed.add(current)
+                  if is_xz_compressed(current):
+                      decomp = decompress_xz(current)
+                      to_process.append(decomp)
+                      sub_files = extract_with_binwalk(decomp, temp_dir)
+                      for sf in sub_files:
+                          if sf not in processed:
+                              to_process.append(sf)
+                      carved = carve_xz_streams(decomp, temp_dir)
+                      for cf in carved:
+                          if cf not in processed:
+                              to_process.append(cf)
+                      results.append(decomp)
+                  else:
+                      sub_files = extract_with_binwalk(current, temp_dir)
+                      for sf in sub_files:
+                          if sf not in processed:
+                              to_process.append(sf)
+                      carved = carve_xz_streams(current, temp_dir)
+                      for cf in carved:
+                          if cf not in processed:
+                              to_process.append(cf)
+                      results.append(current)
+              seen = set()
+              unique_results = []
+              for f in results:
+                  if f not in seen:
+                      seen.add(f)
+                      unique_results.append(f)
+              return unique_results
+
+          # ---------- Exhaustive XOR key generation ----------
+          def generate_xor_keys():
+              keys = []
+              # Single-byte
+              for i in range(0x100):
+                  keys.append(bytes([i]))
+              # Common single-byte extras
+              extras = [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C, 0x00, 0x80, 0x7F]
+              for v in extras:
+                  keys.append(bytes([v]))
+              # 2-byte
+              common_2 = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA,
+                          0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA,
+                          0x4F45, 0x454D, 0x4D00, 0x004D, 0x0D0A, 0x0A0D, 0x2020, 0x0909]
+              spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343,
+                        0x4F4F, 0x4545, 0x4D4D, 0x004F, 0x4F00, 0x454D, 0x4D45]
+              # ASCII pairs: "OE", "EM", "M ", " O", etc.
+              for c1 in ' OEM':
+                  for c2 in ' OEMlock':
+                      v = ord(c1)<<8 | ord(c2)
+                      common_2.append(v)
+              for k in common_2 + spec_2:
+                  keys.append(k.to_bytes(2, 'little'))
+                  keys.append(k.to_bytes(2, 'big'))
+              # 4-byte
+              common_4 = [0xAA55AA55, 0x5AA55AA5, 0xFFFFFFFF, 0x00000000, 0x01010101, 0x02020202,
+                          0x12345678, 0x87654321, 0xDEADBEEF, 0xCAFEBABE, 0xFEEDFACE, 0x0D15EA5E,
+                          0x4F454D00, 0x004D454F, 0x4F454D20, 0x4F454D4F]
+              spec_4 = [0x044B5134, 0x5134044B, 0x34514B04, 0x4B043451, 0x44B5134]
+              ascii_4 = [0x4F454D00, 0x004D454F, 0x4F454D20, 0x4F454D4F, 0x454D4F00]
+              for k in common_4 + spec_4 + ascii_4:
+                  keys.append(k.to_bytes(4, 'little'))
+                  keys.append(k.to_bytes(4, 'big'))
+              # Register values from previous emulation
+              reg_vals = [0x0c22dc4a, 0x52, 0x01000041, 0x0c2e2338, 0x0c240884, 0x00000110]
+              for v in reg_vals:
+                  if v < 0x100:
+                      keys.append(v.to_bytes(1, 'little'))
+                  elif v < 0x10000:
+                      keys.append(v.to_bytes(2, 'little'))
+                      keys.append(v.to_bytes(2, 'big'))
+                  else:
+                      keys.append(v.to_bytes(4, 'little'))
+                      keys.append(v.to_bytes(4, 'big'))
+              # Remove duplicates
+              seen = set()
+              unique = []
+              for k in keys:
+                  if k not in seen:
+                      seen.add(k)
+                      unique.append(k)
+              return unique
+
+          def try_xor_decode(data, key_bytes):
+              if not isinstance(key_bytes, bytes):
+                  return None
+              key_len = len(key_bytes)
+              if key_len == 1:
+                  key = key_bytes[0]
+                  return bytes([b ^ key for b in data])
+              elif key_len == 2:
+                  key_int = int.from_bytes(key_bytes, 'little')
+                  dec = bytearray()
+                  for i in range(0, len(data) - 1, 2):
+                      chunk = int.from_bytes(data[i:i+2], 'little')
+                      dec += (chunk ^ key_int).to_bytes(2, 'little')
+                  if len(data) % 2 == 1:
+                      dec += (data[-1] ^ (key_int & 0xFF)).to_bytes(1, 'little')
+                  return bytes(dec)
+              elif key_len == 4:
+                  key_int = int.from_bytes(key_bytes, 'little')
+                  dec = bytearray()
+                  for i in range(0, len(data) - 3, 4):
+                      chunk = int.from_bytes(data[i:i+4], 'little')
+                      dec += (chunk ^ key_int).to_bytes(4, 'little')
+                  rem = len(data) % 4
+                  if rem:
+                      for j in range(rem):
+                          dec += (data[-(rem-j)] ^ ((key_int >> (8*j)) & 0xFF)).to_bytes(1, 'little')
+                  return bytes(dec)
+              return None
+
+          # ---------- Extract strings from binary (ASCII + UTF-16LE) ----------
+          def extract_all_strings_from_data(data):
+              results = set()
+              ascii_re = re.compile(b'[ -~]{4,}')
+              for m in ascii_re.finditer(data):
+                  s = m.group().decode('ascii', errors='ignore')
+                  results.add(s)
+              utf16_str = []
+              for i in range(0, len(data)-1, 2):
+                  if data[i+1] == 0 and 32 <= data[i] <= 126:
+                      utf16_str.append(chr(data[i]))
+                  else:
+                      if len(utf16_str) >= 4:
+                          results.add(''.join(utf16_str))
+                      utf16_str = []
+              if len(utf16_str) >= 4:
+                  results.add(''.join(utf16_str))
+              return list(results)
+
+          # ---------- Entropy ----------
+          def entropy(data):
+              if not data:
+                  return 0
+              e = 0
+              for x in range(256):
+                  p_x = float(data.count(x)) / len(data)
+                  if p_x > 0:
+                      e += - p_x * math.log(p_x, 2)
+              return e
+
+          # ---------- Analyze XOR function ----------
+          def analyze_xor_function(r2, addr):
+              info = {'addr': addr, 'key': None, 'data_addr': None}
+              disasm = r2.cmd(f'pdr @ {addr}')
+              for line in disasm.splitlines():
+                  if 'mov' in line and '#' in line:
+                      parts = line.split('#')
+                      if len(parts) > 1:
+                          try:
+                              val = int(parts[1].split()[0], 0)
+                              if val < 0x10000:
+                                  info['key'] = val & 0xFF
+                          except:
+                              pass
+                  if 'ldr' in line and '=' in line:
+                      parts = line.split('=')
+                      if len(parts) > 1:
+                          try:
+                              data_addr = int(parts[1].split()[0], 0)
+                              if data_addr > 0x1000:
+                                  info['data_addr'] = data_addr
+                          except:
+                              pass
+              return info
+
+          # ---------- v3: ELF-aware metadata dump (readelf + pyelftools) ----------
+          def dump_elf_metadata(img_path):
+              meta = {'is_elf': False, 'readelf_header': '', 'readelf_sections': '',
+                      'readelf_symbols': '', 'pyelftools_symbols': [], 'pyelftools_sections': []}
+              try:
+                  with open(img_path, 'rb') as f:
+                      magic = f.read(4)
+                  if magic != b'\x7fELF':
+                      return meta
+                  meta['is_elf'] = True
+              except Exception:
+                  return meta
+
+              for cmd, key in [(['readelf', '-h', img_path], 'readelf_header'),
+                                (['readelf', '-S', '-W', img_path], 'readelf_sections'),
+                                (['readelf', '-s', '-W', img_path], 'readelf_symbols')]:
+                  try:
+                      out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+                      meta[key] = out.decode(errors='ignore')
+                  except Exception as e:
+                      meta[key] = f'(readelf failed: {e})'
+
+              try:
+                  from elftools.elf.elffile import ELFFile
+                  with open(img_path, 'rb') as f:
+                      ef = ELFFile(f)
+                      for section in ef.iter_sections():
+                          meta['pyelftools_sections'].append({
+                              'name': section.name,
+                              'addr': section['sh_addr'],
+                              'size': section['sh_size'],
+                              'type': section['sh_type']
+                          })
+                          if section.name in ('.symtab', '.dynsym'):
+                              for sym in section.iter_symbols():
+                                  if sym.name:
+                                      meta['pyelftools_symbols'].append({
+                                          'name': sym.name,
+                                          'value': sym['st_value'],
+                                          'section': section.name
+                                      })
+              except Exception as e:
+                  meta['pyelftools_error'] = str(e)
+              return meta
+
+          # ---------- v3: 既知シンボル辞書とのクロスチェック ----------
+          def match_known_oem_symbols(all_symbol_names):
+              hits = []
+              lowered = {s.lower(): s for s in all_symbol_names if s}
+              for known in KNOWN_OEM_SYMBOLS:
+                  for low_name, orig_name in lowered.items():
+                      if known in low_name:
+                          hits.append({'known_pattern': known, 'matched_symbol': orig_name})
+              return hits
+
+          # ---------- v3: 文字列 -> 関数 xrefチェーン + 疑似コード ----------
+          def build_xref_chains(r2, string_addrs, keyword_regex, max_strings=80):
+              chains = []
+              count = 0
+              for addr, s in string_addrs.items():
+                  if count >= max_strings:
+                      break
+                  if not keyword_regex.search(s):
+                      continue
+                  count += 1
+                  try:
+                      refs = r2.cmdj(f'axtj {addr:#x}') or []
+                  except Exception:
+                      refs = []
+                  for ref in refs:
+                      fn_addr = ref.get('fcn_addr') or ref.get('from')
+                      if not fn_addr:
+                          continue
+                      pdc = ''
+                      callers = []
+                      try:
+                          r2.cmd(f's {fn_addr:#x}' if isinstance(fn_addr, int) else f's {fn_addr}')
+                          pdc = r2.cmd('pdc')
+                          caller_refs = r2.cmdj(f'axtj {fn_addr:#x}' if isinstance(fn_addr, int) else f'axtj {fn_addr}') or []
+                          callers = [c.get('from') for c in caller_refs if c.get('from')]
+                      except Exception as e:
+                          pdc = f'(decompile failed: {e})'
+                      chains.append({
+                          'string': s,
+                          'string_addr': addr,
+                          'function_addr': fn_addr,
+                          'pseudocode': pdc[:4000],
+                          'callers': callers[:10]
+                      })
+              return chains
+
+          # ---------- Main analysis ----------
+          def analyze_file(img_path, label):
+              print(f"[+] Analyzing {label} : {img_path}")
+              out_dir = "/tmp/artifacts"
+              os.makedirs(out_dir, exist_ok=True)
+
+              # v3: ELFメタデータを先に取得(生バイナリがそのままELFであることを確認する)
+              elf_meta = dump_elf_metadata(img_path)
+
+              r2 = r2pipe.open(img_path, flags=['-e', 'bin.relocs.apply=true'])
+              try:
+                  r2.cmd('e anal.in=io.maps')
+                  r2.cmd('ompg +x')
+                  r2.cmd('ompg +w')
+              except:
+                  pass
+
+              for cmd in ['aaaa', 'aaa', 'aa', 'a']:
+                  try:
+                      print(f"[*] Trying analysis: {cmd}")
+                      r2.cmd(cmd)
+                      break
+                  except Exception as e:
+                      print(f"[-] {cmd} failed: {e}")
+              try:
+                  r2.cmd('aac')
+                  r2.cmd('aav')
+              except:
+                  pass
+
+              info = r2.cmd('iI')
+              strings = r2.cmdj('izzj') or []
+              funcs = r2.cmdj('aflj') or []
+              symbols = r2.cmdj('isj') or []
+
+              # XOR loops
+              xors = []
+              for f in funcs:
+                  addr = f.get('addr')
+                  if not addr:
+                      continue
+                  r2.cmd(f's {addr}')
+                  disasm = r2.cmd('pdr')
+                  if 'eor' in disasm.lower() and ('str' in disasm.lower() or 'stm' in disasm.lower()):
+                      xors.append({
+                          'function': f.get('name', addr),
+                          'addr': addr,
+                          'disasm': disasm[:800]
+                      })
+
+              # High entropy regions
+              high_entropy_regions = []
+              sections = r2.cmdj('iSj') or []
+              for sec in sections:
+                  if sec.get('size', 0) > 64:
+                      addr = sec.get('vaddr', 0)
+                      size = sec.get('size', 0)
+                      if addr and size:
+                          data = r2.cmd(f'px {size} @ {addr}')
+                          try:
+                              raw = bytes.fromhex(''.join(data.split()))
+                          except:
+                              continue
+                          e = entropy(raw)
+                          if e > 6.0:
+                              high_entropy_regions.append({'addr': addr, 'size': size, 'entropy': e, 'section': sec.get('name', '')})
+
+              # ---------- Exhaustive XOR on all data sections (v3: printable-ratio + strict boundary gated) ----------
+              decoded_xor = []
+              decoded_xor_loose = []
+              all_keys = generate_xor_keys()
+              print(f"[*] XOR keys to test: {len(all_keys)}")
+              raw_file_data = open(img_path, 'rb').read()
+              data_sources = []
+              for sec in sections:
+                  addr = sec.get('vaddr', 0)
+                  size = sec.get('size', 0)
+                  if addr and size:
+                      data_hex = r2.cmd(f'px {size} @ {addr}')
+                      try:
+                          data = bytes.fromhex(''.join(data_hex.split()))
+                      except:
+                          continue
+                      data_sources.append((addr, data, sec.get('name', '')))
+              data_sources.append((0, raw_file_data, 'raw_file'))
+
+              for addr, data, sec_name in data_sources:
+                  if len(data) < 64:
+                      continue
+                  for key_bytes in all_keys:
+                      try:
+                          dec = try_xor_decode(data, key_bytes)
+                      except:
+                          continue
+                      if dec is None:
+                          continue
+                      try:
+                          dec_str = dec.decode('latin1', errors='ignore')
+                      except:
+                          continue
+
+                      # v3: strict word-boundary match first (低ノイズ)
+                      m = UNLOCK_RE_STRICT.search(dec_str) or re.search(r'(?<![A-Za-z0-9_])(oem|fastboot)(?![A-Za-z0-9_])', dec_str, re.IGNORECASE)
+                      if m:
+                          window_start = max(0, m.start() - 60)
+                          window_end = min(len(dec_str), m.end() + 60)
+                          window_str = dec_str[window_start:window_end]
+                          ratio = printable_ratio(window_str)
+                          if ratio >= 0.85:
+                              decoded_xor.append({
+                                  'addr': addr,
+                                  'size': len(data),
+                                  'key': key_bytes.hex(),
+                                  'matched_keyword': m.group(0),
+                                  'window': window_str,
+                                  'printable_ratio': round(ratio, 3),
+                                  'section': sec_name
+                              })
+                      # v3: 旧来のloose substring一致も参考情報として別枠で残す(既存処理踏襲)
+                      if len(decoded_xor_loose) <= 1000 and any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
+                          decoded_xor_loose.append({
+                              'addr': addr,
+                              'size': len(data),
+                              'key': key_bytes.hex(),
+                              'decoded_string': dec_str[:200],
+                              'section': sec_name
+                          })
+                      if len(decoded_xor) > 500 and len(decoded_xor_loose) > 1000:
+                          break
+                  if len(decoded_xor) > 500 and len(decoded_xor_loose) > 1000:
+                      break
+
+              # ---------- OEM command table (既存処理) ----------
+              oem_tables = []
+              string_addrs = {}
+              for s in strings:
+                  if 'string' in s:
+                      addr = s.get('addr')
+                      if addr is not None:
+                          if isinstance(addr, str):
+                              addr = int(addr, 0) if addr.startswith('0x') else int(addr)
+                          string_addrs[addr] = s['string']
+              for addr, s in string_addrs.items():
+                  refs = r2.cmdj(f'axtj {addr:#x}') or []
+                  if not refs:
+                      continue
+                  start = addr - 0x100
+                  end = addr + 0x100
+                  data = r2.cmd(f'px {end-start} @ {start}')
+                  try:
+                      raw = bytes.fromhex(''.join(data.split()))
+                  except:
+                      continue
+                  ptr_size = 8 if '64' in r2.cmd('iB') else 4
+                  for i in range(0, len(raw)-ptr_size, ptr_size):
+                      ptr = struct.unpack('<Q' if ptr_size==8 else '<I', raw[i:i+ptr_size])[0]
+                      if r2.cmd(f'iS @ {ptr:#x}') and 'CODE' in r2.cmd(f'iS. @ {ptr:#x}'):
+                          if abs((start+i) - addr) < 0x80:
+                              oem_tables.append({
+                                  'string': s,
+                                  'string_addr': addr,
+                                  'ptr_addr': start+i,
+                                  'ptr_value': ptr,
+                                  'section': r2.cmd(f'iS. @ {ptr:#x}').strip()
+                              })
+
+              # ---------- v3: 既知シンボル辞書とのクロスチェック ----------
+              symbol_names = [sym.get('name', '') for sym in symbols] + [ps.get('name', '') for ps in elf_meta.get('pyelftools_symbols', [])]
+              known_symbol_hits = match_known_oem_symbols(symbol_names)
+
+              # ---------- v3: 文字列 -> 関数 xrefチェーン + 疑似コード ----------
+              oem_unlock_regex = build_boundary_regex(['oem', 'unlock', 'fastboot', 'lock'])
+              xref_chains = build_xref_chains(r2, string_addrs, oem_unlock_regex, max_strings=80)
+
+              # ---------- Categorize strings (v3: strict + loose 併記) ----------
+              fastboot_matches = []
+              fastboot_matches_strict = []
+              unlock_matches = []
+              unlock_matches_strict = []
+              vendor_matches = []
+              vendor_matches_strict = []
+              oem_cmd_matches = []
+              partition_candidates = set()
+              for entry in strings:
+                  s = entry.get('string', '')
+                  addr = entry.get('addr', '')
+                  lower_s = s.lower()
+                  for kw in FASTBOOT_KEYWORDS:
+                      if kw in lower_s:
+                          fastboot_matches.append({'addr': addr, 'string': s, 'keyword': kw})
+                          break
+                  if FASTBOOT_RE_STRICT.search(s):
+                      fastboot_matches_strict.append({'addr': addr, 'string': s})
+                  for ukw in UNLOCK_KEYWORDS:
+                      if ukw in lower_s:
+                          unlock_matches.append({'addr': addr, 'string': s, 'keyword': ukw})
+                          break
+                  if UNLOCK_RE_STRICT.search(s):
+                      unlock_matches_strict.append({'addr': addr, 'string': s})
+                  for vkw in VENDOR_KEYWORDS:
+                      if vkw in lower_s:
+                          vendor_matches.append({'addr': addr, 'string': s, 'keyword': vkw})
+                          break
+                  if VENDOR_RE_STRICT.search(s):
+                      vendor_matches_strict.append({'addr': addr, 'string': s})
+                  for pat in OEM_COMMAND_PATTERNS:
+                      if re.search(pat, lower_s):
+                          oem_cmd_matches.append({'addr': addr, 'string': s, 'pattern': pat})
+                          break
+                  if 'partition' in lower_s or any(p in lower_s for p in ['aboot','misc','persist','frp','userdata','boot','xbl','abl']):
+                      partition_candidates.add(s)
+
+              # Unlock functions (既存処理)
+              unlock_functions = []
+              for f in funcs:
+                  addr = f.get('addr')
+                  name = f.get('name', '')
+                  if not addr:
+                      continue
+                  if any(kw in name.lower() for kw in UNLOCK_KEYWORDS):
+                      r2.cmd(f's {addr}')
+                      disasm = r2.cmd('pdr')
+                      unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm})
+                  else:
+                      refs = r2.cmdj(f'axtj {addr}') or []
+                      for ref in refs:
+                          ref_str = ref.get('string', '')
+                          if any(kw in ref_str.lower() for kw in UNLOCK_KEYWORDS):
+                              r2.cmd(f's {addr}')
+                              disasm = r2.cmd('pdr')
+                              unlock_functions.append({'addr': addr, 'name': name, 'disasm': disasm, 'reason': f'References string: {ref_str}'})
+                              break
+
+              # Unlock variables (既存処理)
+              unlock_vars = []
+              for sym in symbols:
+                  name = sym.get('name', '')
+                  if any(kw in name.lower() for kw in ['unlock', 'lock', 'oem', 'device_state', 'secure_boot', 'go', 'flag', 'set']):
+                      unlock_vars.append({'name': name, 'addr': sym.get('vaddr'), 'type': sym.get('type')})
+              for s in strings:
+                  s_str = s.get('string', '')
+                  if any(kw in s_str.lower() for kw in ['unlock', 'lock', 'unlock-go', 'oem', 'flag']):
+                      addr = s.get('addr')
+                      if addr is not None:
+                          refs = r2.cmdj(f'axtj {addr}') or []
+                          for ref in refs:
+                              if ref.get('type') == 'data':
+                                  unlock_vars.append({'name': f'data_ref_{s_str}', 'addr': ref.get('from'), 'type': 'data reference'})
+
+              # ---------- v3: ターゲットを絞ったエミュレーション ----------
+              # 既存のXORループ関数だけでなく、oem/unlock文字列を参照するディスパッチ候補関数も対象にする
+              emu_results = []
+              emu_targets = list({x['addr'] for x in xors[:10]})
+              for chain in xref_chains[:10]:
+                  fa = chain.get('function_addr')
+                  if fa is not None and fa not in emu_targets:
+                      emu_targets.append(fa)
+
+              for target_addr in emu_targets[:20]:
+                  try:
+                      r2.cmd(f's {target_addr}')
+                      r2.cmd('aae')
+                      r2.cmd('ompg +x')
+                      r2.cmd('ompg +w')
+                      r2.cmd('aec')
+                      regs = r2.cmd('dr')
+                      emu_results.append({'function': target_addr, 'registers': regs, 'note': 'Emulation attempted (v3 targeted).'})
+                  except Exception as e:
+                      emu_results.append({'function': target_addr, 'error': str(e)[:100]})
+
+              # ---------- Report ----------
+              safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', label)
+              report_path = f"{out_dir}/{safe_label}_detailed_report.md"
+              with open(report_path, 'w') as f:
+                  f.write(f"# Bootloader Analysis Report for {label} (v3 multi-angle)\n\n")
+                  f.write("## File Info (radare2)\n")
+                  f.write(f"```\n{info}\n```\n\n")
+
+                  f.write("## ELF Metadata (readelf)\n")
+                  f.write(f"is_elf: {elf_meta.get('is_elf')}\n\n")
+                  f.write("### readelf -h\n```\n" + elf_meta.get('readelf_header', '') + "\n```\n\n")
+                  f.write("### readelf -S\n```\n" + elf_meta.get('readelf_sections', '') + "\n```\n\n")
+                  f.write("### readelf -s\n```\n" + elf_meta.get('readelf_symbols', '')[:20000] + "\n```\n\n")
+
+                  f.write("## Known OEM/Fastboot Symbol Dictionary Hits (v3)\n")
+                  if known_symbol_hits:
+                      f.write("| Known Pattern | Matched Symbol |\n")
+                      f.write("|----------------|-----------------|\n")
+                      for h in known_symbol_hits[:100]:
+                          f.write(f"| {h['known_pattern']} | {h['matched_symbol']} |\n")
+                  else:
+                      f.write("既知シンボル辞書との一致なし。\n")
+
+                  f.write("\n## Fastboot Commands/Keywords (strict word-boundary, v3)\n")
+                  if fastboot_matches_strict:
+                      f.write("| Address | String |\n")
+                      f.write("|---------|--------|\n")
+                      for m in fastboot_matches_strict[:200]:
+                          f.write(f"| {m['addr']} | {m['string']} |\n")
+                  else:
+                      f.write("strictマッチなし。\n")
+
+                  f.write("\n## Fastboot Commands/Keywords (loose substring, legacy)\n")
+                  if fastboot_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in fastboot_matches[:200]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No fastboot-related strings found.\n")
+
+                  f.write("\n## Unlock/Lock Related Strings (strict word-boundary, v3)\n")
+                  if unlock_matches_strict:
+                      f.write("| Address | String |\n")
+                      f.write("|---------|--------|\n")
+                      for m in unlock_matches_strict[:100]:
+                          f.write(f"| {m['addr']} | {m['string']} |\n")
+                  else:
+                      f.write("strictマッチなし。\n")
+
+                  f.write("\n## Unlock/Lock Related Strings (loose substring, legacy)\n")
+                  if unlock_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in unlock_matches[:100]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No unlock-related strings found.\n")
+
+                  f.write("\n## Vendor-specific Strings (strict word-boundary, v3)\n")
+                  if vendor_matches_strict:
+                      f.write("| Address | String |\n")
+                      f.write("|---------|--------|\n")
+                      for m in vendor_matches_strict[:100]:
+                          f.write(f"| {m['addr']} | {m['string']} |\n")
+                  else:
+                      f.write("strictマッチなし。\n")
+
+                  f.write("\n## Vendor-specific Strings (loose substring, legacy)\n")
+                  if vendor_matches:
+                      f.write("| Address | String | Keyword |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in vendor_matches[:100]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['keyword']} |\n")
+                  else:
+                      f.write("No vendor-specific strings found.\n")
+
+                  f.write("\n## OEM Command Patterns\n")
+                  if oem_cmd_matches:
+                      f.write("| Address | String | Pattern |\n")
+                      f.write("|---------|--------|---------|\n")
+                      for m in oem_cmd_matches[:100]:
+                          f.write(f"| {m['addr']} | {m['string']} | {m['pattern']} |\n")
+                  else:
+                      f.write("No explicit OEM command patterns found.\n")
+
+                  f.write("\n## String -> Function Xref Chains with Pseudocode (v3)\n")
+                  if xref_chains:
+                      for c in xref_chains[:30]:
+                          f.write(f"### string \"{c['string']}\" @ {c['string_addr']} -> function {c['function_addr']}\n")
+                          f.write(f"callers: {c['callers']}\n")
+                          f.write("```c\n")
+                          f.write(c['pseudocode'])
+                          f.write("\n```\n\n")
+                  else:
+                      f.write("xrefチェーンなし。\n")
+
+                  f.write("\n## Suspected Functions Handling Unlock (既存処理)\n")
+                  if unlock_functions:
+                      for uf in unlock_functions[:30]:
+                          f.write(f"### Function {uf['name']} at {uf['addr']}\n")
+                          if 'reason' in uf:
+                              f.write(f"Reason: {uf['reason']}\n")
+                          f.write("```asm\n")
+                          f.write(uf['disasm'][:3000])
+                          f.write("\n```\n\n")
+                  else:
+                      f.write("No unlock-related functions identified.\n")
+
+                  f.write("\n## Partition Names Mentioned\n")
+                  if partition_candidates:
+                      for p in sorted(partition_candidates):
+                          f.write(f"- {p}\n")
+                  else:
+                      f.write("No explicit partition names found.\n")
+
+                  f.write("\n## High-Entropy Regions (Possible Encoded Data)\n")
+                  if high_entropy_regions:
+                      f.write("| Address | Size | Entropy | Section |\n")
+                      f.write("|---------|------|---------|---------|\n")
+                      for r in high_entropy_regions[:50]:
+                          f.write(f"| {r['addr']:#x} | {r['size']} | {r['entropy']:.2f} | {r['section']} |\n")
+                  else:
+                      f.write("No high-entropy data regions found.\n")
+
+                  f.write("\n## XOR Decoded Candidates (v3: strict boundary + printable-ratio gated)\n")
+                  if decoded_xor:
+                      f.write("| Address | Section | Key | Matched | Printable Ratio | Window |\n")
+                      f.write("|---------|---------|-----|---------|------------------|--------|\n")
+                      for d in decoded_xor[:200]:
+                          f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['key']} | {d['matched_keyword']} | {d['printable_ratio']} | {d['window'][:80]} |\n")
+                  else:
+                      f.write("strict条件で有意なXORデコード結果は見つからなかった(=単純固定XORキーでの難読化ではない可能性が高い)。\n")
+
+                  f.write("\n## XOR Decoded Strings (loose substring, legacy - 参考情報/誤検出を含む)\n")
+                  if decoded_xor_loose:
+                      f.write("| Address | Section | Key | Decoded Preview |\n")
+                      f.write("|---------|---------|-----|-----------------|\n")
+                      for d in decoded_xor_loose[:200]:
+                          f.write(f"| {d['addr']:#x} | {d.get('section','')} | {d['key']} | {d['decoded_string'][:80]} |\n")
+                  else:
+                      f.write("No decodable strings found via XOR.\n")
+
+                  f.write("\n## OEM Command Table Candidates\n")
+                  if oem_tables:
+                      f.write("| String | String Addr | Ptr Addr | Ptr Value | Section |\n")
+                      f.write("|--------|-------------|----------|-----------|---------|\n")
+                      for t in oem_tables[:30]:
+                          f.write(f"| {t['string']} | {t['string_addr']:#x} | {t['ptr_addr']:#x} | {t['ptr_value']:#x} | {t['section']} |\n")
+                  else:
+                      f.write("No OEM command table candidates found.\n")
+
+                  f.write("\n## Unlock-related Global Variables\n")
+                  if unlock_vars:
+                      f.write("| Name | Address | Type |\n")
+                      f.write("|------|---------|------|\n")
+                      for v in unlock_vars[:50]:
+                          f.write(f"| {v['name']} | {v['addr']:#x} | {v['type']} |\n")
+                  else:
+                      f.write("No unlock-related variables found.\n")
+
+                  f.write("\n## Functions with XOR loops (potential decryption)\n")
+                  if xors:
+                      for x in xors[:20]:
+                          f.write(f"### {x['function']} (addr: {x['addr']})\n")
+                          f.write("```asm\n")
+                          f.write(x['disasm'][:1500])
+                          f.write("\n```\n")
+                  else:
+                      f.write("No XOR loops detected.\n")
+
+                  f.write("\n## Targeted Emulation Results (v3: XOR loops + oem/unlock dispatch candidates)\n")
+                  if emu_results:
+                      for e in emu_results:
+                          f.write(f"- {e}\n")
+                  else:
+                      f.write("No emulation results.\n")
+
+                  f.write("\n## XZ/LZMA Compression Streams Discovered\n")
+                  f.write("The input file was scanned for embedded XZ magic bytes. Any successfully decompressed streams have been analyzed as separate 'parts'.\n")
+                  f.write("Check the JSON output for detailed carving offsets.\n")
+
+              # ---------- v3: 候補関数アドレス一覧をGhidra連携用に別出力 ----------
+              ghidra_targets = sorted({c['function_addr'] for c in xref_chains if isinstance(c.get('function_addr'), int)})
+              ghidra_targets += sorted({x['addr'] for x in xors if isinstance(x.get('addr'), int)})
+              with open(f"{out_dir}/{safe_label}_ghidra_targets.json", 'w') as f:
+                  json.dump({'binary': os.path.basename(img_path), 'label': label, 'targets': sorted(set(ghidra_targets))}, f, indent=2)
+
+              with open(f"{out_dir}/{safe_label}_fastboot_data.json", 'w') as f:
+                  json.dump({
+                      'fastboot_matches': fastboot_matches,
+                      'fastboot_matches_strict': fastboot_matches_strict,
+                      'unlock_matches': unlock_matches,
+                      'unlock_matches_strict': unlock_matches_strict,
+                      'vendor_matches': vendor_matches,
+                      'vendor_matches_strict': vendor_matches_strict,
+                      'oem_cmd_matches': oem_cmd_matches,
+                      'unlock_functions': [{'addr': uf['addr'], 'name': uf['name']} for uf in unlock_functions],
+                      'partition_candidates': list(partition_candidates),
+                      'xor_functions': xors,
+                      'high_entropy_regions': high_entropy_regions,
+                      'xor_decoded_strict': decoded_xor,
+                      'xor_decoded_loose': decoded_xor_loose,
+                      'oem_command_tables': oem_tables,
+                      'unlock_variables': unlock_vars,
+                      'known_symbol_hits': known_symbol_hits,
+                      'xref_chains': xref_chains,
+                      'emulation_results': emu_results,
+                      'elf_metadata_sections': elf_meta.get('pyelftools_sections', []),
+                      'elf_metadata_symbol_count': len(elf_meta.get('pyelftools_symbols', []))
+                  }, f, indent=2)
+
+              r2.quit()
+              print(f"[+] Report for {label} generated.")
+
+          # ---------- Main ----------
+          def main():
+              if len(sys.argv) < 3:
+                  print("Usage: python3 analyze_bootloader.py <xbl.img> <abl.img>")
+                  sys.exit(1)
+
+              all_files = []
+              for idx, img in enumerate(sys.argv[1:3]):
+                  label = "xbl" if idx == 0 else "abl"
+                  files = prepare_files(img)
+                  for f in files:
+                      base_label = label
+                      if len(files) > 1:
+                          part_idx = files.index(f)
+                          base_label = f"{label}_part{part_idx}"
+                      if 'xz_carved' in f or '.decomp' in f:
+                          base_label += "_decompressed"
+                      all_files.append((f, base_label))
+
+              seen = set()
+              for f, lbl in all_files:
+                  if f in seen:
+                      continue
+                  seen.add(f)
+                  analyze_file(f, lbl)
+
+              print("[+] All analysis complete. Reports are in /tmp/artifacts/")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          chmod +x /tmp/analyze_bootloader.py
+
+      - name: Run Advanced Analysis
+        run: |
+          export PATH="/usr/local/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+          python3 /tmp/analyze_bootloader.py ./xbl.img ./abl.img
+
+      - name: Generate HTML Summary
+        run: |
+          cd /tmp/artifacts
+          cat > summary.html << 'HTML'
+          <html><head><title>Bootloader Analysis Summary (v3)</title>
+          <style>body{font-family:sans-serif;margin:40px;background:#f0f0f0;}
+          h1{color:#333;}table{border-collapse:collapse;width:100%;background:#fff;}
+          th,td{border:1px solid #ddd;padding:8px;text-align:left;}
+          th{background:#4CAF50;color:#fff;}
+          tr:nth-child(even){background:#f2f2f2;}
+          .warning{color:#d9534f;}
+          </style></head>
+          <body>
+          <h1>QCOM Bootloader Analysis (v3, multi-angle)</h1>
+          <h2>Generated Artifacts</h2>
+          <ul>
+          <li><a href="xbl_detailed_report.md">XBL Detailed Report</a></li>
+          <li><a href="abl_detailed_report.md">ABL Detailed Report</a></li>
+          <li><a href="xbl_fastboot_data.json">XBL JSON Data</a></li>
+          <li><a href="abl_fastboot_data.json">ABL JSON Data</a></li>
+          <li><a href="xbl_ghidra_targets.json">XBL Ghidra Target Addresses</a></li>
+          <li><a href="abl_ghidra_targets.json">ABL Ghidra Target Addresses</a></li>
+          </ul>
+          <h2>Quick Summary</h2>
+          <p>strict(単語境界)一致とloose(部分一致, 誤検出含む旧来ロジック)を両方出力しています。まずstrict側とknown_symbol_hits、xref_chainsを確認してください。</p>
+          <p class="warning">strictでヒットが無い場合、固定XORキー難読化ではない可能性が高いので、high_entropy_regionsとghidra-deep-diveジョブの疑似コードを確認してください。</p>
+          <p>Embedded XZ/LZMA streams were automatically carved, decompressed, and analyzed as separate parts.</p>
+          </body></html>
+          HTML
+
+      - name: Set artifact name
+        id: set-artifact-name
+        run: echo "name=qcom_bootloader_analysis" >> "$GITHUB_OUTPUT"
+
+      - name: Upload All Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcom_bootloader_analysis
+          path: |
+            /tmp/artifacts/*.txt
+            /tmp/artifacts/*.md
+            /tmp/artifacts/*.json
+            /tmp/artifacts/*.html
+          retention-days: 30
+          compression-level: 0
+
+      - name: Notify Completion
+        if: success()
+        run: |
+          echo "::notice title=Bootloader Analysis Complete::Reports and disassembly artifacts uploaded."
+
+  ghidra-deep-dive:
+    needs: full-disassembly
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download radare2-stage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: qcom_bootloader_analysis
+          path: /tmp/r2_artifacts
+
+      - name: Install Java
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openjdk-17-jdk unzip wget
+
+      - name: Download and install Ghidra
+        run: |
+          GHIDRA_VERSION="11.1.2"
+          GHIDRA_DATE="20240709"
+          GHIDRA_URL="https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip"
+          wget -q "$GHIDRA_URL" -O /tmp/ghidra.zip
+          unzip -q /tmp/ghidra.zip -d /tmp/ghidra_install
+          GHIDRA_DIR=$(find /tmp/ghidra_install -maxdepth 1 -type d -name 'ghidra_*')
+          echo "GHIDRA_HOME=$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+      - name: Create Ghidra headless decompile script (Jython)
+        run: |
+          mkdir -p /tmp/ghidra_scripts
+          cat > /tmp/ghidra_scripts/DumpOemCandidates.py << 'EOF'
+          # Ghidra headless post-script (Jython)
+          # 対象アドレスリスト(*_ghidra_targets.json)を読み込み、各アドレスを含む関数を
+          # Ghidraのデコンパイラで疑似C化して出力する。radare2側の疑似コード(pdc)とは
+          # 別系統のデコンパイラなので、相互チェックにより解析の信頼性を上げる目的。
+          import json
+          import os
+          from ghidra.app.decompiler import DecompInterface
+          from ghidra.util.task import ConsoleTaskMonitor
+
+          targets_file = os.environ.get('GHIDRA_TARGETS_FILE')
+          out_dir = os.environ.get('GHIDRA_OUT_DIR')
+
+          if targets_file is None or out_dir is None:
+              print("GHIDRA_TARGETS_FILE / GHIDRA_OUT_DIR is not set, skipping.")
+          else:
+              with open(targets_file, 'r') as f:
+                  data = json.load(f)
+
+              label = data.get('label', 'unknown')
+              targets = data.get('targets', [])
+
+              ifc = DecompInterface()
+              ifc.openProgram(currentProgram)
+              monitor = ConsoleTaskMonitor()
+
+              fm = currentProgram.getFunctionManager()
+              addr_factory = currentProgram.getAddressFactory()
+
+              results = []
+              for t in targets:
+                  try:
+                      addr = addr_factory.getAddress(hex(t))
+                      func = fm.getFunctionContaining(addr)
+                      if func is None:
+                          results.append({'target': hex(t), 'status': 'no_function_found'})
+                          continue
+                      res = ifc.decompileFunction(func, 60, monitor)
+                      if res.decompileCompleted():
+                          c_code = res.getDecompiledFunction().getC()
+                          results.append({
+                              'target': hex(t),
+                              'function_name': func.getName(),
+                              'function_entry': hex(func.getEntryPoint().getOffset()),
+                              'status': 'ok',
+                              'c_code': c_code
+                          })
+                      else:
+                          results.append({'target': hex(t), 'status': 'decompile_failed'})
+                  except Exception as e:
+                      results.append({'target': hex(t), 'status': 'error', 'error': str(e)})
+
+              out_path = os.path.join(out_dir, label + '_ghidra_decompiled.json')
+              with open(out_path, 'w') as f:
+                  json.dump(results, f, indent=2)
+
+              c_out_path = os.path.join(out_dir, label + '_ghidra_decompiled.c')
+              with open(c_out_path, 'w') as f:
+                  for r in results:
+                      f.write('// ---- target %s status=%s ----\n' % (r.get('target'), r.get('status')))
+                      if r.get('c_code'):
+                          f.write(r['c_code'])
+                          f.write('\n\n')
+
+              ifc.dispose()
+              print("Ghidra decompile dump written: %s" % out_path)
+          EOF
+
+      - name: Run Ghidra headless analysis for xbl targets
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/ghidra_out
+          export GHIDRA_TARGETS_FILE=/tmp/r2_artifacts/xbl_ghidra_targets.json
+          export GHIDRA_OUT_DIR=/tmp/ghidra_out
+          "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra_project GhidraOemProject \
+            -import ./xbl.img -overwrite \
+            -scriptPath /tmp/ghidra_scripts \
+            -postScript DumpOemCandidates.py \
+            -analysisTimeoutPerFile 1800
+
+      - name: Run Ghidra headless analysis for abl targets
+        continue-on-error: true
+        run: |
+          export GHIDRA_TARGETS_FILE=/tmp/r2_artifacts/abl_ghidra_targets.json
+          export GHIDRA_OUT_DIR=/tmp/ghidra_out
+          "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra_project GhidraOemProject \
+            -import ./abl.img -overwrite \
+            -scriptPath /tmp/ghidra_scripts \
+            -postScript DumpOemCandidates.py \
+            -analysisTimeoutPerFile 1800
+
+      - name: Upload Ghidra deep-dive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcom_bootloader_ghidra_deepdive
+          path: |
+            /tmp/ghidra_out/*.json
+            /tmp/ghidra_out/*.c
+          retention-days: 30
+          compression-level: 0
+
+      - name: Notify Completion
+        if: success()
+        run: |
+          echo "::notice title=Ghidra Deep-Dive Complete::Decompiled pseudo-C for oem/unlock xref candidates uploaded."
