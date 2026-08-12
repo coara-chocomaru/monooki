@@ -234,16 +234,24 @@ jobs:
           def generate_xor_keys():
               keys = []
               # Single-byte
-              keys.extend(range(0x100))
-              # 2-byte: all possible? Too many (65536) but we can sample and add common ones
+              for i in range(0x100):
+                  keys.append(bytes([i]))
+              # Common single-byte extras
+              extras = [0xAA, 0x55, 0xFF, 0x01, 0x02, 0x5A, 0xA5, 0x3C, 0x00, 0x80, 0x7F]
+              for v in extras:
+                  keys.append(bytes([v]))
+              # 2-byte
               common_2 = [0xAA55, 0x5AA5, 0xFFFF, 0x0000, 0x0101, 0x0202, 0x5555, 0xAAAA,
                           0x1234, 0x4321, 0xDEAD, 0xBEEF, 0xCAFE, 0xFECA, 0xABCD, 0xDCBA,
                           0x4F45, 0x454D, 0x4D00, 0x004D, 0x0D0A, 0x0A0D, 0x2020, 0x0909]
               spec_2 = [0x5134, 0x044B, 0x55AA, 0xAA55, 0x4B51, 0x3451, 0x3413, 0x1343,
                         0x4F4F, 0x4545, 0x4D4D, 0x004F, 0x4F00, 0x454D, 0x4D45]
-              # Also add common ASCII pairs: "OE", "EM", "M ", " O", etc.
-              ascii_pairs = [ord(c1)<<8 | ord(c2) for c1 in ' OEM' for c2 in ' OEMlock']
-              for k in common_2 + spec_2 + ascii_pairs:
+              # ASCII pairs: "OE", "EM", "M ", " O", etc.
+              for c1 in ' OEM':
+                  for c2 in ' OEMlock':
+                      v = ord(c1)<<8 | ord(c2)
+                      common_2.append(v)
+              for k in common_2 + spec_2:
                   keys.append(k.to_bytes(2, 'little'))
                   keys.append(k.to_bytes(2, 'big'))
               # 4-byte
@@ -276,6 +284,8 @@ jobs:
               return unique
 
           def try_xor_decode(data, key_bytes):
+              if not isinstance(key_bytes, bytes):
+                  return None
               key_len = len(key_bytes)
               if key_len == 1:
                   key = key_bytes[0]
@@ -434,23 +444,31 @@ jobs:
               print(f"[*] XOR keys to test: {len(all_keys)}")
               # Also try the raw binary data as a whole
               raw_file_data = open(img_path, 'rb').read()
-              for sec in sections + [{'vaddr': 0, 'size': len(raw_file_data), 'name': 'raw_file'}]:
+              # Collect all data sources: sections plus raw file
+              data_sources = []
+              for sec in sections:
                   addr = sec.get('vaddr', 0)
                   size = sec.get('size', 0)
-                  if not size or size < 64:
-                      continue
-                  # Get data
-                  if addr == 0:
-                      data = raw_file_data
-                  else:
+                  if addr and size:
                       data_hex = r2.cmd(f'px {size} @ {addr}')
                       try:
                           data = bytes.fromhex(''.join(data_hex.split()))
                       except:
                           continue
+                      data_sources.append((addr, data, sec.get('name', '')))
+              # Add raw file as a whole
+              data_sources.append((0, raw_file_data, 'raw_file'))
+              # Also add decompressed parts if they are separate files? (handled by prepare_files)
+
+              for addr, data, sec_name in data_sources:
+                  if len(data) < 64:
+                      continue
                   # Try each key
                   for key_bytes in all_keys:
-                      dec = try_xor_decode(data, key_bytes)
+                      try:
+                          dec = try_xor_decode(data, key_bytes)
+                      except:
+                          continue
                       if dec is None:
                           continue
                       # Check for keywords
@@ -458,17 +476,18 @@ jobs:
                           dec_str = dec.decode('ascii', errors='ignore')
                       except:
                           continue
+                      # Look for specific patterns
                       if any(kw in dec_str.lower() for kw in UNLOCK_KEYWORDS + ['oem', 'fastboot', 'unlock', 'lock', 'go', 'flag', 'set']):
                           decoded_xor.append({
                               'addr': addr,
-                              'size': size,
+                              'size': len(data),
                               'key': key_bytes.hex(),
                               'decoded_string': dec_str[:200],
-                              'section': sec.get('name', '')
+                              'section': sec_name
                           })
-                          if len(decoded_xor) > 500:
+                          if len(decoded_xor) > 1000:
                               break
-                  if len(decoded_xor) > 500:
+                  if len(decoded_xor) > 1000:
                       break
 
               # ---------- OEM command table ----------
