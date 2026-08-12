@@ -5,15 +5,18 @@ on:
     branches:
       - main
       - dev
+
   pull_request:
     branches:
       - main
+
   workflow_dispatch:
     inputs:
       zip_url:
-        description: Analysis ZIP URL
-        required: true
+        description: ZIP URL to download and recursively analyze
+        required: false
         type: string
+        default: https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/rakuten_data_dump.zip
 
 jobs:
   full-disassembly:
@@ -24,20 +27,29 @@ jobs:
       options: --privileged
 
     env:
-      ZIP_URL: ${{ inputs.zip_url || vars.ANALYSIS_ZIP_URL || secrets.ANALYSIS_ZIP_URL }}
+      ZIP_URL: ${{ github.event.inputs.zip_url || 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/rakuten_data_dump.zip' }}
       ANALYSIS_ROOT: ${{ github.workspace }}/analysis
       ARTIFACT_ROOT: ${{ github.workspace }}/artifacts
+      PYTHONUNBUFFERED: "1"
+      PATH: /usr/local/bin:/usr/bin:/bin
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
 
     steps:
-      - name: Install Git
+      - name: Install Git and Base Tools
         shell: bash
         run: |
           set -e
+
+          export DEBIAN_FRONTEND=noninteractive
+
           apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+
+          apt-get install -y --no-install-recommends \
             git \
-            ca-certificates \
-            curl
+            curl \
+            wget \
+            ca-certificates
+
           apt-get clean
           rm -rf /var/lib/apt/lists/*
 
@@ -45,19 +57,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Validate ZIP URL
-        shell: bash
-        run: |
-          set -e
-
-          if [ -z "${ZIP_URL}" ]; then
-            echo "ZIP_URL is empty."
-            echo "Set workflow_dispatch input zip_url, repository variable ANALYSIS_ZIP_URL, or secret ANALYSIS_ZIP_URL."
-            exit 1
-          fi
-
-          echo "ZIP_URL=${ZIP_URL}"
 
       - name: Install Analysis Tools
         shell: bash
@@ -69,8 +68,6 @@ jobs:
           apt-get update -y
 
           apt-get install -y --no-install-recommends \
-            wget \
-            curl \
             unzip \
             zip \
             p7zip-full \
@@ -102,28 +99,32 @@ jobs:
           apt-get clean
           rm -rf /var/lib/apt/lists/*
 
-          if ! command -v r2 >/dev/null 2>&1; then
-            rm -rf /tmp/radare2
-            git clone --depth 1 https://github.com/radareorg/radare2.git /tmp/radare2
-            cd /tmp/radare2
-            ./configure --prefix=/usr/local
-            make -j"$(nproc)"
-            make install
-            cd /
-            rm -rf /tmp/radare2
-          fi
+          rm -rf /tmp/radare2
+
+          git clone \
+            --depth 1 \
+            https://github.com/radareorg/radare2.git \
+            /tmp/radare2
+
+          cd /tmp/radare2
+
+          ./configure \
+            --prefix=/usr/local
+
+          make -j"$(nproc)"
+
+          make install
+
+          cd /
+
+          rm -rf /tmp/radare2
 
           ldconfig
 
-          echo "/usr/local/bin" >> "${GITHUB_PATH}"
-
-          export PATH="/usr/local/bin:${PATH}"
-
           r2 -v
+          python3 --version
           file --version
           7z i >/dev/null 2>&1
-          binwalk --help >/dev/null 2>&1 || true
-          python3 --version
 
       - name: Install Python Libraries
         shell: bash
@@ -141,7 +142,7 @@ jobs:
             unicorn \
             python-magic
 
-      - name: Prepare Analysis Directories
+      - name: Prepare Directories
         shell: bash
         run: |
           set -e
@@ -154,11 +155,24 @@ jobs:
             "${ANALYSIS_ROOT}/files" \
             "${ANALYSIS_ROOT}/extracted" \
             "${ANALYSIS_ROOT}/work" \
+            "${ARTIFACT_ROOT}" \
+            "${ARTIFACT_ROOT}/logs" \
             "${ARTIFACT_ROOT}/reports" \
             "${ARTIFACT_ROOT}/reports/files" \
             "${ARTIFACT_ROOT}/reports/disassembly" \
-            "${ARTIFACT_ROOT}/raw" \
-            "${ARTIFACT_ROOT}/logs"
+            "${ARTIFACT_ROOT}/raw"
+
+      - name: Validate ZIP URL
+        shell: bash
+        run: |
+          set -e
+
+          if [ -z "${ZIP_URL}" ]; then
+            echo "ZIP_URL is empty."
+            exit 1
+          fi
+
+          echo "ZIP_URL=${ZIP_URL}"
 
       - name: Download ZIP
         shell: bash
@@ -168,7 +182,7 @@ jobs:
           curl \
             --fail \
             --location \
-            --retry 5 \
+            --retry 8 \
             --retry-delay 5 \
             --retry-all-errors \
             --connect-timeout 30 \
@@ -176,24 +190,33 @@ jobs:
             --output "${ANALYSIS_ROOT}/input/source.zip" \
             "${ZIP_URL}"
 
-          test -f "${ANALYSIS_ROOT}/input/source.zip"
+          test -f \
+            "${ANALYSIS_ROOT}/input/source.zip"
 
-          FILE_SIZE="$(stat -c '%s' "${ANALYSIS_ROOT}/input/source.zip")"
+          SOURCE_SIZE="$(stat -c '%s' "${ANALYSIS_ROOT}/input/source.zip")"
 
-          if [ "${FILE_SIZE}" -le 0 ]; then
+          if [ "${SOURCE_SIZE}" -le 0 ]; then
             echo "Downloaded ZIP is empty."
             exit 1
           fi
 
-          file "${ANALYSIS_ROOT}/input/source.zip"
+          file \
+            "${ANALYSIS_ROOT}/input/source.zip"
 
           sha256sum \
             "${ANALYSIS_ROOT}/input/source.zip" \
-            | tee "${ARTIFACT_ROOT}/logs/source_sha256.txt"
+            | tee \
+            "${ARTIFACT_ROOT}/logs/source_sha256.txt"
+
+          md5sum \
+            "${ANALYSIS_ROOT}/input/source.zip" \
+            | tee \
+            "${ARTIFACT_ROOT}/logs/source_md5.txt"
 
           stat \
             "${ANALYSIS_ROOT}/input/source.zip" \
-            | tee "${ARTIFACT_ROOT}/logs/source_stat.txt"
+            | tee \
+            "${ARTIFACT_ROOT}/logs/source_stat.txt"
 
       - name: Create Recursive Analysis Script
         shell: bash
@@ -210,8 +233,8 @@ jobs:
           import shutil
           import hashlib
           import subprocess
-          import tarfile
           import zipfile
+          import tarfile
           import gzip
           import bz2
           import lzma
@@ -234,6 +257,7 @@ jobs:
           REPORT_ROOT = ARTIFACT_ROOT / "reports"
           REPORT_FILES_ROOT = REPORT_ROOT / "files"
           REPORT_DISASM_ROOT = REPORT_ROOT / "disassembly"
+
           RAW_ROOT = ARTIFACT_ROOT / "raw"
           LOG_ROOT = ARTIFACT_ROOT / "logs"
 
@@ -241,8 +265,6 @@ jobs:
           MAX_FILES = 100000
           MAX_DECOMPRESSED_FILE_SIZE = 1024 * 1024 * 1024
           READ_CHUNK = 1024 * 1024
-          STRING_MIN_LENGTH = 4
-          R2_TIMEOUT = 900
 
           FASTBOOT_KEYWORDS = [
               "flash",
@@ -263,7 +285,6 @@ jobs:
               "slot",
               "partition",
               "flag",
-              "set",
               "userdata",
               "recovery",
               "system",
@@ -275,7 +296,9 @@ jobs:
               "sbl",
               "tz",
               "hyp",
-              "devcfg"
+              "devcfg",
+              "vbmeta",
+              "super"
           ]
 
           UNLOCK_KEYWORDS = [
@@ -303,12 +326,9 @@ jobs:
               "qcom",
               "snapdragon",
               "littlekernel",
-              "lk",
-              "abl",
-              "xbl",
-              "sectools",
-              "sahara",
+              "fastboot",
               "firehose",
+              "sahara",
               "edl",
               "smem",
               "rpm",
@@ -316,7 +336,8 @@ jobs:
               "hyp",
               "devcfg",
               "uefi",
-              "fastboot"
+              "xbl",
+              "abl"
           ]
 
           OEM_COMMAND_PATTERNS = [
@@ -350,44 +371,96 @@ jobs:
                       timeout=timeout,
                       cwd=cwd
                   )
-                  return result.returncode, result.stdout
+
+                  return (
+                      result.returncode,
+                      result.stdout
+                  )
+
               except subprocess.TimeoutExpired as exc:
-                  output = exc.stdout if isinstance(exc.stdout, str) else ""
-                  return 124, output + "\nTIMEOUT\n"
+                  output = (
+                      exc.stdout
+                      if isinstance(
+                          exc.stdout,
+                          str
+                      )
+                      else ""
+                  )
+
+                  return (
+                      124,
+                      output + "\nTIMEOUT\n"
+                  )
+
               except Exception as exc:
-                  return 125, str(exc)
+                  return (
+                      125,
+                      str(exc)
+                  )
 
           def safe_name(value, limit=180):
               value = str(value)
-              value = value.replace("\\", "_")
-              value = value.replace("/", "_")
-              value = re.sub(r"[^A-Za-z0-9._@+-]+", "_", value)
-              value = value.strip("._")
+              value = value.replace(
+                  "\\",
+                  "_"
+              )
+              value = value.replace(
+                  "/",
+                  "_"
+              )
+              value = re.sub(
+                  r"[^A-Za-z0-9._@+-]+",
+                  "_",
+                  value
+              )
+              value = value.strip(
+                  "._"
+              )
+
               if not value:
                   value = "file"
+
               return value[:limit]
 
           def sha256_file(path):
               digest = hashlib.sha256()
 
-              with open(path, "rb") as f:
+              with open(
+                  path,
+                  "rb"
+              ) as f:
                   while True:
-                      chunk = f.read(READ_CHUNK)
+                      chunk = f.read(
+                          READ_CHUNK
+                      )
+
                       if not chunk:
                           break
-                      digest.update(chunk)
+
+                      digest.update(
+                          chunk
+                      )
 
               return digest.hexdigest()
 
           def md5_file(path):
               digest = hashlib.md5()
 
-              with open(path, "rb") as f:
+              with open(
+                  path,
+                  "rb"
+              ) as f:
                   while True:
-                      chunk = f.read(READ_CHUNK)
+                      chunk = f.read(
+                          READ_CHUNK
+                      )
+
                       if not chunk:
                           break
-                      digest.update(chunk)
+
+                      digest.update(
+                          chunk
+                      )
 
               return digest.hexdigest()
 
@@ -395,14 +468,21 @@ jobs:
               counts = [0] * 256
               total = 0
 
-              with open(path, "rb") as f:
+              with open(
+                  path,
+                  "rb"
+              ) as f:
                   while True:
-                      chunk = f.read(READ_CHUNK)
+                      chunk = f.read(
+                          READ_CHUNK
+                      )
 
                       if not chunk:
                           break
 
-                      total += len(chunk)
+                      total += len(
+                          chunk
+                      )
 
                       for value in chunk:
                           counts[value] += 1
@@ -410,14 +490,22 @@ jobs:
               if total == 0:
                   return 0.0
 
-              entropy_value = 0.0
+              result = 0.0
 
               for count in counts:
                   if count:
-                      probability = count / total
-                      entropy_value -= probability * math.log2(probability)
+                      probability = (
+                          count / total
+                      )
 
-              return entropy_value
+                      result -= (
+                          probability
+                          * math.log2(
+                              probability
+                          )
+                      )
+
+              return result
 
           def block_entropy(data):
               if not data:
@@ -428,52 +516,92 @@ jobs:
               for value in data:
                   counts[value] += 1
 
-              total = len(data)
-              entropy_value = 0.0
+              total = len(
+                  data
+              )
+
+              result = 0.0
 
               for count in counts:
                   if count:
-                      probability = count / total
-                      entropy_value -= probability * math.log2(probability)
+                      probability = (
+                          count / total
+                      )
 
-              return entropy_value
+                      result -= (
+                          probability
+                          * math.log2(
+                              probability
+                          )
+                      )
 
-          def entropy_regions(path, block_size=65536, threshold=7.0):
-              regions = []
+              return result
+
+          def entropy_regions(
+              path,
+              block_size=65536,
+              threshold=7.0
+          ):
+              result = []
               offset = 0
 
-              with open(path, "rb") as f:
+              with open(
+                  path,
+                  "rb"
+              ) as f:
                   while True:
-                      block = f.read(block_size)
+                      block = f.read(
+                          block_size
+                      )
 
                       if not block:
                           break
 
-                      entropy_value = block_entropy(block)
+                      entropy_value = block_entropy(
+                          block
+                      )
 
-                      if entropy_value >= threshold:
-                          regions.append(
+                      if (
+                          entropy_value
+                          >= threshold
+                      ):
+                          result.append(
                               {
                                   "offset": offset,
-                                  "size": len(block),
-                                  "entropy": round(entropy_value, 6)
+                                  "size": len(
+                                      block
+                                  ),
+                                  "entropy": round(
+                                      entropy_value,
+                                      6
+                                  )
                               }
                           )
 
-                      offset += len(block)
+                      offset += len(
+                          block
+                      )
 
-              return regions
+              return result
 
-          def hex_preview(path, size=512):
-              with open(path, "rb") as f:
-                  data = f.read(size)
+          def hex_preview(path, size=1024):
+              with open(
+                  path,
+                  "rb"
+              ) as f:
+                  data = f.read(
+                      size
+                  )
 
               return " ".join(
                   f"{value:02x}"
                   for value in data
               )
 
-          def safe_extract_path(destination, member_name):
+          def safe_extract_path(
+              destination,
+              member_name
+          ):
               destination_real = os.path.realpath(
                   destination
               )
@@ -485,22 +613,23 @@ jobs:
                   )
               )
 
-              if target_real == destination_real:
-                  return True
-
-              return target_real.startswith(
-                  destination_real + os.sep
+              return (
+                  target_real == destination_real
+                  or target_real.startswith(
+                      destination_real + os.sep
+                  )
               )
 
-          def safe_extract_zip(path, destination):
-              destination = str(destination)
-
+          def safe_extract_zip(
+              path,
+              destination
+          ):
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              extracted = []
+              result = []
 
               with zipfile.ZipFile(
                   path,
@@ -528,22 +657,24 @@ jobs:
                           continue
 
                       os.makedirs(
-                          os.path.dirname(target),
+                          os.path.dirname(
+                              target
+                          ),
                           exist_ok=True
                       )
 
                       with archive.open(
                           member,
                           "r"
-                      ) as src:
+                      ) as source:
                           with open(
                               target,
                               "wb"
-                          ) as dst:
+                          ) as output:
                               shutil.copyfileobj(
-                                  src,
-                                  dst,
-                                  length=READ_CHUNK
+                                  source,
+                                  output,
+                                  READ_CHUNK
                               )
 
                       if not os.path.isfile(
@@ -558,22 +689,26 @@ jobs:
                       except Exception:
                           continue
 
-                      if size <= MAX_DECOMPRESSED_FILE_SIZE:
-                          extracted.append(
+                      if (
+                          size
+                          <= MAX_DECOMPRESSED_FILE_SIZE
+                      ):
+                          result.append(
                               target
                           )
 
-              return extracted
+              return result
 
-          def safe_extract_tar(path, destination):
-              destination = str(destination)
-
+          def safe_extract_tar(
+              path,
+              destination
+          ):
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              extracted = []
+              result = []
 
               with tarfile.open(
                   path,
@@ -605,27 +740,29 @@ jobs:
                           )
                           continue
 
-                      extracted_file = archive.extractfile(
+                      source = archive.extractfile(
                           member
                       )
 
-                      if extracted_file is None:
+                      if source is None:
                           continue
 
                       os.makedirs(
-                          os.path.dirname(target),
+                          os.path.dirname(
+                              target
+                          ),
                           exist_ok=True
                       )
 
-                      with extracted_file:
+                      with source:
                           with open(
                               target,
                               "wb"
-                          ) as dst:
+                          ) as output:
                               shutil.copyfileobj(
-                                  extracted_file,
-                                  dst,
-                                  length=READ_CHUNK
+                                  source,
+                                  output,
+                                  READ_CHUNK
                               )
 
                       if not os.path.isfile(
@@ -640,45 +777,47 @@ jobs:
                       except Exception:
                           continue
 
-                      if size <= MAX_DECOMPRESSED_FILE_SIZE:
-                          extracted.append(
+                      if (
+                          size
+                          <= MAX_DECOMPRESSED_FILE_SIZE
+                      ):
+                          result.append(
                               target
                           )
 
-              return extracted
+              return result
 
-          def safe_extract_7z(path, destination):
-              destination = str(destination)
-
+          def safe_extract_7z(
+              path,
+              destination
+          ):
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              command = [
-                  "7z",
-                  "x",
-                  "-y",
-                  "-bd",
-                  f"-o{destination}",
-                  path
-              ]
-
               code, output = run_command(
-                  command,
+                  [
+                      "7z",
+                      "x",
+                      "-y",
+                      "-bd",
+                      f"-o{destination}",
+                      path
+                  ],
                   timeout=1800
               )
 
-              extracted = []
+              result = []
 
               if code != 0:
                   return (
-                      extracted,
+                      result,
                       code,
                       output
                   )
 
-              for root, dirs, files in os.walk(
+              for root, directories, files in os.walk(
                   destination
               ):
                   for filename in files:
@@ -699,15 +838,16 @@ jobs:
                       except Exception:
                           continue
 
-                      if size > MAX_DECOMPRESSED_FILE_SIZE:
-                          continue
-
-                      extracted.append(
-                          current
-                      )
+                      if (
+                          size
+                          <= MAX_DECOMPRESSED_FILE_SIZE
+                      ):
+                          result.append(
+                              current
+                          )
 
               return (
-                  extracted,
+                  result,
                   code,
                   output
               )
@@ -716,8 +856,6 @@ jobs:
               path,
               destination
           ):
-              destination = str(destination)
-
               os.makedirs(
                   destination,
                   exist_ok=True
@@ -728,106 +866,88 @@ jobs:
                       path,
                       "rb"
                   ) as f:
-                      magic = f.read(16)
+                      magic = f.read(
+                          16
+                      )
               except Exception:
                   return []
 
-              output = os.path.join(
-                  destination,
-                  safe_name(
-                      os.path.basename(path)
-                  ) + ".decompressed"
+              output = (
+                  destination
+                  / (
+                      safe_name(
+                          os.path.basename(
+                              path
+                          )
+                      )
+                      + ".decompressed"
+                  )
               )
 
               try:
                   if magic.startswith(
                       b"\x1f\x8b"
                   ):
-                      with gzip.open(
+                      source = gzip.open(
                           path,
                           "rb"
-                      ) as src:
-                          with open(
-                              output,
-                              "wb"
-                          ) as dst:
-                              shutil.copyfileobj(
-                                  src,
-                                  dst,
-                                  length=READ_CHUNK
-                              )
+                      )
 
                   elif magic.startswith(
                       b"BZh"
                   ):
-                      with bz2.open(
+                      source = bz2.open(
                           path,
                           "rb"
-                      ) as src:
-                          with open(
-                              output,
-                              "wb"
-                          ) as dst:
-                              shutil.copyfileobj(
-                                  src,
-                                  dst,
-                                  length=READ_CHUNK
-                              )
+                      )
 
                   elif magic.startswith(
                       b"\xfd7zXZ\x00"
                   ):
-                      with lzma.open(
+                      source = lzma.open(
                           path,
                           "rb"
-                      ) as src:
-                          with open(
-                              output,
-                              "wb"
-                          ) as dst:
-                              shutil.copyfileobj(
-                                  src,
-                                  dst,
-                                  length=READ_CHUNK
-                              )
+                      )
 
                   else:
                       return []
 
-                  if not os.path.isfile(
-                      output
-                  ):
-                      return []
-
-                  size = os.path.getsize(
-                      output
-                  )
-
-                  if size <= 0:
-                      return []
-
-                  if size > MAX_DECOMPRESSED_FILE_SIZE:
-                      try:
-                          os.remove(
-                              output
+                  with source:
+                      with open(
+                          output,
+                          "wb"
+                      ) as destination_file:
+                          shutil.copyfileobj(
+                              source,
+                              destination_file,
+                              READ_CHUNK
                           )
+
+                  if not output.is_file():
+                      return []
+
+                  size = output.stat().st_size
+
+                  if (
+                      size <= 0
+                      or size
+                      > MAX_DECOMPRESSED_FILE_SIZE
+                  ):
+                      try:
+                          output.unlink()
                       except Exception:
                           pass
 
                       return []
 
                   return [
-                      output
+                      str(output)
                   ]
 
               except Exception:
                   try:
-                      if os.path.exists(
-                          output
-                      ):
-                          os.remove(
-                              output
-                          )
+                      if output.exists():
+                          output.unlink()
                   except Exception:
                       pass
 
@@ -837,32 +957,28 @@ jobs:
               path,
               destination
           ):
-              destination = str(destination)
-
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              command = [
-                  "binwalk",
-                  "-Me",
-                  "--run-as=root",
-                  "--directory=" + destination,
-                  path
-              ]
-
               code, output = run_command(
-                  command,
+                  [
+                      "binwalk",
+                      "-Me",
+                      "--run-as=root",
+                      "--directory=" + destination,
+                      path
+                  ],
                   timeout=1800
               )
 
-              extracted = []
+              result = []
 
               if os.path.isdir(
                   destination
               ):
-                  for root, dirs, files in os.walk(
+                  for root, directories, files in os.walk(
                       destination
                   ):
                       for filename in files:
@@ -883,41 +999,38 @@ jobs:
                           except Exception:
                               continue
 
-                          if size > MAX_DECOMPRESSED_FILE_SIZE:
-                              continue
-
-                          extracted.append(
-                              current
-                          )
+                          if (
+                              size
+                              <= MAX_DECOMPRESSED_FILE_SIZE
+                          ):
+                              result.append(
+                                  current
+                              )
 
               return (
-                  extracted,
+                  result,
                   code,
                   output
               )
 
-          def discover_archive_type(path):
+          def detect_archive_types(path):
               result = {
                   "zip": False,
                   "tar": False,
                   "7z": False,
-                  "compressed_stream": False
+                  "compressed": False
               }
 
               try:
-                  result["zip"] = (
-                      zipfile.is_zipfile(
-                          path
-                      )
+                  result["zip"] = zipfile.is_zipfile(
+                      path
                   )
               except Exception:
                   pass
 
               try:
-                  result["tar"] = (
-                      tarfile.is_tarfile(
-                          path
-                      )
+                  result["tar"] = tarfile.is_tarfile(
+                      path
                   )
               except Exception:
                   pass
@@ -927,27 +1040,27 @@ jobs:
                       path,
                       "rb"
                   ) as f:
-                      magic = f.read(32)
+                      magic = f.read(
+                          32
+                      )
 
                   if magic.startswith(
                       b"7z\xbc\xaf'\x1c"
                   ):
                       result["7z"] = True
 
-                  if magic.startswith(
-                      b"\x1f\x8b"
+                  if (
+                      magic.startswith(
+                          b"\x1f\x8b"
+                      )
+                      or magic.startswith(
+                          b"BZh"
+                      )
+                      or magic.startswith(
+                          b"\xfd7zXZ\x00"
+                      )
                   ):
-                      result["compressed_stream"] = True
-
-                  if magic.startswith(
-                      b"BZh"
-                  ):
-                      result["compressed_stream"] = True
-
-                  if magic.startswith(
-                      b"\xfd7zXZ\x00"
-                  ):
-                      result["compressed_stream"] = True
+                      result["compressed"] = True
 
               except Exception:
                   pass
@@ -958,14 +1071,20 @@ jobs:
               source_path,
               relative_name,
               depth,
-              global_hashes,
+              known_hashes,
               discovered,
               extraction_log
           ):
-              if depth > MAX_ARCHIVE_DEPTH:
+              if (
+                  depth
+                  > MAX_ARCHIVE_DEPTH
+              ):
                   return
 
-              if len(discovered) >= MAX_FILES:
+              if (
+                  len(discovered)
+                  >= MAX_FILES
+              ):
                   return
 
               try:
@@ -976,71 +1095,71 @@ jobs:
                   extraction_log.append(
                       {
                           "source": source_path,
-                          "method": "sha256",
                           "depth": depth,
+                          "method": "sha256",
                           "success": False,
-                          "output": str(exc)
+                          "error": str(exc)
                       }
                   )
 
                   return
 
-              if source_hash in global_hashes:
+              if source_hash in known_hashes:
                   return
 
-              global_hashes.add(
+              known_hashes.add(
                   source_hash
               )
 
-              base_name = (
-                  source_hash[:16]
-                  + "_"
-                  + safe_name(
-                      relative_name
+              extraction_base = (
+                  EXTRACT_ROOT
+                  / (
+                      source_hash[:16]
+                      + "_"
+                      + safe_name(
+                          relative_name
+                      )
                   )
               )
 
-              destination = (
-                  EXTRACT_ROOT
-                  / base_name
-              )
-
-              destination.mkdir(
+              extraction_base.mkdir(
                   parents=True,
                   exist_ok=True
               )
 
-              archive_info = discover_archive_type(
+              archive_types = detect_archive_types(
                   source_path
               )
 
-              local_files = []
+              generated = []
 
-              if archive_info["zip"]:
-                  zip_destination = (
-                      destination
+              if archive_types["zip"]:
+                  destination = (
+                      extraction_base
                       / "zip"
                   )
 
                   try:
-                      extracted = safe_extract_zip(
+                      files = safe_extract_zip(
                           source_path,
-                          zip_destination
+                          destination
                       )
 
-                      local_files.extend(
-                          extracted
+                      generated.extend(
+                          files
                       )
 
                       extraction_log.append(
                           {
                               "source": source_path,
-                              "method": "python_zip",
                               "depth": depth,
+                              "method": "zip",
                               "success": True,
-                              "count": len(extracted),
-                              "output": str(
-                                  zip_destination
+                              "count": len(
+                                  files
+                              ),
+                              "destination": str(
+                                  destination
                               )
                           }
                       )
@@ -1049,39 +1168,41 @@ jobs:
                       extraction_log.append(
                           {
                               "source": source_path,
-                              "method": "python_zip",
                               "depth": depth,
+                              "method": "zip",
                               "success": False,
                               "count": 0,
-                              "output": str(exc)
+                              "error": str(exc)
                           }
                       )
 
-              if archive_info["tar"]:
-                  tar_destination = (
-                      destination
+              if archive_types["tar"]:
+                  destination = (
+                      extraction_base
                       / "tar"
                   )
 
                   try:
-                      extracted = safe_extract_tar(
+                      files = safe_extract_tar(
                           source_path,
-                          tar_destination
+                          destination
                       )
 
-                      local_files.extend(
-                          extracted
+                      generated.extend(
+                          files
                       )
 
                       extraction_log.append(
                           {
                               "source": source_path,
-                              "method": "python_tar",
                               "depth": depth,
+                              "method": "tar",
                               "success": True,
-                              "count": len(extracted),
-                              "output": str(
-                                  tar_destination
+                              "count": len(
+                                  files
+                              ),
+                              "destination": str(
+                                  destination
                               )
                           }
                       )
@@ -1090,153 +1211,186 @@ jobs:
                       extraction_log.append(
                           {
                               "source": source_path,
-                              "method": "python_tar",
                               "depth": depth,
+                              "method": "tar",
                               "success": False,
                               "count": 0,
-                              "output": str(exc)
+                              "error": str(exc)
                           }
                       )
 
-              if archive_info["7z"]:
-                  seven_zip_destination = (
-                      destination
+              if archive_types["7z"]:
+                  destination = (
+                      extraction_base
                       / "7z"
                   )
 
                   (
-                      extracted,
+                      files,
                       code,
                       output
                   ) = safe_extract_7z(
                       source_path,
-                      seven_zip_destination
+                      destination
                   )
 
-                  local_files.extend(
-                      extracted
+                  generated.extend(
+                      files
                   )
 
                   extraction_log.append(
                       {
                           "source": source_path,
-                          "method": "7z",
                           "depth": depth,
+                          "method": "7z",
                           "success": code == 0,
-                          "count": len(extracted),
+                          "count": len(files),
                           "output": output[-10000:]
                       }
                   )
 
-              if archive_info["compressed_stream"]:
-                  stream_destination = (
-                      destination
+              if archive_types["compressed"]:
+                  destination = (
+                      extraction_base
                       / "stream"
                   )
 
-                  extracted = extract_single_stream(
+                  files = extract_single_stream(
                       source_path,
-                      stream_destination
+                      destination
                   )
 
-                  local_files.extend(
-                      extracted
+                  generated.extend(
+                      files
                   )
 
                   extraction_log.append(
                       {
                           "source": source_path,
-                          "method": "single_stream",
                           "depth": depth,
-                          "success": bool(extracted),
-                          "count": len(extracted),
-                          "output": str(
-                              stream_destination
+                          "method": "compressed_stream",
+                          "success": bool(files),
+                          "count": len(files),
+                          "destination": str(
+                              destination
                           )
                       }
                   )
 
               binwalk_destination = (
-                  destination
+                  extraction_base
                   / "binwalk"
               )
 
               (
-                  extracted,
-                  code,
-                  output
+                  binwalk_files,
+                  binwalk_code,
+                  binwalk_output
               ) = extract_with_binwalk(
                   source_path,
                   binwalk_destination
               )
 
-              local_files.extend(
-                  extracted
+              generated.extend(
+                  binwalk_files
               )
 
               extraction_log.append(
                   {
                       "source": source_path,
-                      "method": "binwalk",
                       "depth": depth,
-                      "success": code == 0,
-                      "count": len(extracted),
-                      "output": output[-10000:]
+                      "method": "binwalk",
+                      "success": binwalk_code == 0,
+                      "count": len(binwalk_files),
+                      "output": binwalk_output[-10000:]
                   }
               )
 
-              unique_local = set()
+              unique_generated = set()
 
-              for item in local_files:
+              for current in generated:
                   if not os.path.isfile(
-                      item
+                      current
                   ):
                       continue
 
                   try:
-                      item_hash = sha256_file(
-                          item
+                      current_hash = sha256_file(
+                          current
                       )
                   except Exception:
                       continue
 
-                  if item_hash == source_hash:
+                  if (
+                      current_hash == source_hash
+                  ):
                       continue
 
-                  if item_hash in unique_local:
+                  if (
+                      current_hash
+                      in unique_generated
+                  ):
                       continue
 
-                  unique_local.add(
-                      item_hash
+                  if (
+                      current_hash
+                      in known_hashes
+                  ):
+                      continue
+
+                  unique_generated.add(
+                      current_hash
                   )
 
-                  if item_hash in global_hashes:
-                      continue
-
-                  if len(discovered) >= MAX_FILES:
+                  if (
+                      len(discovered)
+                      >= MAX_FILES
+                  ):
                       break
 
                   discovered.append(
                       {
-                          "path": item,
+                          "path": current,
                           "parent": source_path,
                           "depth": depth + 1,
-                          "sha256": item_hash
+                          "sha256": current_hash
                       }
                   )
 
+          def file_command(
+              path,
+              mime=False
+          ):
+              command = [
+                  "file",
+                  "-b"
+              ]
+
+              if mime:
+                  command.append(
+                      "--mime"
+                  )
+
+              command.append(
+                  path
+              )
+
+              return run_command(
+                  command,
+                  timeout=60
+              )
+
           def strings_command(
               path,
-              mode
+              utf16=False
           ):
-              if mode == "ascii":
+              if utf16:
                   command = [
                       "strings",
                       "-a",
+                      "-el",
                       "-n",
-                      str(
-                          STRING_MIN_LENGTH
-                      ),
+                      "4",
                       "-t",
                       "x",
                       path
@@ -1245,11 +1399,8 @@ jobs:
                   command = [
                       "strings",
                       "-a",
-                      "-el",
                       "-n",
-                      str(
-                          STRING_MIN_LENGTH
-                      ),
+                      "4",
                       "-t",
                       "x",
                       path
@@ -1260,28 +1411,7 @@ jobs:
                   timeout=600
               )
 
-          def file_description(path):
-              return run_command(
-                  [
-                      "file",
-                      "-b",
-                      path
-                  ],
-                  timeout=60
-              )
-
-          def mime_description(path):
-              return run_command(
-                  [
-                      "file",
-                      "-b",
-                      "--mime",
-                      path
-                  ],
-                  timeout=60
-              )
-
-          def extract_r2_json(
+          def get_r2_json(
               r2,
               command
           ):
@@ -1298,16 +1428,7 @@ jobs:
               except Exception:
                   return {}
 
-          def r2_open(path):
-              return r2pipe.open(
-                  str(path),
-                  flags=[
-                      "-2"
-                  ],
-                  timeout=R2_TIMEOUT
-              )
-
-          def get_r2_analysis(
+          def analyze_with_r2(
               path,
               base_name
           ):
@@ -1325,15 +1446,16 @@ jobs:
                   "functions": [],
                   "function_count": 0,
                   "disassembly_file": None,
-                  "entry_disassembly_file": None,
-                  "command_log": []
+                  "entry_disassembly_file": None
               }
 
               try:
-                  r2 = r2_open(
-                      path
+                  r2 = r2pipe.open(
+                      str(path),
+                      flags=[
+                          "-2"
+                      ]
                   )
-
               except Exception as exc:
                   result["error"] = str(
                       exc
@@ -1344,127 +1466,95 @@ jobs:
               result["available"] = True
 
               try:
-                  r2.cmd(
-                      "e io.cache=true"
+                  result["info"] = get_r2_json(
+                      r2,
+                      "ij"
                   )
-              except Exception:
-                  pass
 
-              try:
-                  r2.cmd(
-                      "e bin.cache=true"
+                  result["analysis_info"] = get_r2_json(
+                      r2,
+                      "iIj"
                   )
-              except Exception:
-                  pass
 
-              result["info"] = extract_r2_json(
-                  r2,
-                  "ij"
-              )
+                  result["sections"] = get_r2_json(
+                      r2,
+                      "iSj"
+                  )
 
-              result["analysis_info"] = extract_r2_json(
-                  r2,
-                  "iIj"
-              )
+                  result["symbols"] = get_r2_json(
+                      r2,
+                      "isj"
+                  )
 
-              result["sections"] = extract_r2_json(
-                  r2,
-                  "iSj"
-              )
+                  result["imports"] = get_r2_json(
+                      r2,
+                      "iij"
+                  )
 
-              result["symbols"] = extract_r2_json(
-                  r2,
-                  "isj"
-              )
+                  result["exports"] = get_r2_json(
+                      r2,
+                      "iEj"
+                  )
 
-              result["imports"] = extract_r2_json(
-                  r2,
-                  "iij"
-              )
+                  result["strings"] = get_r2_json(
+                      r2,
+                      "izzj"
+                  )
 
-              result["exports"] = extract_r2_json(
-                  r2,
-                  "iEj"
-              )
+                  result["entrypoints"] = get_r2_json(
+                      r2,
+                      "iej"
+                  )
 
-              result["strings"] = extract_r2_json(
-                  r2,
-                  "izzj"
-              )
+                  for command in [
+                      "aaa",
+                      "aac",
+                      "aav",
+                      "aaf"
+                  ]:
+                      try:
+                          r2.cmd(
+                              command
+                          )
+                      except Exception:
+                          pass
 
-              result["entrypoints"] = extract_r2_json(
-                  r2,
-                  "iej"
-              )
-
-              for command in [
-                  "aaa",
-                  "aac",
-                  "aav",
-                  "aaf"
-              ]:
-                  try:
-                      output = r2.cmd(
-                          command
-                      )
-
-                      result["command_log"].append(
-                          {
-                              "command": command,
-                              "success": True,
-                              "output_tail": output[-5000:]
-                          }
-                      )
-
-                  except Exception as exc:
-                      result["command_log"].append(
-                          {
-                              "command": command,
-                              "success": False,
-                              "error": str(exc)
-                          }
-                      )
-
-              result["functions"] = (
-                  extract_r2_json(
+                  result["functions"] = get_r2_json(
                       r2,
                       "aflj"
                   )
-              )
 
-              if not isinstance(
-                  result["functions"],
-                  list
-              ):
-                  result["functions"] = []
+                  if not isinstance(
+                      result["functions"],
+                      list
+                  ):
+                      result["functions"] = []
 
-              result["function_count"] = len(
-                  result["functions"]
-              )
+                  result["function_count"] = len(
+                      result["functions"]
+                  )
 
-              disassembly_path = (
-                  REPORT_DISASM_ROOT
-                  / f"{base_name}.asm"
-              )
+                  disassembly_path = (
+                      REPORT_DISASM_ROOT
+                      / f"{base_name}.asm"
+                  )
 
-              disassembly_path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
+                  disassembly_path.parent.mkdir(
+                      parents=True,
+                      exist_ok=True
+                  )
 
-              try:
                   with open(
                       disassembly_path,
                       "w",
                       encoding="utf-8",
                       errors="replace"
-                  ) as asm:
-
-                      asm.write(
+                  ) as output:
+                      output.write(
                           "===== FILE INFORMATION =====\n"
                       )
 
-                      asm.write(
+                      output.write(
                           json.dumps(
                               result["info"],
                               indent=2,
@@ -1472,24 +1562,8 @@ jobs:
                           )
                       )
 
-                      asm.write(
+                      output.write(
                           "\n\n"
-                      )
-
-                      asm.write(
-                          "===== ENTRYPOINTS =====\n"
-                      )
-
-                      asm.write(
-                          json.dumps(
-                              result["entrypoints"],
-                              indent=2,
-                              ensure_ascii=False
-                          )
-                      )
-
-                      asm.write(
-                          "\n"
                       )
 
                       for index, function in enumerate(
@@ -1512,55 +1586,45 @@ jobs:
                               )
                           )
 
-                          asm.write(
+                          output.write(
                               "\n"
+                              + "=" * 100
+                              + "\n"
                           )
 
-                          asm.write(
-                              "=" * 100
-                          )
-
-                          asm.write(
-                              "\n"
-                          )
-
-                          asm.write(
+                          output.write(
                               f"FUNCTION_INDEX={index}\n"
                           )
 
-                          asm.write(
+                          output.write(
                               f"NAME={name}\n"
                           )
 
-                          asm.write(
+                          output.write(
                               f"ADDRESS={address:#x}\n"
                           )
 
-                          asm.write(
+                          output.write(
                               "=" * 100
-                          )
-
-                          asm.write(
-                              "\n"
+                              + "\n"
                           )
 
                           try:
-                              disassembly = r2.cmd(
+                              text = r2.cmd(
                                   f"pdf @ {address}"
                               )
-
                           except Exception as exc:
-                              disassembly = (
+                              text = (
                                   "DISASSEMBLY_ERROR: "
                                   + str(exc)
                                   + "\n"
                               )
 
-                          asm.write(
-                              disassembly
+                          output.write(
+                              text
                           )
 
-                          asm.write(
+                          output.write(
                               "\n"
                           )
 
@@ -1570,74 +1634,69 @@ jobs:
                       disassembly_path
                   )
 
-              except Exception as exc:
-                  result[
-                      "disassembly_error"
-                  ] = str(
-                      exc
+                  entry_path = (
+                      REPORT_DISASM_ROOT
+                      / f"{base_name}_entry.asm"
                   )
 
-              entry_disassembly_path = (
-                  REPORT_DISASM_ROOT
-                  / f"{base_name}_entry.asm"
-              )
-
-              entry_disassembly_path.parent.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              try:
-                  entry_disassembly = r2.cmd(
-                      "pd 512 @ entry0"
+                  entry_path.parent.mkdir(
+                      parents=True,
+                      exist_ok=True
                   )
+
+                  try:
+                      entry_text = r2.cmd(
+                          "pd 512 @ entry0"
+                      )
+                  except Exception as exc:
+                      entry_text = str(
+                          exc
+                      )
 
                   with open(
-                      entry_disassembly_path,
+                      entry_path,
                       "w",
                       encoding="utf-8",
                       errors="replace"
-                  ) as f:
-                      f.write(
-                          entry_disassembly
+                  ) as output:
+                      output.write(
+                          entry_text
                       )
 
                   result[
                       "entry_disassembly_file"
                   ] = str(
-                      entry_disassembly_path
+                      entry_path
                   )
 
-              except Exception:
-                  result[
-                      "entry_disassembly_file"
-                  ] = None
+              except Exception as exc:
+                  result["error"] = str(
+                      exc
+                  )
 
-              try:
-                  r2.quit()
-              except Exception:
-                  pass
+              finally:
+                  try:
+                      r2.quit()
+                  except Exception:
+                      pass
 
               return result
 
           def keyword_matches(
               strings
           ):
-              fastboot_matches = []
-              unlock_matches = []
-              vendor_matches = []
-              oem_matches = []
+              matches = {
+                  "fastboot": [],
+                  "unlock": [],
+                  "vendor": [],
+                  "oem": []
+              }
 
               if not isinstance(
                   strings,
                   list
               ):
-                  return {
-                      "fastboot": [],
-                      "unlock": [],
-                      "vendor": [],
-                      "oem": []
-                  }
+                  return matches
 
               for entry in strings:
                   if not isinstance(
@@ -1667,11 +1726,13 @@ jobs:
 
                   for keyword in FASTBOOT_KEYWORDS:
                       if keyword in lower:
-                          fastboot_matches.append(
+                          matches[
+                              "fastboot"
+                          ].append(
                               {
                                   "address": address,
-                                  "string": text,
-                                  "keyword": keyword
+                                  "keyword": keyword,
+                                  "string": text
                               }
                           )
 
@@ -1679,11 +1740,13 @@ jobs:
 
                   for keyword in UNLOCK_KEYWORDS:
                       if keyword in lower:
-                          unlock_matches.append(
+                          matches[
+                              "unlock"
+                          ].append(
                               {
                                   "address": address,
-                                  "string": text,
-                                  "keyword": keyword
+                                  "keyword": keyword,
+                                  "string": text
                               }
                           )
 
@@ -1691,11 +1754,13 @@ jobs:
 
                   for keyword in VENDOR_KEYWORDS:
                       if keyword in lower:
-                          vendor_matches.append(
+                          matches[
+                              "vendor"
+                          ].append(
                               {
                                   "address": address,
-                                  "string": text,
-                                  "keyword": keyword
+                                  "keyword": keyword,
+                                  "string": text
                               }
                           )
 
@@ -1707,11 +1772,13 @@ jobs:
                               pattern,
                               lower
                           ):
-                              oem_matches.append(
+                              matches[
+                                  "oem"
+                              ].append(
                                   {
                                       "address": address,
-                                      "string": text,
-                                      "pattern": pattern
+                                      "pattern": pattern,
+                                      "string": text
                                   }
                               )
 
@@ -1720,17 +1787,12 @@ jobs:
                       except Exception:
                           pass
 
-              return {
-                  "fastboot": fastboot_matches,
-                  "unlock": unlock_matches,
-                  "vendor": vendor_matches,
-                  "oem": oem_matches
-              }
+              return matches
 
-          def discover_partition_strings(
+          def partition_candidates(
               strings
           ):
-              candidates = set()
+              values = set()
 
               keywords = [
                   "partition",
@@ -1792,24 +1854,30 @@ jobs:
                       keyword in lower
                       for keyword in keywords
                   ):
-                      candidates.add(
+                      values.add(
                           text
                       )
 
               return sorted(
-                  candidates
+                  values
               )
 
           def analyze_file(
               path,
               relative_name,
-              sequence
+              sequence,
+              parent,
+              depth
           ):
-              sha256 = sha256_file(
+              path = str(
                   path
               )
 
-              md5 = md5_file(
+              file_hash = sha256_file(
+                  path
+              )
+
+              file_md5 = md5_file(
                   path
               )
 
@@ -1820,7 +1888,7 @@ jobs:
               base_name = (
                   f"{sequence:06d}_"
                   f"{safe_name(relative_name)}_"
-                  f"{sha256[:16]}"
+                  f"{file_hash[:16]}"
               )
 
               raw_dir = (
@@ -1833,68 +1901,44 @@ jobs:
                   exist_ok=True
               )
 
-              report_json_path = (
+              report_json = (
                   REPORT_FILES_ROOT
                   / f"{base_name}.json"
               )
 
-              report_markdown_path = (
+              report_markdown = (
                   REPORT_FILES_ROOT
                   / f"{base_name}.md"
               )
 
-              report_json_path.parent.mkdir(
+              report_json.parent.mkdir(
                   parents=True,
                   exist_ok=True
               )
 
-              report_markdown_path.parent.mkdir(
+              report_markdown.parent.mkdir(
                   parents=True,
                   exist_ok=True
               )
 
-              (
-                  description_code,
-                  description_output
-              ) = file_description(
-                  path
-              )
-
-              (
-                  mime_code,
-                  mime_output
-              ) = mime_description(
-                  path
-              )
-
-              description = (
-                  description_output.strip()
-              )
-
-              mime = (
-                  mime_output.strip()
-              )
-
-              entropy_value = (
-                  calculate_entropy(
-                      path
-                  )
-              )
-
-              (
-                  ascii_code,
-                  ascii_output
-              ) = strings_command(
+              file_code, file_output = file_command(
                   path,
-                  "ascii"
+                  mime=False
               )
 
-              (
-                  utf16_code,
-                  utf16_output
-              ) = strings_command(
+              mime_code, mime_output = file_command(
                   path,
-                  "utf16"
+                  mime=True
+              )
+
+              ascii_code, ascii_output = strings_command(
+                  path,
+                  utf16=False
+              )
+
+              utf16_code, utf16_output = strings_command(
+                  path,
+                  utf16=True
               )
 
               ascii_path = (
@@ -1917,8 +1961,8 @@ jobs:
                   "w",
                   encoding="utf-8",
                   errors="replace"
-              ) as f:
-                  f.write(
+              ) as output:
+                  output.write(
                       ascii_output
                   )
 
@@ -1927,8 +1971,8 @@ jobs:
                   "w",
                   encoding="utf-8",
                   errors="replace"
-              ) as f:
-                  f.write(
+              ) as output:
+                  output.write(
                       utf16_output
                   )
 
@@ -1936,55 +1980,53 @@ jobs:
                   hex_path,
                   "w",
                   encoding="utf-8"
-              ) as f:
-                  f.write(
+              ) as output:
+                  output.write(
                       hex_preview(
                           path
                       )
                   )
 
               try:
-                  entropy_blocks = (
-                      entropy_regions(
-                          path
-                      )
+                  entropy_value = calculate_entropy(
+                      path
                   )
+              except Exception:
+                  entropy_value = 0.0
 
+              try:
+                  entropy_blocks = entropy_regions(
+                      path
+                  )
               except Exception:
                   entropy_blocks = []
 
-              r2_result = (
-                  get_r2_analysis(
-                      path,
-                      base_name
-                  )
+              r2_result = analyze_with_r2(
+                  path,
+                  base_name
               )
 
-              r2_strings = (
+              matches = keyword_matches(
                   r2_result.get(
                       "strings",
                       []
                   )
               )
 
-              matches = (
-                  keyword_matches(
-                      r2_strings
-                  )
-              )
-
-              partition_candidates = (
-                  discover_partition_strings(
-                      r2_strings
+              partitions = partition_candidates(
+                  r2_result.get(
+                      "strings",
+                      []
                   )
               )
 
               original_copy = None
 
-              if size <= (
-                  64 * 1024 * 1024
+              if (
+                  size
+                  <= 64 * 1024 * 1024
               ):
-                  original_copy_path = (
+                  original_path = (
                       raw_dir
                       / "original.bin"
                   )
@@ -1992,27 +2034,27 @@ jobs:
                   try:
                       shutil.copy2(
                           path,
-                          original_copy_path
+                          original_path
                       )
 
                       original_copy = str(
-                          original_copy_path
+                          original_path
                       )
-
                   except Exception:
                       original_copy = None
 
-              metadata = {
+              data = {
                   "sequence": sequence,
                   "relative_name": relative_name,
-                  "path": str(path),
+                  "path": path,
+                  "parent": parent,
+                  "depth": depth,
                   "size": size,
-                  "sha256": sha256,
-                  "md5": md5,
-                  "file_description": description,
-                  "mime": mime,
-                  "entropy": entropy_value,
-                  "file_command_exit_code": description_code,
+                  "sha256": file_hash,
+                  "md5": file_md5,
+                  "file_description": file_output.strip(),
+                  "mime": mime_output.strip(),
+                  "file_command_exit_code": file_code,
                   "mime_command_exit_code": mime_code,
                   "ascii_strings_command_exit_code": ascii_code,
                   "utf16_strings_command_exit_code": utf16_code,
@@ -2026,7 +2068,11 @@ jobs:
                       hex_path
                   ),
                   "original_copy": original_copy,
-                  "r2": r2_result,
+                  "entropy": entropy_value,
+                  "high_entropy_blocks": entropy_blocks,
+                  "high_entropy_block_count": len(
+                      entropy_blocks
+                  ),
                   "fastboot_matches": matches[
                       "fastboot"
                   ],
@@ -2039,110 +2085,101 @@ jobs:
                   "oem_matches": matches[
                       "oem"
                   ],
-                  "partition_candidates": (
-                      partition_candidates
-                  ),
-                  "high_entropy_blocks": (
-                      entropy_blocks
-                  ),
-                  "high_entropy_block_count": len(
-                      entropy_blocks
-                  )
+                  "partition_candidates": partitions,
+                  "r2": r2_result
               }
 
               with open(
-                  report_json_path,
+                  report_json,
                   "w",
                   encoding="utf-8"
-              ) as f:
+              ) as output:
                   json.dump(
-                      metadata,
-                      f,
+                      data,
+                      output,
                       indent=2,
                       ensure_ascii=False
                   )
 
               with open(
-                  report_markdown_path,
+                  report_markdown,
                   "w",
                   encoding="utf-8"
-              ) as f:
-                  f.write(
+              ) as output:
+                  output.write(
                       "# Recursive File Analysis Report\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "## File\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       f"`{relative_name}`\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "## Metadata\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "| Field | Value |\n"
                   )
 
-                  f.write(
+                  output.write(
                       "|---|---|\n"
                   )
 
-                  f.write(
-                      f"| Size | {size} bytes |\n"
+                  output.write(
+                      f"| Size | `{size}` bytes |\n"
                   )
 
-                  f.write(
-                      f"| SHA256 | `{sha256}` |\n"
+                  output.write(
+                      f"| SHA256 | `{file_hash}` |\n"
                   )
 
-                  f.write(
-                      f"| MD5 | `{md5}` |\n"
+                  output.write(
+                      f"| MD5 | `{file_md5}` |\n"
                   )
 
-                  f.write(
-                      f"| File | `{description}` |\n"
+                  output.write(
+                      f"| File | `{file_output.strip()}` |\n"
                   )
 
-                  f.write(
-                      f"| MIME | `{mime}` |\n"
+                  output.write(
+                      f"| MIME | `{mime_output.strip()}` |\n"
                   )
 
-                  f.write(
+                  output.write(
                       f"| Entropy | `{entropy_value:.6f}` |\n"
                   )
 
-                  f.write(
-                      "| R2 Available | "
-                      f"`{r2_result.get('available')}` |\n"
+                  output.write(
+                      f"| Recursion Depth | `{depth}` |\n"
                   )
 
-                  f.write(
-                      "| R2 Function Count | "
-                      f"`{r2_result.get('function_count', 0)}` |\n"
+                  output.write(
+                      f"| R2 Available | `{r2_result.get('available')}` |\n"
                   )
 
-                  f.write(
-                      "\n## Fastboot-related Strings\n\n"
+                  output.write(
+                      f"| R2 Functions | `{r2_result.get('function_count', 0)}` |\n"
                   )
 
-                  if matches[
-                      "fastboot"
-                  ]:
-                      f.write(
+                  output.write(
+                      "\n## Fastboot-related Matches\n\n"
+                  )
+
+                  if matches["fastboot"]:
+                      output.write(
                           "| Address | Keyword | String |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "fastboot"
-                      ]:
+                      for item in matches["fastboot"]:
                           text = str(
                               item["string"]
                           ).replace(
@@ -2150,35 +2187,31 @@ jobs:
                               " "
                           )
 
-                          f.write(
+                          output.write(
                               f"| `{item['address']}` | "
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
 
                   else:
-                      f.write(
-                          "No fastboot-related strings detected.\n"
+                      output.write(
+                          "No fastboot-related matches detected.\n"
                       )
 
-                  f.write(
-                      "\n## Unlock/Lock-related Strings\n\n"
+                  output.write(
+                      "\n## Unlock-related Matches\n\n"
                   )
 
-                  if matches[
-                      "unlock"
-                  ]:
-                      f.write(
+                  if matches["unlock"]:
+                      output.write(
                           "| Address | Keyword | String |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "unlock"
-                      ]:
+                      for item in matches["unlock"]:
                           text = str(
                               item["string"]
                           ).replace(
@@ -2186,35 +2219,31 @@ jobs:
                               " "
                           )
 
-                          f.write(
+                          output.write(
                               f"| `{item['address']}` | "
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
 
                   else:
-                      f.write(
-                          "No unlock/lock-related strings detected.\n"
+                      output.write(
+                          "No unlock-related matches detected.\n"
                       )
 
-                  f.write(
-                      "\n## Vendor-related Strings\n\n"
+                  output.write(
+                      "\n## Vendor-related Matches\n\n"
                   )
 
-                  if matches[
-                      "vendor"
-                  ]:
-                      f.write(
+                  if matches["vendor"]:
+                      output.write(
                           "| Address | Keyword | String |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "vendor"
-                      ]:
+                      for item in matches["vendor"]:
                           text = str(
                               item["string"]
                           ).replace(
@@ -2222,35 +2251,31 @@ jobs:
                               " "
                           )
 
-                          f.write(
+                          output.write(
                               f"| `{item['address']}` | "
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
 
                   else:
-                      f.write(
-                          "No vendor-related strings detected.\n"
+                      output.write(
+                          "No vendor-related matches detected.\n"
                       )
 
-                  f.write(
-                      "\n## OEM Command Patterns\n\n"
+                  output.write(
+                      "\n## OEM Command Pattern Matches\n\n"
                   )
 
-                  if matches[
-                      "oem"
-                  ]:
-                      f.write(
+                  if matches["oem"]:
+                      output.write(
                           "| Address | Pattern | String |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "oem"
-                      ]:
+                      for item in matches["oem"]:
                           text = str(
                               item["string"]
                           ).replace(
@@ -2258,65 +2283,65 @@ jobs:
                               " "
                           )
 
-                          f.write(
+                          output.write(
                               f"| `{item['address']}` | "
                               f"`{item['pattern']}` | "
                               f"`{text}` |\n"
                           )
 
                   else:
-                      f.write(
+                      output.write(
                           "No explicit OEM command patterns detected.\n"
                       )
 
-                  f.write(
+                  output.write(
                       "\n## Partition Candidates\n\n"
                   )
 
-                  if partition_candidates:
-                      for item in partition_candidates:
-                          f.write(
+                  if partitions:
+                      for item in partitions:
+                          output.write(
                               f"- `{item}`\n"
                           )
                   else:
-                      f.write(
+                      output.write(
                           "No partition candidates detected.\n"
                       )
 
-                  f.write(
+                  output.write(
                       "\n## High Entropy Regions\n\n"
                   )
 
                   if entropy_blocks:
-                      f.write(
+                      output.write(
                           "| Offset | Size | Entropy |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---:|---:|---:|\n"
                       )
 
-                      for block in entropy_blocks:
-                          f.write(
-                              f"| `0x{block['offset']:x}` | "
-                              f"`{block['size']}` | "
-                              f"`{block['entropy']}` |\n"
+                      for item in entropy_blocks:
+                          output.write(
+                              f"| `0x{item['offset']:x}` | "
+                              f"`{item['size']}` | "
+                              f"`{item['entropy']}` |\n"
                           )
 
                   else:
-                      f.write(
+                      output.write(
                           "No high entropy regions detected.\n"
                       )
 
-                  f.write(
+                  output.write(
                       "\n## R2 Binary Information\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "```json\n"
                   )
 
-                  f.write(
+                  output.write(
                       json.dumps(
                           r2_result.get(
                               "info",
@@ -2327,42 +2352,19 @@ jobs:
                       )
                   )
 
-                  f.write(
+                  output.write(
                       "\n```\n"
                   )
 
-                  f.write(
-                      "\n## R2 Analysis Information\n\n"
-                  )
-
-                  f.write(
-                      "```json\n"
-                  )
-
-                  f.write(
-                      json.dumps(
-                          r2_result.get(
-                              "analysis_info",
-                              {}
-                          ),
-                          indent=2,
-                          ensure_ascii=False
-                      )
-                  )
-
-                  f.write(
-                      "\n```\n"
-                  )
-
-                  f.write(
+                  output.write(
                       "\n## R2 Sections\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "```json\n"
                   )
 
-                  f.write(
+                  output.write(
                       json.dumps(
                           r2_result.get(
                               "sections",
@@ -2373,19 +2375,19 @@ jobs:
                       )
                   )
 
-                  f.write(
+                  output.write(
                       "\n```\n"
                   )
 
-                  f.write(
+                  output.write(
                       "\n## R2 Symbols\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "```json\n"
                   )
 
-                  f.write(
+                  output.write(
                       json.dumps(
                           r2_result.get(
                               "symbols",
@@ -2396,19 +2398,19 @@ jobs:
                       )
                   )
 
-                  f.write(
+                  output.write(
                       "\n```\n"
                   )
 
-                  f.write(
+                  output.write(
                       "\n## R2 Imports\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "```json\n"
                   )
 
-                  f.write(
+                  output.write(
                       json.dumps(
                           r2_result.get(
                               "imports",
@@ -2419,19 +2421,19 @@ jobs:
                       )
                   )
 
-                  f.write(
+                  output.write(
                       "\n```\n"
                   )
 
-                  f.write(
+                  output.write(
                       "\n## R2 Exports\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       "```json\n"
                   )
 
-                  f.write(
+                  output.write(
                       json.dumps(
                           r2_result.get(
                               "exports",
@@ -2442,27 +2444,25 @@ jobs:
                       )
                   )
 
-                  f.write(
+                  output.write(
                       "\n```\n"
                   )
 
-                  f.write(
-                      "\n## R2 Functions\n\n"
+                  output.write(
+                      "\n## Functions\n\n"
                   )
 
-                  functions = (
-                      r2_result.get(
-                          "functions",
-                          []
-                      )
+                  functions = r2_result.get(
+                      "functions",
+                      []
                   )
 
                   if functions:
-                      f.write(
+                      output.write(
                           "| Address | Name | Size | Type |\n"
                       )
 
-                      f.write(
+                      output.write(
                           "|---|---|---:|---|\n"
                       )
 
@@ -2484,21 +2484,17 @@ jobs:
                               " "
                           )
 
-                          function_size = (
-                              function.get(
-                                  "size",
-                                  ""
-                              )
+                          function_size = function.get(
+                              "size",
+                              ""
                           )
 
-                          function_type = (
-                              function.get(
-                                  "type",
-                                  ""
-                              )
+                          function_type = function.get(
+                              "type",
+                              ""
                           )
 
-                          f.write(
+                          output.write(
                               f"| `{address}` | "
                               f"`{name}` | "
                               f"`{function_size}` | "
@@ -2506,206 +2502,174 @@ jobs:
                           )
 
                   else:
-                      f.write(
+                      output.write(
                           "No functions identified by radare2.\n"
                       )
 
-                  f.write(
+                  output.write(
                       "\n## Raw Analysis Files\n\n"
                   )
 
-                  f.write(
+                  output.write(
                       f"- ASCII strings: `{ascii_path}`\n"
                   )
 
-                  f.write(
+                  output.write(
                       f"- UTF-16LE strings: `{utf16_path}`\n"
                   )
 
-                  f.write(
+                  output.write(
                       f"- Hex preview: `{hex_path}`\n"
                   )
 
                   if original_copy:
-                      f.write(
+                      output.write(
                           f"- Original copy: `{original_copy}`\n"
                       )
 
                   if r2_result.get(
                       "disassembly_file"
                   ):
-                      f.write(
+                      output.write(
                           "\n## Full Function Disassembly\n\n"
                       )
 
-                      f.write(
+                      output.write(
                           f"`{r2_result['disassembly_file']}`\n"
                       )
 
                   if r2_result.get(
                       "entry_disassembly_file"
                   ):
-                      f.write(
+                      output.write(
                           "\n## Entry Point Disassembly\n\n"
                       )
 
-                      f.write(
+                      output.write(
                           f"`{r2_result['entry_disassembly_file']}`\n"
                       )
 
               return {
                   "sequence": sequence,
                   "relative_name": relative_name,
-                  "path": str(path),
+                  "path": path,
+                  "parent": parent,
+                  "depth": depth,
                   "size": size,
-                  "sha256": sha256,
-                  "md5": md5,
-                  "file_description": description,
-                  "mime": mime,
+                  "sha256": file_hash,
+                  "md5": file_md5,
+                  "file_description": file_output.strip(),
+                  "mime": mime_output.strip(),
                   "entropy": entropy_value,
                   "function_count": r2_result.get(
                       "function_count",
                       0
                   ),
                   "fastboot_match_count": len(
-                      matches[
-                          "fastboot"
-                      ]
+                      matches["fastboot"]
                   ),
                   "unlock_match_count": len(
-                      matches[
-                          "unlock"
-                      ]
+                      matches["unlock"]
                   ),
                   "vendor_match_count": len(
-                      matches[
-                          "vendor"
-                      ]
+                      matches["vendor"]
                   ),
                   "oem_match_count": len(
-                      matches[
-                          "oem"
-                      ]
+                      matches["oem"]
                   ),
                   "partition_candidate_count": len(
-                      partition_candidates
+                      partitions
                   ),
                   "high_entropy_block_count": len(
                       entropy_blocks
                   ),
                   "report_markdown": str(
-                      report_markdown_path
+                      report_markdown
                   ),
                   "report_json": str(
-                      report_json_path
+                      report_json
                   ),
                   "raw_directory": str(
                       raw_dir
                   ),
-                  "disassembly_file": (
-                      r2_result.get(
-                          "disassembly_file"
-                      )
+                  "disassembly_file": r2_result.get(
+                      "disassembly_file"
                   ),
-                  "entry_disassembly_file": (
-                      r2_result.get(
-                          "entry_disassembly_file"
-                      )
+                  "entry_disassembly_file": r2_result.get(
+                      "entry_disassembly_file"
                   )
               }
 
-          def main():
-              FILE_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
+          def csv_escape(
+              value
+          ):
+              value = str(
+                  value
               )
 
-              EXTRACT_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              WORK_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              REPORT_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              REPORT_FILES_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              REPORT_DISASM_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              RAW_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              LOG_ROOT.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              if not INPUT.exists():
-                  print(
-                      f"INPUT ZIP NOT FOUND: {INPUT}"
+              return (
+                  '"'
+                  + value.replace(
+                      '"',
+                      '""'
                   )
-                  sys.exit(10)
+                  + '"'
+              )
+
+          def main():
+              for directory in [
+                  FILE_ROOT,
+                  EXTRACT_ROOT,
+                  WORK_ROOT,
+                  REPORT_ROOT,
+                  REPORT_FILES_ROOT,
+                  REPORT_DISASM_ROOT,
+                  RAW_ROOT,
+                  LOG_ROOT
+              ]:
+                  directory.mkdir(
+                      parents=True,
+                      exist_ok=True
+                  )
 
               if not INPUT.is_file():
                   print(
-                      f"INPUT ZIP IS NOT A FILE: {INPUT}"
+                      f"INPUT ZIP NOT FOUND: {INPUT}"
                   )
-                  sys.exit(11)
+                  return 10
 
               input_size = INPUT.stat().st_size
 
               if input_size <= 0:
                   print(
-                      f"INPUT ZIP IS EMPTY: {INPUT}"
+                      "INPUT ZIP IS EMPTY"
                   )
-                  sys.exit(12)
+                  return 11
 
-              initial_destination = (
+              source_destination = (
                   FILE_ROOT
                   / "source"
               )
 
-              initial_destination.mkdir(
+              source_destination.mkdir(
                   parents=True,
                   exist_ok=True
               )
 
               try:
                   initial_files = safe_extract_zip(
-                      str(INPUT),
-                      str(initial_destination)
+                      INPUT,
+                      source_destination
                   )
-
               except Exception as exc:
                   print(
                       f"Initial ZIP extraction failed: {exc}"
                   )
-                  sys.exit(20)
+                  return 12
 
-              if not initial_files:
-                  print(
-                      "Initial ZIP extraction produced no regular files."
-                  )
-                  sys.exit(21)
-
-              extraction_log = []
               discovered = []
-              seen_hashes = set()
+              global_hashes = set()
+              extraction_log = []
 
               for item in initial_files:
                   if not os.path.isfile(
@@ -2723,7 +2687,9 @@ jobs:
                   discovered.append(
                       {
                           "path": item,
-                          "parent": str(INPUT),
+                          "parent": str(
+                              INPUT
+                          ),
                           "depth": 1,
                           "sha256": item_hash
                       }
@@ -2733,32 +2699,38 @@ jobs:
                   discovered
               )
 
-              processed_queue_hashes = set()
+              processed_hashes = set()
 
               while queue:
                   current = queue.popleft()
 
-                  current_path = (
-                      current["path"]
-                  )
+                  current_path = current[
+                      "path"
+                  ]
 
-                  current_hash = (
-                      current["sha256"]
-                  )
+                  current_hash = current[
+                      "sha256"
+                  ]
 
-                  if current_hash in processed_queue_hashes:
+                  if (
+                      current_hash
+                      in processed_hashes
+                  ):
                       continue
 
-                  processed_queue_hashes.add(
+                  processed_hashes.add(
                       current_hash
                   )
 
-                  if len(discovered) >= MAX_FILES:
+                  if (
+                      len(discovered)
+                      >= MAX_FILES
+                  ):
                       break
 
                   relative_name = os.path.relpath(
                       current_path,
-                      str(FILE_ROOT)
+                      FILE_ROOT
                   )
 
                   before = len(
@@ -2774,7 +2746,7 @@ jobs:
                               1
                           )
                       ),
-                      seen_hashes,
+                      global_hashes,
                       discovered,
                       extraction_log
                   )
@@ -2787,54 +2759,55 @@ jobs:
                       for item in discovered[
                           before:after
                       ]:
-                          item_hash = (
-                              item["sha256"]
-                          )
-
                           if (
-                              item_hash
-                              not in processed_queue_hashes
+                              item["sha256"]
+                              not in processed_hashes
                           ):
                               queue.append(
                                   item
                               )
 
               unique_files = []
-              unique_file_hashes = set()
+              unique_hashes = set()
 
               for item in discovered:
-                  path = item["path"]
+                  current_path = item[
+                      "path"
+                  ]
 
                   if not os.path.isfile(
-                      path
+                      current_path
                   ):
                       continue
 
                   try:
-                      item_hash = sha256_file(
-                          path
+                      current_hash = sha256_file(
+                          current_path
                       )
                   except Exception:
                       continue
 
-                  if item_hash in unique_file_hashes:
+                  if (
+                      current_hash
+                      in unique_hashes
+                  ):
                       continue
 
-                  unique_file_hashes.add(
-                      item_hash
+                  unique_hashes.add(
+                      current_hash
                   )
 
                   unique_files.append(
                       {
-                          "path": path,
+                          "path": current_path,
                           "parent": item.get(
                               "parent"
                           ),
                           "depth": item.get(
                               "depth",
-                              0
+                              1
                           ),
-                          "sha256": item_hash
+                          "sha256": current_hash
                       }
                   )
 
@@ -2864,7 +2837,7 @@ jobs:
               summaries = []
               failures = []
 
-              total_files = len(
+              total = len(
                   unique_files
               )
 
@@ -2872,36 +2845,34 @@ jobs:
                   unique_files,
                   1
               ):
-                  path = item["path"]
+                  current_path = item[
+                      "path"
+                  ]
 
                   relative_name = os.path.relpath(
-                      path,
-                      str(FILE_ROOT)
+                      current_path,
+                      FILE_ROOT
                   )
 
                   print(
-                      f"[{index}/{total_files}] "
+                      f"[{index}/{total}] "
                       f"Analyzing {relative_name}",
                       flush=True
                   )
 
                   try:
                       summary = analyze_file(
-                          path,
+                          current_path,
                           relative_name,
-                          index
-                      )
-
-                      summary["parent"] = (
+                          index,
                           item.get(
                               "parent"
-                          )
-                      )
-
-                      summary["depth"] = (
-                          item.get(
-                              "depth",
-                              0
+                          ),
+                          int(
+                              item.get(
+                                  "depth",
+                                  0
+                              )
                           )
                       )
 
@@ -2912,8 +2883,11 @@ jobs:
                   except Exception as exc:
                       failure = {
                           "sequence": index,
-                          "path": path,
                           "relative_name": relative_name,
+                          "path": current_path,
+                          "parent": item.get(
+                              "parent"
+                          ),
                           "depth": item.get(
                               "depth",
                               0
@@ -2929,15 +2903,14 @@ jobs:
                           LOG_ROOT / "failures.log",
                           "a",
                           encoding="utf-8"
-                      ) as f:
-                          f.write(
+                      ) as output:
+                          output.write(
                               json.dumps(
                                   failure,
                                   ensure_ascii=False
                               )
                           )
-
-                          f.write(
+                          output.write(
                               "\n"
                           )
 
@@ -2948,25 +2921,22 @@ jobs:
                           flush=True
                       )
 
-              extraction_log_path = (
-                  LOG_ROOT
-                  / "recursive_extraction.json"
-              )
-
               with open(
-                  extraction_log_path,
+                  LOG_ROOT / "recursive_extraction.json",
                   "w",
                   encoding="utf-8"
-              ) as f:
+              ) as output:
                   json.dump(
                       extraction_log,
-                      f,
+                      output,
                       indent=2,
                       ensure_ascii=False
                   )
 
               manifest = {
-                  "input_zip": str(INPUT),
+                  "input_zip": str(
+                      INPUT
+                  ),
                   "input_size": input_size,
                   "input_sha256": sha256_file(
                       INPUT
@@ -3011,10 +2981,10 @@ jobs:
                   manifest_path,
                   "w",
                   encoding="utf-8"
-              ) as f:
+              ) as output:
                   json.dump(
                       manifest,
-                      f,
+                      output,
                       indent=2,
                       ensure_ascii=False
                   )
@@ -3028,34 +2998,30 @@ jobs:
                   csv_path,
                   "w",
                   encoding="utf-8"
-              ) as f:
-                  f.write(
-                      "sequence,depth,relative_name,size,"
-                      "sha256,md5,entropy,function_count,"
-                      "fastboot_match_count,unlock_match_count,"
-                      "vendor_match_count,oem_match_count,"
+              ) as output:
+                  output.write(
+                      "sequence,"
+                      "depth,"
+                      "relative_name,"
+                      "size,"
+                      "sha256,"
+                      "md5,"
+                      "entropy,"
+                      "function_count,"
+                      "fastboot_match_count,"
+                      "unlock_match_count,"
+                      "vendor_match_count,"
+                      "oem_match_count,"
                       "partition_candidate_count,"
                       "high_entropy_block_count,"
-                      "report_markdown,report_json,"
-                      "disassembly_file,entry_disassembly_file\n"
+                      "report_markdown,"
+                      "report_json,"
+                      "disassembly_file,"
+                      "entry_disassembly_file\n"
                   )
 
                   for item in summaries:
-                      def csv_escape(value):
-                          value = str(
-                              value
-                          )
-
-                          return (
-                              '"'
-                              + value.replace(
-                                  '"',
-                                  '""'
-                              )
-                              + '"'
-                          )
-
-                      f.write(
+                      output.write(
                           ",".join(
                               [
                                   str(
@@ -3170,29 +3136,9 @@ jobs:
                           )
                       )
 
-                      f.write(
+                      output.write(
                           "\n"
                       )
-
-              if not manifest_path.is_file():
-                  print(
-                      "Manifest creation failed."
-                  )
-                  sys.exit(30)
-
-              if not summaries:
-                  print(
-                      "No files were successfully analyzed."
-                  )
-                  print(
-                      f"Discovered files: "
-                      f"{len(unique_files)}"
-                  )
-                  print(
-                      f"Failed files: "
-                      f"{len(failures)}"
-                  )
-                  sys.exit(31)
 
               print(
                   "=============================================="
@@ -3203,58 +3149,51 @@ jobs:
               )
 
               print(
-                  f"Discovered files : "
-                  f"{len(unique_files)}"
+                  f"Discovered files : {len(unique_files)}"
               )
 
               print(
-                  f"Analyzed files   : "
-                  f"{len(summaries)}"
+                  f"Analyzed files   : {len(summaries)}"
               )
 
               print(
-                  f"Failed files     : "
-                  f"{len(failures)}"
+                  f"Failed files     : {len(failures)}"
               )
 
               print(
-                  f"Manifest         : "
-                  f"{manifest_path}"
+                  f"Manifest         : {manifest_path}"
               )
 
               print(
                   "=============================================="
               )
 
+              return 0
+
           if __name__ == "__main__":
-              main()
+              sys.exit(
+                  main()
+              )
           PYEOF
 
           chmod +x /tmp/recursive_analysis.py
 
+          python3 -m py_compile \
+            /tmp/recursive_analysis.py
+
       - name: Run Recursive Analysis
-        shell: bash
-        env:
-          PYTHONUNBUFFERED: "1"
-          PATH: /usr/local/bin:/usr/bin:/bin
-          LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
-        run: |
-          set -o pipefail
-
-          mkdir -p "${ARTIFACT_ROOT}/logs"
-
-          python3 /tmp/recursive_analysis.py 2>&1 | tee \
-            "${ARTIFACT_ROOT}/logs/analysis.log"
-
-          test -f \
-            "${ARTIFACT_ROOT}/analysis_manifest.json"
-
-      - name: Verify Analysis Output
         shell: bash
         run: |
           set -e
 
-          test -d "${ARTIFACT_ROOT}"
+          mkdir -p \
+            "${ARTIFACT_ROOT}/logs"
+
+          python3 \
+            /tmp/recursive_analysis.py \
+            2>&1 \
+            | tee \
+            "${ARTIFACT_ROOT}/logs/analysis.log"
 
           test -f \
             "${ARTIFACT_ROOT}/analysis_manifest.json"
@@ -3262,547 +3201,14 @@ jobs:
           test -f \
             "${ARTIFACT_ROOT}/analysis_index.csv"
 
-          python3 - <<'PYEOF'
-          import json
-          import os
-          from pathlib import Path
-
-          artifact_root = Path(
-              os.environ["ARTIFACT_ROOT"]
-          )
-
-          manifest_path = (
-              artifact_root
-              / "analysis_manifest.json"
-          )
-
-          if not manifest_path.is_file():
-              raise SystemExit(
-                  f"Manifest not found: "
-                  f"{manifest_path}"
-              )
-
-          with open(
-              manifest_path,
-              "r",
-              encoding="utf-8"
-          ) as f:
-              manifest = json.load(f)
-
-          required_keys = [
-              "input_zip",
-              "input_size",
-              "input_sha256",
-              "file_count_discovered",
-              "file_count_analyzed",
-              "file_count_failed",
-              "files",
-              "failures"
-          ]
-
-          for key in required_keys:
-              if key not in manifest:
-                  raise SystemExit(
-                      f"Manifest key missing: {key}"
-                  )
-
-          print(
-              f"Discovered: "
-              f"{manifest['file_count_discovered']}"
-          )
-
-          print(
-              f"Analyzed: "
-              f"{manifest['file_count_analyzed']}"
-          )
-
-          print(
-              f"Failed: "
-              f"{manifest['file_count_failed']}"
-          )
-
-          print(
-              f"Manifest: "
-              f"{manifest_path}"
-          )
-          PYEOF
-
-          find \
-            "${ARTIFACT_ROOT}" \
-            -maxdepth 4 \
-            -type f \
-            -print \
-            | sort
-
       - name: Generate Global Report
         shell: bash
         run: |
           set -e
 
-          test -f \
-            "${ARTIFACT_ROOT}/analysis_manifest.json"
+          cat > /tmp/generate_global_report.py <<'PYEOF'
+          #!/usr/bin/env python3
 
-          python3 - <<'PYEOF'
-          import os
-          import json
-          from pathlib import Path
-
-          artifact_root = Path(
-              os.environ["ARTIFACT_ROOT"]
-          )
-
-          manifest_path = (
-              artifact_root
-              / "analysis_manifest.json"
-          )
-
-          if not manifest_path.is_file():
-              raise SystemExit(
-                  f"analysis_manifest.json not found: "
-                  f"{manifest_path}"
-              )
-
-          with open(
-              manifest_path,
-              "r",
-              encoding="utf-8"
-          ) as f:
-              manifest = json.load(
-                  f
-              )
-
-          report_path = (
-              artifact_root
-              / "reports"
-              / "FULL_ANALYSIS_REPORT.md"
-          )
-
-          report_path.parent.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          files = manifest.get(
-              "files",
-              []
-          )
-
-          failures = manifest.get(
-              "failures",
-              []
-          )
-
-          unlock_hits = []
-          fastboot_hits = []
-          vendor_hits = []
-          oem_hits = []
-          high_entropy = []
-
-          total_functions = 0
-          total_unlock_matches = 0
-          total_fastboot_matches = 0
-          total_vendor_matches = 0
-          total_oem_matches = 0
-
-          for item in files:
-              total_functions += int(
-                  item.get(
-                      "function_count",
-                      0
-                  )
-                  or 0
-              )
-
-              total_unlock_matches += int(
-                  item.get(
-                      "unlock_match_count",
-                      0
-                  )
-                  or 0
-              )
-
-              total_fastboot_matches += int(
-                  item.get(
-                      "fastboot_match_count",
-                      0
-                  )
-                  or 0
-              )
-
-              total_vendor_matches += int(
-                  item.get(
-                      "vendor_match_count",
-                      0
-                  )
-                  or 0
-              )
-
-              total_oem_matches += int(
-                  item.get(
-                      "oem_match_count",
-                      0
-                  )
-                  or 0
-              )
-
-              if item.get(
-                  "unlock_match_count",
-                  0
-              ) > 0:
-                  unlock_hits.append(
-                      item
-                  )
-
-              if item.get(
-                  "fastboot_match_count",
-                  0
-              ) > 0:
-                  fastboot_hits.append(
-                      item
-                  )
-
-              if item.get(
-                  "vendor_match_count",
-                  0
-              ) > 0:
-                  vendor_hits.append(
-                      item
-                  )
-
-              if item.get(
-                  "oem_match_count",
-                  0
-              ) > 0:
-                  oem_hits.append(
-                      item
-                  )
-
-              if item.get(
-                  "high_entropy_block_count",
-                  0
-              ) > 0:
-                  high_entropy.append(
-                      item
-                  )
-
-          with open(
-              report_path,
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(
-                  "# QCOM Bootloader Full Recursive Analysis\n\n"
-              )
-
-              f.write(
-                  "## Input\n\n"
-              )
-
-              f.write(
-                  f"- Input ZIP: "
-                  f"`{manifest.get('input_zip', '')}`\n"
-              )
-
-              f.write(
-                  f"- Input Size: "
-                  f"`{manifest.get('input_size', 0)}` bytes\n"
-              )
-
-              f.write(
-                  f"- Input SHA256: "
-                  f"`{manifest.get('input_sha256', '')}`\n"
-              )
-
-              f.write(
-                  f"- Discovered Files: "
-                  f"`{manifest.get('file_count_discovered', 0)}`\n"
-              )
-
-              f.write(
-                  f"- Analyzed Files: "
-                  f"`{manifest.get('file_count_analyzed', 0)}`\n"
-              )
-
-              f.write(
-                  f"- Failed Files: "
-                  f"`{manifest.get('file_count_failed', 0)}`\n"
-              )
-
-              f.write(
-                  f"- Total Functions: "
-                  f"`{total_functions}`\n"
-              )
-
-              f.write(
-                  f"- Total Fastboot Matches: "
-                  f"`{total_fastboot_matches}`\n"
-              )
-
-              f.write(
-                  f"- Total Unlock Matches: "
-                  f"`{total_unlock_matches}`\n"
-              )
-
-              f.write(
-                  f"- Total Vendor Matches: "
-                  f"`{total_vendor_matches}`\n"
-              )
-
-              f.write(
-                  f"- Total OEM Matches: "
-                  f"`{total_oem_matches}`\n"
-              )
-
-              f.write(
-                  "\n"
-              )
-
-              f.write(
-                  "## Analysis Coverage\n\n"
-              )
-
-              f.write(
-                  "Every discovered regular file is analyzed "
-                  "without using file extensions as an inclusion "
-                  "condition. The analysis includes file identification, "
-                  "MIME detection, SHA256, MD5, entropy, ASCII strings, "
-                  "UTF-16LE strings, hexadecimal previews, recursive "
-                  "archive extraction, embedded data extraction, "
-                  "radare2 binary information, sections, symbols, "
-                  "imports, exports, entry points, function discovery, "
-                  "and function-level disassembly where supported.\n\n"
-              )
-
-              f.write(
-                  "## Files With Unlock-related Matches\n\n"
-              )
-
-              if unlock_hits:
-                  f.write(
-                      "| File | Unlock Matches | Functions |\n"
-                  )
-
-                  f.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in unlock_hits:
-                      f.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{item.get('unlock_match_count', 0)} | "
-                          f"{item.get('function_count', 0)} |\n"
-                      )
-
-              else:
-                  f.write(
-                      "No unlock-related matches were detected.\n"
-                  )
-
-              f.write(
-                  "\n## Files With Fastboot-related Matches\n\n"
-              )
-
-              if fastboot_hits:
-                  f.write(
-                      "| File | Fastboot Matches | Functions |\n"
-                  )
-
-                  f.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in fastboot_hits:
-                      f.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{item.get('fastboot_match_count', 0)} | "
-                          f"{item.get('function_count', 0)} |\n"
-                      )
-
-              else:
-                  f.write(
-                      "No fastboot-related matches were detected.\n"
-                  )
-
-              f.write(
-                  "\n## Files With OEM Command Matches\n\n"
-              )
-
-              if oem_hits:
-                  f.write(
-                      "| File | OEM Matches | Functions |\n"
-                  )
-
-                  f.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in oem_hits:
-                      f.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{item.get('oem_match_count', 0)} | "
-                          f"{item.get('function_count', 0)} |\n"
-                      )
-
-              else:
-                  f.write(
-                      "No explicit OEM command patterns were detected.\n"
-                  )
-
-              f.write(
-                  "\n## Files With Vendor-related Matches\n\n"
-              )
-
-              if vendor_hits:
-                  f.write(
-                      "| File | Vendor Matches | Functions |\n"
-                  )
-
-                  f.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in vendor_hits:
-                      f.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{item.get('vendor_match_count', 0)} | "
-                          f"{item.get('function_count', 0)} |\n"
-                      )
-
-              else:
-                  f.write(
-                      "No vendor-related matches were detected.\n"
-                  )
-
-              f.write(
-                  "\n## High Entropy Files\n\n"
-              )
-
-              if high_entropy:
-                  f.write(
-                      "| File | Entropy Blocks | Size |\n"
-                  )
-
-                  f.write(
-                      "|---|---:|---:|\n"
-                  )
-
-                  for item in sorted(
-                      high_entropy,
-                      key=lambda value: int(
-                          value.get(
-                              "high_entropy_block_count",
-                              0
-                          )
-                          or 0
-                      ),
-                      reverse=True
-                  ):
-                      f.write(
-                          f"| `{item.get('relative_name', '')}` | "
-                          f"{item.get('high_entropy_block_count', 0)} | "
-                          f"{item.get('size', 0)} |\n"
-                      )
-
-              else:
-                  f.write(
-                      "No high entropy blocks were detected.\n"
-                  )
-
-              f.write(
-                  "\n## All Analyzed Files\n\n"
-              )
-
-              f.write(
-                  "| # | Depth | File | Size | SHA256 | "
-                  "Entropy | Functions | Unlock | Fastboot | OEM |\n"
-              )
-
-              f.write(
-                  "|---:|---:|---|---:|---|---:|---:|---:|---:|---:|\n"
-              )
-
-              for item in files:
-                  try:
-                      entropy_value = float(
-                          item.get(
-                              "entropy",
-                              0
-                          )
-                          or 0
-                      )
-                  except Exception:
-                      entropy_value = 0.0
-
-                  f.write(
-                      f"| {item.get('sequence', '')} | "
-                      f"{item.get('depth', '')} | "
-                      f"`{item.get('relative_name', '')}` | "
-                      f"{item.get('size', '')} | "
-                      f"`{item.get('sha256', '')}` | "
-                      f"{entropy_value:.4f} | "
-                      f"{item.get('function_count', 0)} | "
-                      f"{item.get('unlock_match_count', 0)} | "
-                      f"{item.get('fastboot_match_count', 0)} | "
-                      f"{item.get('oem_match_count', 0)} |\n"
-                  )
-
-              f.write(
-                  "\n## Failed Files\n\n"
-              )
-
-              if failures:
-                  for failure in failures:
-                      f.write(
-                          f"- `{failure.get('relative_name', '')}`: "
-                          f"{failure.get('error', '')}\n"
-                      )
-
-              else:
-                  f.write(
-                      "No file analysis failures were recorded.\n"
-                  )
-
-              f.write(
-                  "\n## Artifact Structure\n\n"
-              )
-
-              f.write(
-                  "```text\n"
-                  "artifacts/\n"
-                  "├── analysis_manifest.json\n"
-                  "├── analysis_index.csv\n"
-                  "├── logs/\n"
-                  "│   ├── analysis.log\n"
-                  "│   ├── recursive_extraction.json\n"
-                  "│   ├── source_sha256.txt\n"
-                  "│   └── source_stat.txt\n"
-                  "├── reports/\n"
-                  "│   ├── FULL_ANALYSIS_REPORT.md\n"
-                  "│   ├── index.html\n"
-                  "│   ├── files/\n"
-                  "│   │   ├── per-file JSON reports\n"
-                  "│   │   └── per-file Markdown reports\n"
-                  "│   └── disassembly/\n"
-                  "│       ├── function disassembly\n"
-                  "│       └── entry point disassembly\n"
-                  "└── raw/\n"
-                  "    └── per-file raw analysis data\n"
-                  "```\n"
-
-          print(
-              f"Generated: {report_path}"
-          )
-          PYEOF
-
-      - name: Generate HTML Summary
-        shell: bash
-        run: |
-          set -e
-
-          test -f \
-            "${ARTIFACT_ROOT}/analysis_manifest.json"
-
-          python3 - <<'PYEOF'
           import os
           import json
           import html
@@ -3817,19 +3223,13 @@ jobs:
               / "analysis_manifest.json"
           )
 
-          if not manifest_path.is_file():
-              raise SystemExit(
-                  f"Manifest not found: "
-                  f"{manifest_path}"
-              )
-
           with open(
               manifest_path,
               "r",
               encoding="utf-8"
-          ) as f:
+          ) as source:
               manifest = json.load(
-                  f
+                  source
               )
 
           files = manifest.get(
@@ -3837,207 +3237,645 @@ jobs:
               []
           )
 
-          report_html = (
-              artifact_root
-              / "reports"
-              / "index.html"
+          failures = manifest.get(
+              "failures",
+              []
           )
 
-          report_html.parent.mkdir(
+          total_functions = sum(
+              int(
+                  item.get(
+                      "function_count",
+                      0
+                  )
+                  or 0
+              )
+              for item in files
+          )
+
+          total_fastboot = sum(
+              int(
+                  item.get(
+                      "fastboot_match_count",
+                      0
+                  )
+                  or 0
+              )
+              for item in files
+          )
+
+          total_unlock = sum(
+              int(
+                  item.get(
+                      "unlock_match_count",
+                      0
+                  )
+                  or 0
+              )
+              for item in files
+          )
+
+          total_vendor = sum(
+              int(
+                  item.get(
+                      "vendor_match_count",
+                      0
+                  )
+                  or 0
+              )
+              for item in files
+          )
+
+          total_oem = sum(
+              int(
+                  item.get(
+                      "oem_match_count",
+                      0
+                  )
+                  or 0
+              )
+              for item in files
+          )
+
+          markdown_path = (
+              artifact_root
+              / "reports"
+              / "FULL_ANALYSIS_REPORT.md"
+          )
+
+          markdown_path.parent.mkdir(
               parents=True,
               exist_ok=True
           )
 
           with open(
-              report_html,
+              markdown_path,
               "w",
               encoding="utf-8"
-          ) as f:
-              f.write(
-                  "<!doctype html>"
-                  "<html>"
-                  "<head>"
-                  "<meta charset='utf-8'>"
+          ) as output:
+
+              output.write(
+                  "# QCOM Bootloader Full Recursive Analysis\n\n"
+              )
+
+              output.write(
+                  "## Input\n\n"
+              )
+
+              output.write(
+                  f"- ZIP: `{manifest.get('input_zip', '')}`\n"
+              )
+
+              output.write(
+                  f"- Size: `{manifest.get('input_size', 0)}` bytes\n"
+              )
+
+              output.write(
+                  f"- SHA256: `{manifest.get('input_sha256', '')}`\n"
+              )
+
+              output.write(
+                  f"- Discovered: `{manifest.get('file_count_discovered', 0)}`\n"
+              )
+
+              output.write(
+                  f"- Analyzed: `{manifest.get('file_count_analyzed', 0)}`\n"
+              )
+
+              output.write(
+                  f"- Failed: `{manifest.get('file_count_failed', 0)}`\n"
+              )
+
+              output.write(
+                  f"- Total Functions: `{total_functions}`\n"
+              )
+
+              output.write(
+                  f"- Fastboot Matches: `{total_fastboot}`\n"
+              )
+
+              output.write(
+                  f"- Unlock Matches: `{total_unlock}`\n"
+              )
+
+              output.write(
+                  f"- Vendor Matches: `{total_vendor}`\n"
+              )
+
+              output.write(
+                  f"- OEM Matches: `{total_oem}`\n"
+              )
+
+              output.write(
+                  "\n"
+              )
+
+              output.write(
+                  "## Analysis Scope\n\n"
+              )
+
+              output.write(
+                  "All discovered regular files are analyzed without "
+                  "using the file extension as an inclusion criterion. "
+                  "The workflow performs file identification, MIME "
+                  "detection, hashes, entropy analysis, ASCII strings, "
+                  "UTF-16LE strings, hexadecimal inspection, recursive "
+                  "archive extraction, embedded extraction, radare2 "
+                  "binary analysis and function-level disassembly "
+                  "where supported.\n\n"
+              )
+
+              output.write(
+                  "## Unlock-related Files\n\n"
+              )
+
+              unlock_files = [
+                  item
+                  for item in files
+                  if (
+                      int(
+                          item.get(
+                              "unlock_match_count",
+                              0
+                          )
+                          or 0
+                      )
+                      > 0
+                  )
+              ]
+
+              if unlock_files:
+                  output.write(
+                      "| File | Unlock Matches | Functions |\n"
+                  )
+
+                  output.write(
+                      "|---|---:|---:|\n"
+                  )
+
+                  for item in unlock_files:
+                      output.write(
+                          f"| `{item.get('relative_name', '')}` | "
+                          f"{item.get('unlock_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  output.write(
+                      "No unlock-related matches detected.\n"
+                  )
+
+              output.write(
+                  "\n## Fastboot-related Files\n\n"
+              )
+
+              fastboot_files = [
+                  item
+                  for item in files
+                  if (
+                      int(
+                          item.get(
+                              "fastboot_match_count",
+                              0
+                          )
+                          or 0
+                      )
+                      > 0
+                  )
+              ]
+
+              if fastboot_files:
+                  output.write(
+                      "| File | Fastboot Matches | Functions |\n"
+                  )
+
+                  output.write(
+                      "|---|---:|---:|\n"
+                  )
+
+                  for item in fastboot_files:
+                      output.write(
+                          f"| `{item.get('relative_name', '')}` | "
+                          f"{item.get('fastboot_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  output.write(
+                      "No fastboot-related matches detected.\n"
+                  )
+
+              output.write(
+                  "\n## OEM Command Files\n\n"
+              )
+
+              oem_files = [
+                  item
+                  for item in files
+                  if (
+                      int(
+                          item.get(
+                              "oem_match_count",
+                              0
+                          )
+                          or 0
+                      )
+                      > 0
+                  )
+              ]
+
+              if oem_files:
+                  output.write(
+                      "| File | OEM Matches | Functions |\n"
+                  )
+
+                  output.write(
+                      "|---|---:|---:|\n"
+                  )
+
+                  for item in oem_files:
+                      output.write(
+                          f"| `{item.get('relative_name', '')}` | "
+                          f"{item.get('oem_match_count', 0)} | "
+                          f"{item.get('function_count', 0)} |\n"
+                      )
+              else:
+                  output.write(
+                      "No OEM command matches detected.\n"
+                  )
+
+              output.write(
+                  "\n## All Files\n\n"
+              )
+
+              output.write(
+                  "| # | Depth | File | Size | SHA256 | "
+                  "Entropy | Functions | Unlock | Fastboot | Vendor | OEM |\n"
+              )
+
+              output.write(
+                  "|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|\n"
+              )
+
+              for item in files:
+                  output.write(
+                      f"| {item.get('sequence', '')} | "
+                      f"{item.get('depth', '')} | "
+                      f"`{item.get('relative_name', '')}` | "
+                      f"{item.get('size', '')} | "
+                      f"`{item.get('sha256', '')}` | "
+                      f"{float(item.get('entropy', 0) or 0):.4f} | "
+                      f"{item.get('function_count', 0)} | "
+                      f"{item.get('unlock_match_count', 0)} | "
+                      f"{item.get('fastboot_match_count', 0)} | "
+                      f"{item.get('vendor_match_count', 0)} | "
+                      f"{item.get('oem_match_count', 0)} |\n"
+                  )
+
+              output.write(
+                  "\n## Failed Files\n\n"
+              )
+
+              if failures:
+                  for item in failures:
+                      output.write(
+                          f"- `{item.get('relative_name', '')}`: "
+                          f"{item.get('error', '')}\n"
+                      )
+              else:
+                  output.write(
+                      "No file analysis failures.\n"
+                  )
+
+              output.write(
+                  "\n## Artifact Layout\n\n"
+              )
+
+              output.write(
+                  "```text\n"
+                  "artifacts/\n"
+                  "├── analysis_manifest.json\n"
+                  "├── analysis_index.csv\n"
+                  "├── logs/\n"
+                  "│   ├── analysis.log\n"
+                  "│   ├── recursive_extraction.json\n"
+                  "│   ├── failures.log\n"
+                  "│   ├── source_sha256.txt\n"
+                  "│   ├── source_md5.txt\n"
+                  "│   └── source_stat.txt\n"
+                  "├── reports/\n"
+                  "│   ├── FULL_ANALYSIS_REPORT.md\n"
+                  "│   ├── index.html\n"
+                  "│   ├── files/\n"
+                  "│   └── disassembly/\n"
+                  "└── raw/\n"
+                  "```\n"
+
+          html_path = (
+              artifact_root
+              / "reports"
+              / "index.html"
+          )
+
+          with open(
+              html_path,
+              "w",
+              encoding="utf-8"
+          ) as output:
+
+              output.write(
+                  "<!doctype html>\n"
+              )
+
+              output.write(
+                  "<html>\n"
+              )
+
+              output.write(
+                  "<head>\n"
+                  "<meta charset='utf-8'>\n"
                   "<meta name='viewport' "
-                  "content='width=device-width,initial-scale=1'>"
-                  "<title>"
-                  "QCOM Bootloader Full Recursive Analysis"
-                  "</title>"
+                  "content='width=device-width,initial-scale=1'>\n"
+                  "<title>QCOM Bootloader Full Recursive Analysis</title>\n"
                   "<style>"
-                  "body{"
-                  "font-family:Arial,Helvetica,sans-serif;"
-                  "margin:32px;"
-                  "background:#f5f5f5;"
-                  "color:#222"
-                  "}"
-                  "h1,h2{color:#222}"
-                  ".cards{"
-                  "display:grid;"
-                  "grid-template-columns:"
-                  "repeat(auto-fit,minmax(180px,1fr));"
-                  "gap:16px"
-                  "}"
-                  ".card{"
-                  "background:#fff;"
-                  "border:1px solid #ddd;"
-                  "border-radius:8px;"
-                  "padding:16px"
-                  "}"
-                  ".value{"
-                  "font-size:28px;"
-                  "font-weight:bold"
-                  "}"
-                  "table{"
-                  "border-collapse:collapse;"
-                  "width:100%;"
-                  "background:#fff"
-                  "}"
-                  "th,td{"
-                  "border:1px solid #ddd;"
-                  "padding:7px;"
-                  "text-align:left;"
-                  "vertical-align:top"
-                  "}"
-                  "th{"
-                  "background:#333;"
-                  "color:#fff;"
-                  "position:sticky;"
-                  "top:0"
-                  "}"
-                  "tr:nth-child(even){"
-                  "background:#fafafa"
-                  "}"
-                  "</style>"
-                  "</head>"
-                  "<body>"
+                  "body{font-family:Arial,Helvetica,sans-serif;"
+                  "margin:30px;background:#f5f5f5;color:#222}"
+                  ".cards{display:grid;"
+                  "grid-template-columns:repeat(auto-fit,minmax(180px,1fr));"
+                  "gap:16px;margin-bottom:24px}"
+                  ".card{background:#fff;border:1px solid #ddd;"
+                  "border-radius:8px;padding:18px}"
+                  ".value{font-size:28px;font-weight:bold}"
+                  "table{border-collapse:collapse;width:100%;"
+                  "background:#fff}"
+                  "th,td{border:1px solid #ddd;padding:7px;"
+                  "text-align:left;vertical-align:top}"
+                  "th{background:#333;color:#fff}"
+                  "tr:nth-child(even){background:#fafafa}"
+                  "a{color:#0645ad}"
+                  "</style>\n"
+                  "</head>\n"
               )
 
-              f.write(
-                  "<h1>"
-                  "QCOM Bootloader Full Recursive Analysis"
-                  "</h1>"
+              output.write(
+                  "<body>\n"
               )
 
-              f.write(
-                  "<div class='cards'>"
+              output.write(
+                  "<h1>QCOM Bootloader Full Recursive Analysis</h1>\n"
               )
 
-              f.write(
-                  "<div class='card'>"
-                  "<div>Discovered</div>"
-                  "<div class='value'>"
-                  f"{manifest.get('file_count_discovered', 0)}"
-                  "</div>"
-                  "</div>"
+              output.write(
+                  "<div class='cards'>\n"
               )
 
-              f.write(
-                  "<div class='card'>"
-                  "<div>Analyzed</div>"
-                  "<div class='value'>"
-                  f"{manifest.get('file_count_analyzed', 0)}"
-                  "</div>"
-                  "</div>"
+              for label, value in [
+                  (
+                      "Discovered",
+                      manifest.get(
+                          "file_count_discovered",
+                          0
+                      )
+                  ),
+                  (
+                      "Analyzed",
+                      manifest.get(
+                          "file_count_analyzed",
+                          0
+                      )
+                  ),
+                  (
+                      "Failed",
+                      manifest.get(
+                          "file_count_failed",
+                          0
+                      )
+                  ),
+                  (
+                      "Functions",
+                      total_functions
+                  ),
+                  (
+                      "Unlock",
+                      total_unlock
+                  ),
+                  (
+                      "Fastboot",
+                      total_fastboot
+                  )
+              ]:
+                  output.write(
+                      "<div class='card'>"
+                      f"<div>{html.escape(str(label))}</div>"
+                      f"<div class='value'>{html.escape(str(value))}</div>"
+                      "</div>\n"
+                  )
+
+              output.write(
+                  "</div>\n"
               )
 
-              f.write(
-                  "<div class='card'>"
-                  "<div>Failed</div>"
-                  "<div class='value'>"
-                  f"{manifest.get('file_count_failed', 0)}"
-                  "</div>"
-                  "</div>"
-              )
-
-              f.write(
-                  "</div>"
-              )
-
-              f.write(
-                  "<h2>Reports</h2>"
-                  "<ul>"
-              )
-
-              f.write(
-                  "<li>"
+              output.write(
+                  "<p>"
                   "<a href='FULL_ANALYSIS_REPORT.md'>"
                   "FULL_ANALYSIS_REPORT.md"
                   "</a>"
-                  "</li>"
+                  "</p>\n"
               )
 
-              f.write(
-                  "<li>"
+              output.write(
+                  "<p>"
                   "<a href='../analysis_manifest.json'>"
                   "analysis_manifest.json"
                   "</a>"
-                  "</li>"
+                  "</p>\n"
               )
 
-              f.write(
-                  "<li>"
+              output.write(
+                  "<p>"
                   "<a href='../analysis_index.csv'>"
                   "analysis_index.csv"
                   "</a>"
-                  "</li>"
+                  "</p>\n"
               )
 
-              f.write(
-                  "</ul>"
+              output.write(
+                  "<h2>Files</h2>\n"
               )
 
-              f.write(
-                  "<h2>Analyzed Files</h2>"
-              )
-
-              f.write(
-                  "<table>"
+              output.write(
+                  "<table>\n"
                   "<thead>"
                   "<tr>"
                   "<th>#</th>"
                   "<th>Depth</th>"
                   "<th>File</th>"
                   "<th>Size</th>"
-                  "<th>SHA256</th>"
                   "<th>Entropy</th>"
                   "<th>Functions</th>"
                   "<th>Unlock</th>"
                   "<th>Fastboot</th>"
+                  "<th>Vendor</th>"
                   "<th>OEM</th>"
                   "</tr>"
                   "</thead>"
-                  "<tbody>"
+                  "<tbody>\n"
               )
 
               for item in files:
-                  f.write(
+                  output.write(
                       "<tr>"
                       f"<td>{html.escape(str(item.get('sequence', '')))}</td>"
                       f"<td>{html.escape(str(item.get('depth', '')))}</td>"
                       f"<td>{html.escape(str(item.get('relative_name', '')))}</td>"
                       f"<td>{html.escape(str(item.get('size', '')))}</td>"
-                      f"<td>{html.escape(str(item.get('sha256', '')))}</td>"
                       f"<td>{html.escape(str(item.get('entropy', '')))}</td>"
                       f"<td>{html.escape(str(item.get('function_count', '')))}</td>"
                       f"<td>{html.escape(str(item.get('unlock_match_count', '')))}</td>"
                       f"<td>{html.escape(str(item.get('fastboot_match_count', '')))}</td>"
+                      f"<td>{html.escape(str(item.get('vendor_match_count', '')))}</td>"
                       f"<td>{html.escape(str(item.get('oem_match_count', '')))}</td>"
-                      "</tr>"
+                      "</tr>\n"
                   )
 
-              f.write(
+              output.write(
                   "</tbody>"
-                  "</table>"
-                  "</body>"
-                  "</html>"
+                  "</table>\n"
+              )
+
+              output.write(
+                  "</body>\n"
+                  "</html>\n"
               )
 
           print(
-              f"Generated: {report_html}"
+              f"Markdown report: {markdown_path}"
+          )
+
+          print(
+              f"HTML report: {html_path}"
           )
           PYEOF
 
-      - name: Collect Failure Diagnostics
+          python3 -m py_compile \
+            /tmp/generate_global_report.py
+
+          python3 \
+            /tmp/generate_global_report.py
+
+          test -f \
+            "${ARTIFACT_ROOT}/reports/FULL_ANALYSIS_REPORT.md"
+
+          test -f \
+            "${ARTIFACT_ROOT}/reports/index.html"
+
+      - name: Validate Final Artifacts
+        shell: bash
+        run: |
+          set -e
+
+          test -d \
+            "${ARTIFACT_ROOT}"
+
+          test -f \
+            "${ARTIFACT_ROOT}/analysis_manifest.json"
+
+          test -f \
+            "${ARTIFACT_ROOT}/analysis_index.csv"
+
+          test -f \
+            "${ARTIFACT_ROOT}/reports/FULL_ANALYSIS_REPORT.md"
+
+          test -f \
+            "${ARTIFACT_ROOT}/reports/index.html"
+
+          python3 - <<'PYEOF'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(
+              os.environ["ARTIFACT_ROOT"]
+          )
+
+          manifest_path = (
+              root
+              / "analysis_manifest.json"
+          )
+
+          with open(
+              manifest_path,
+              "r",
+              encoding="utf-8"
+          ) as source:
+              manifest = json.load(
+                  source
+              )
+
+          required = [
+              "input_zip",
+              "input_size",
+              "input_sha256",
+              "file_count_discovered",
+              "file_count_analyzed",
+              "file_count_failed",
+              "files",
+              "failures"
+          ]
+
+          for key in required:
+              if key not in manifest:
+                  raise SystemExit(
+                      f"Missing manifest key: {key}"
+                  )
+
+          discovered = int(
+              manifest[
+                  "file_count_discovered"
+              ]
+          )
+
+          analyzed = int(
+              manifest[
+                  "file_count_analyzed"
+              ]
+          )
+
+          failed = int(
+              manifest[
+                  "file_count_failed"
+              ]
+          )
+
+          if discovered < analyzed:
+              raise SystemExit(
+                  "Manifest count inconsistency."
+              )
+
+          if (
+              analyzed + failed
+              < discovered
+          ):
+              raise SystemExit(
+                  "Manifest analysis accounting inconsistency."
+              )
+
+          print(
+              f"Discovered={discovered}"
+          )
+
+          print(
+              f"Analyzed={analyzed}"
+          )
+
+          print(
+              f"Failed={failed}"
+          )
+
+          print(
+              f"Manifest={manifest_path}"
+          )
+          PYEOF
+
+      - name: Collect Diagnostics
         if: always()
         shell: bash
         run: |
@@ -4053,18 +3891,27 @@ jobs:
             echo "===== PWD ====="
             pwd
 
+            echo "===== SYSTEM ====="
+            uname -a
+
+            echo "===== CPU ====="
+            nproc
+
+            echo "===== MEMORY ====="
+            free -h
+
+            echo "===== DISK ====="
+            df -h
+
             echo "===== ENV ====="
             env | sort
 
-            echo "===== ROOT ====="
-            ls -lah
-
-            echo "===== ANALYSIS ROOT ====="
+            echo "===== ANALYSIS TREE ====="
 
             if [ -d "${ANALYSIS_ROOT}" ]; then
               find \
                 "${ANALYSIS_ROOT}" \
-                -maxdepth 5 \
+                -maxdepth 6 \
                 -type f \
                 -printf '%p %s bytes\n' \
                 | sort
@@ -4072,7 +3919,7 @@ jobs:
               echo "ANALYSIS_ROOT does not exist"
             fi
 
-            echo "===== ARTIFACT ROOT ====="
+            echo "===== ARTIFACT TREE ====="
 
             if [ -d "${ARTIFACT_ROOT}" ]; then
               find \
@@ -4098,16 +3945,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
           compression-level: 0
+          include-hidden-files: true
 
       - name: Notify Completion
         if: success()
         shell: bash
         run: |
-          echo "::notice title=Bootloader Analysis Complete::ZIP downloaded, recursively extracted, all discovered files analyzed, and reports uploaded as GitHub Artifact."
+          echo "::notice title=Bootloader Analysis Complete::Recursive extraction, file analysis, disassembly and report generation completed successfully."
 
       - name: Notify Failure
         if: failure()
         shell: bash
         run: |
-          echo "::error title=Bootloader Analysis Failed::The recursive analysis failed. Diagnostic logs and generated artifacts were uploaded."
+          echo "::error title=Bootloader Analysis Failed::The workflow failed after or during analysis. Diagnostic logs and generated artifacts were uploaded."
           exit 1
