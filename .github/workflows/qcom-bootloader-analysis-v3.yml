@@ -1134,6 +1134,7 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p /tmp/ghidra_out
+          mkdir -p /tmp/ghidra_project
           export GHIDRA_TARGETS_FILE=/tmp/r2_artifacts/xbl_ghidra_targets.json
           export GHIDRA_OUT_DIR=/tmp/ghidra_out
           "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra_project GhidraOemProject \
@@ -1145,6 +1146,8 @@ jobs:
       - name: Run Ghidra headless analysis for abl targets
         continue-on-error: true
         run: |
+          mkdir -p /tmp/ghidra_out
+          mkdir -p /tmp/ghidra_project
           export GHIDRA_TARGETS_FILE=/tmp/r2_artifacts/abl_ghidra_targets.json
           export GHIDRA_OUT_DIR=/tmp/ghidra_out
           "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra_project GhidraOemProject \
