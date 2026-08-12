@@ -5,11 +5,9 @@ on:
     branches:
       - main
       - dev
-
   pull_request:
     branches:
       - main
-
   workflow_dispatch:
     inputs:
       zip_url:
@@ -60,18 +58,37 @@ jobs:
             echo "zip_url=${ZIP_URL}"
           } > "${ARTIFACT_ROOT}/logs/workflow_status.txt"
 
-      - name: Verify System PATH
+      - name: Verify Essential Shell Commands
         shell: bash
         run: |
           set -e
 
-          echo "${PATH}"
+          required_commands="
+          sh
+          bash
+          env
+          ls
+          mkdir
+          apt-get
+          date
+          uname
+          "
+
+          for command_name in ${required_commands}; do
+            if ! command -v "${command_name}" >/dev/null 2>&1; then
+              echo "Required command not found: ${command_name}"
+              exit 1
+            fi
+          done
+
+          echo "PATH=${PATH}"
 
           command -v sh
           command -v bash
           command -v env
           command -v ls
           command -v mkdir
+          command -v apt-get
 
       - name: Install Base Packages
         shell: bash
@@ -95,11 +112,19 @@ jobs:
 
           rm -rf /var/lib/apt/lists/*
 
-          command -v ldconfig
-          command -v ld.so
-          command -v curl
-          command -v wget
-          command -v git
+          if ! command -v ldconfig >/dev/null 2>&1; then
+            echo "ldconfig was not installed correctly."
+            exit 1
+          fi
+
+          LD_CONFIG_PATH="$(command -v ldconfig)"
+
+          if [ ! -x "${LD_CONFIG_PATH}" ]; then
+            echo "ldconfig exists but is not executable: ${LD_CONFIG_PATH}"
+            exit 1
+          fi
+
+          echo "ldconfig=${LD_CONFIG_PATH}"
 
           ldconfig --version
 
@@ -154,29 +179,41 @@ jobs:
 
           rm -rf /var/lib/apt/lists/*
 
-          command -v python3
-          command -v pip3
-          command -v gcc
-          command -v g++
-          command -v make
-          command -v cmake
-          command -v file
-          command -v strings
-          command -v 7z
-          command -v unzip
-          command -v tar
-          command -v xz
-          command -v gzip
-          command -v bzip2
-          command -v ldconfig
+          required_commands="
+          python3
+          pip3
+          gcc
+          g++
+          make
+          cmake
+          file
+          strings
+          7z
+          unzip
+          tar
+          xz
+          gzip
+          bzip2
+          binwalk
+          ldconfig
+          "
+
+          for command_name in ${required_commands}; do
+            if ! command -v "${command_name}" >/dev/null 2>&1; then
+              echo "Required analysis command not found: ${command_name}"
+              exit 1
+            fi
+          done
 
           python3 --version
           gcc --version | head -n 1
+          g++ --version | head -n 1
           make --version | head -n 1
+          cmake --version | head -n 1
           file --version | head -n 1
           ldconfig --version | head -n 1
 
-      - name: Verify Container Environment
+      - name: Record Environment
         shell: bash
         run: |
           set -e
@@ -213,13 +250,19 @@ jobs:
             command -v ldconfig
             ldconfig --version | head -n 1
 
-            echo "===== FILE ====="
-            file --version | head -n 1
-
             echo "===== TOOLS ====="
+            command -v curl
+            command -v wget
+            command -v git
+            command -v python3
+            command -v file
             command -v strings
             command -v 7z
             command -v unzip
+            command -v tar
+            command -v xz
+            command -v gzip
+            command -v bzip2
             command -v binwalk
 
           } | tee \
@@ -230,7 +273,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build and Install Radare2
+      - name: Build Radare2
         shell: bash
         run: |
           set -e
@@ -256,20 +299,29 @@ jobs:
           rm -rf /tmp/radare2
 
           export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
           export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib:/lib"
 
-          mkdir -p \
-            /usr/local/bin \
-            /usr/local/lib
-
-          command -v ldconfig
+          if ! command -v ldconfig >/dev/null 2>&1; then
+            echo "ldconfig is unavailable after radare2 installation."
+            exit 1
+          fi
 
           ldconfig
 
-          command -v r2
-          command -v rabin2
-          command -v rasm2
+          if ! command -v r2 >/dev/null 2>&1; then
+            echo "r2 was not installed."
+            exit 1
+          fi
+
+          if ! command -v rabin2 >/dev/null 2>&1; then
+            echo "rabin2 was not installed."
+            exit 1
+          fi
+
+          if ! command -v rasm2 >/dev/null 2>&1; then
+            echo "rasm2 was not installed."
+            exit 1
+          fi
 
           r2 -v
           rabin2 -v
@@ -280,6 +332,8 @@ jobs:
             echo "rabin2=$(command -v rabin2)"
             echo "rasm2=$(command -v rasm2)"
             r2 -v
+            rabin2 -v
+            rasm2 -v
           } | tee \
             "${ARTIFACT_ROOT}/logs/radare2.txt"
 
@@ -316,9 +370,9 @@ jobs:
               "magic"
           ]
 
-          for module in modules:
-              importlib.import_module(module)
-              print(f"OK {module}")
+          for module_name in modules:
+              importlib.import_module(module_name)
+              print("OK:", module_name)
           PYEOF
 
       - name: Download ZIP
@@ -328,7 +382,7 @@ jobs:
 
           if [ -z "${ZIP_URL}" ]; then
             echo "ZIP_URL is empty."
-            exit 10
+            exit 1
           fi
 
           rm -f \
@@ -346,15 +400,19 @@ jobs:
             "${ANALYSIS_ROOT}/input/source.zip" \
             "${ZIP_URL}"
 
-          test -f \
-            "${ANALYSIS_ROOT}/input/source.zip"
+          if [ ! -f "${ANALYSIS_ROOT}/input/source.zip" ]; then
+            echo "ZIP download failed."
+            exit 1
+          fi
 
           ZIP_SIZE="$(stat -c '%s' "${ANALYSIS_ROOT}/input/source.zip")"
 
           if [ "${ZIP_SIZE}" -le 0 ]; then
             echo "Downloaded ZIP is empty."
-            exit 11
+            exit 1
           fi
+
+          echo "ZIP_SIZE=${ZIP_SIZE}"
 
           file \
             "${ANALYSIS_ROOT}/input/source.zip"
@@ -403,7 +461,6 @@ jobs:
           import re
           import traceback
           import csv
-          import html
 
           from pathlib import Path
           from collections import deque
@@ -569,7 +626,6 @@ jobs:
               "PE": b"MZ",
               "ZIP": b"PK\x03\x04",
               "ZIP_EMPTY": b"PK\x05\x06",
-              "ZIP_SPANNED": b"PK\x07\x08",
               "GZIP": b"\x1f\x8b",
               "BZIP2": b"BZh",
               "XZ": b"\xfd7zXZ\x00",
@@ -581,12 +637,9 @@ jobs:
               "SQLITE": b"SQLite format 3\x00"
           }
 
-          def run_command(
-              command,
-              timeout=300
-          ):
+          def run_command(command, timeout=300):
               try:
-                  process = subprocess.run(
+                  result = subprocess.run(
                       command,
                       stdout=subprocess.PIPE,
                       stderr=subprocess.STDOUT,
@@ -596,8 +649,8 @@ jobs:
                   )
 
                   return (
-                      process.returncode,
-                      process.stdout
+                      result.returncode,
+                      result.stdout
                   )
 
               except subprocess.TimeoutExpired as exc:
@@ -612,8 +665,7 @@ jobs:
 
                   return (
                       124,
-                      output
-                      + "\nTIMEOUT\n"
+                      output + "\nTIMEOUT\n"
                   )
 
               except Exception as exc:
@@ -622,46 +674,26 @@ jobs:
                       str(exc)
                   )
 
-          def safe_name(
-              value,
-              maximum=180
-          ):
+          def safe_name(value, maximum=180):
               value = str(value)
-
-              value = value.replace(
-                  "\\",
-                  "_"
-              )
-
-              value = value.replace(
-                  "/",
-                  "_"
-              )
-
+              value = value.replace("\\", "_")
+              value = value.replace("/", "_")
               value = re.sub(
                   r"[^A-Za-z0-9._@+\-=]+",
                   "_",
                   value
               )
-
-              value = value.strip(
-                  "._"
-              )
+              value = value.strip("._")
 
               if not value:
                   value = "file"
 
               return value[:maximum]
 
-          def sha256_file(
-              path
-          ):
+          def sha256_file(path):
               digest = hashlib.sha256()
 
-              with open(
-                  path,
-                  "rb"
-              ) as source:
+              with open(path, "rb") as source:
                   while True:
                       chunk = source.read(
                           READ_CHUNK
@@ -670,21 +702,14 @@ jobs:
                       if not chunk:
                           break
 
-                      digest.update(
-                          chunk
-                      )
+                      digest.update(chunk)
 
               return digest.hexdigest()
 
-          def md5_file(
-              path
-          ):
+          def md5_file(path):
               digest = hashlib.md5()
 
-              with open(
-                  path,
-                  "rb"
-              ) as source:
+              with open(path, "rb") as source:
                   while True:
                       chunk = source.read(
                           READ_CHUNK
@@ -693,22 +718,15 @@ jobs:
                       if not chunk:
                           break
 
-                      digest.update(
-                          chunk
-                      )
+                      digest.update(chunk)
 
               return digest.hexdigest()
 
-          def entropy_bytes(
-              data
-          ):
+          def entropy_bytes(data):
               if not data:
                   return 0.0
 
-              counts = [
-                  0
-                  for _ in range(256)
-              ]
+              counts = [0] * 256
 
               for value in data:
                   counts[value] += 1
@@ -719,8 +737,7 @@ jobs:
               for count in counts:
                   if count:
                       probability = (
-                          count
-                          / total
+                          count / total
                       )
 
                       result -= (
@@ -732,20 +749,11 @@ jobs:
 
               return result
 
-          def entropy_file(
-              path
-          ):
-              counts = [
-                  0
-                  for _ in range(256)
-              ]
-
+          def entropy_file(path):
+              counts = [0] * 256
               total = 0
 
-              with open(
-                  path,
-                  "rb"
-              ) as source:
+              with open(path, "rb") as source:
                   while True:
                       chunk = source.read(
                           READ_CHUNK
@@ -754,9 +762,7 @@ jobs:
                       if not chunk:
                           break
 
-                      total += len(
-                          chunk
-                      )
+                      total += len(chunk)
 
                       for value in chunk:
                           counts[value] += 1
@@ -769,8 +775,7 @@ jobs:
               for count in counts:
                   if count:
                       probability = (
-                          count
-                          / total
+                          count / total
                       )
 
                       result -= (
@@ -782,17 +787,11 @@ jobs:
 
               return result
 
-          def entropy_regions(
-              path,
-              threshold=7.0
-          ):
+          def entropy_regions(path):
               result = []
               offset = 0
 
-              with open(
-                  path,
-                  "rb"
-              ) as source:
+              with open(path, "rb") as source:
                   while True:
                       block = source.read(
                           BLOCK_SIZE
@@ -805,13 +804,11 @@ jobs:
                           block
                       )
 
-                      if value >= threshold:
+                      if value >= 7.0:
                           result.append(
                               {
                                   "offset": offset,
-                                  "size": len(
-                                      block
-                                  ),
+                                  "size": len(block),
                                   "entropy": round(
                                       value,
                                       6
@@ -819,28 +816,17 @@ jobs:
                               }
                           )
 
-                      offset += len(
-                          block
-                      )
+                      offset += len(block)
 
               return result
 
-          def first_magic(
-              path
-          ):
+          def first_magic(path):
               try:
-                  with open(
-                      path,
-                      "rb"
-                  ) as source:
-                      data = source.read(
-                          64
-                      )
+                  with open(path, "rb") as source:
+                      data = source.read(64)
 
                   for name, magic in MAGIC_PATTERNS.items():
-                      if data.startswith(
-                          magic
-                      ):
+                      if data.startswith(magic):
                           return name
 
               except Exception:
@@ -848,9 +834,7 @@ jobs:
 
               return "UNKNOWN"
 
-          def file_information(
-              path
-          ):
+          def file_information(path):
               code, output = run_command(
                   [
                       "file",
@@ -875,14 +859,10 @@ jobs:
                   "description_exit_code": code,
                   "mime": mime_output.strip(),
                   "mime_exit_code": mime_code,
-                  "magic_prefix": first_magic(
-                      path
-                  )
+                  "magic_prefix": first_magic(path)
               }
 
-          def string_information(
-              path
-          ):
+          def string_information(path):
               ascii_code, ascii_output = run_command(
                   [
                       "strings",
@@ -910,16 +890,12 @@ jobs:
                   timeout=1200
               )
 
-              if len(
-                  ascii_output
-              ) > MAX_STRING_OUTPUT:
+              if len(ascii_output) > MAX_STRING_OUTPUT:
                   ascii_output = ascii_output[
                       :MAX_STRING_OUTPUT
                   ]
 
-              if len(
-                  utf16_output
-              ) > MAX_STRING_OUTPUT:
+              if len(utf16_output) > MAX_STRING_OUTPUT:
                   utf16_output = utf16_output[
                       :MAX_STRING_OUTPUT
                   ]
@@ -931,17 +907,9 @@ jobs:
                   "utf16le_exit_code": utf16_code
               }
 
-          def hex_dump(
-              path,
-              limit=16384
-          ):
-              with open(
-                  path,
-                  "rb"
-              ) as source:
-                  data = source.read(
-                      limit
-                  )
+          def hex_dump(path, limit=16384):
+              with open(path, "rb") as source:
+                  data = source.read(limit)
 
               lines = []
 
@@ -972,9 +940,7 @@ jobs:
                       f"{ascii_part}"
                   )
 
-              return "\n".join(
-                  lines
-              )
+              return "\n".join(lines)
 
           def safe_extract_path(
               destination,
@@ -994,8 +960,7 @@ jobs:
               return (
                   target_real == destination_real
                   or target_real.startswith(
-                      destination_real
-                      + os.sep
+                      destination_real + os.sep
                   )
               )
 
@@ -1003,16 +968,14 @@ jobs:
               source,
               destination
           ):
-              destination = str(
-                  destination
-              )
+              destination = str(destination)
 
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              files = []
+              result = []
 
               with zipfile.ZipFile(
                   source,
@@ -1038,20 +1001,18 @@ jobs:
                               target,
                               exist_ok=True
                           )
-
                           continue
 
                       os.makedirs(
-                          os.path.dirname(
-                              target
-                          ),
+                          os.path.dirname(target),
                           exist_ok=True
                       )
 
                       with archive.open(
                           member,
                           "r"
-                      ) as input_file:
+                      ) as source_file:
+
                           with open(
                               target,
                               "wb"
@@ -1060,16 +1021,14 @@ jobs:
                               total = 0
 
                               while True:
-                                  chunk = input_file.read(
+                                  chunk = source_file.read(
                                       READ_CHUNK
                                   )
 
                                   if not chunk:
                                       break
 
-                                  total += len(
-                                      chunk
-                                  )
+                                  total += len(chunk)
 
                                   if (
                                       total
@@ -1083,29 +1042,23 @@ jobs:
                                       chunk
                                   )
 
-                      if os.path.isfile(
-                          target
-                      ):
-                          files.append(
-                              target
-                          )
+                      if os.path.isfile(target):
+                          result.append(target)
 
-              return files
+              return result
 
           def extract_tar(
               source,
               destination
           ):
-              destination = str(
-                  destination
-              )
+              destination = str(destination)
 
               os.makedirs(
                   destination,
                   exist_ok=True
               )
 
-              files = []
+              result = []
 
               with tarfile.open(
                   source,
@@ -1137,24 +1090,21 @@ jobs:
                               target,
                               exist_ok=True
                           )
-
                           continue
 
-                      input_file = archive.extractfile(
+                      source_file = archive.extractfile(
                           member
                       )
 
-                      if input_file is None:
+                      if source_file is None:
                           continue
 
                       os.makedirs(
-                          os.path.dirname(
-                              target
-                          ),
+                          os.path.dirname(target),
                           exist_ok=True
                       )
 
-                      with input_file:
+                      with source_file:
                           with open(
                               target,
                               "wb"
@@ -1163,16 +1113,14 @@ jobs:
                               total = 0
 
                               while True:
-                                  chunk = input_file.read(
+                                  chunk = source_file.read(
                                       READ_CHUNK
                                   )
 
                                   if not chunk:
                                       break
 
-                                  total += len(
-                                      chunk
-                                  )
+                                  total += len(chunk)
 
                                   if (
                                       total
@@ -1186,22 +1134,16 @@ jobs:
                                       chunk
                                   )
 
-                      if os.path.isfile(
-                          target
-                      ):
-                          files.append(
-                              target
-                          )
+                      if os.path.isfile(target):
+                          result.append(target)
 
-              return files
+              return result
 
           def extract_7z(
               source,
               destination
           ):
-              destination = str(
-                  destination
-              )
+              destination = str(destination)
 
               os.makedirs(
                   destination,
@@ -1220,20 +1162,18 @@ jobs:
                   timeout=1800
               )
 
-              files = []
+              result = []
 
-              for root, _, names in os.walk(
+              for root, _, files in os.walk(
                   destination
               ):
-                  for name in names:
+                  for filename in files:
                       current = os.path.join(
                           root,
-                          name
+                          filename
                       )
 
-                      if not os.path.isfile(
-                          current
-                      ):
+                      if not os.path.isfile(current):
                           continue
 
                       try:
@@ -1247,12 +1187,10 @@ jobs:
                           size
                           <= MAX_DECOMPRESSED_FILE_SIZE
                       ):
-                          files.append(
-                              current
-                          )
+                          result.append(current)
 
               return (
-                  files,
+                  result,
                   code,
                   output
               )
@@ -1275,27 +1213,16 @@ jobs:
                       source,
                       "rb"
                   ) as input_file:
-                      magic = input_file.read(
-                          16
-                      )
+                      magic = input_file.read(16)
               except Exception:
                   return []
 
-              if magic.startswith(
-                  b"\x1f\x8b"
-              ):
+              if magic.startswith(b"\x1f\x8b"):
                   opener = gzip.open
-
-              elif magic.startswith(
-                  b"BZh"
-              ):
+              elif magic.startswith(b"BZh"):
                   opener = bz2.open
-
-              elif magic.startswith(
-                  b"\xfd7zXZ\x00"
-              ):
+              elif magic.startswith(b"\xfd7zXZ\x00"):
                   opener = lzma.open
-
               else:
                   return []
 
@@ -1303,9 +1230,7 @@ jobs:
                   destination
                   / (
                       safe_name(
-                          Path(
-                              source
-                          ).name
+                          Path(source).name
                       )
                       + ".decompressed"
                   )
@@ -1332,16 +1257,14 @@ jobs:
                               if not chunk:
                                   break
 
-                              total += len(
-                                  chunk
-                              )
+                              total += len(chunk)
 
                               if (
                                   total
                                   > MAX_DECOMPRESSED_FILE_SIZE
                               ):
                                   raise RuntimeError(
-                                      "Decompressed stream exceeded size limit"
+                                      "Decompressed data exceeded size limit"
                                   )
 
                               output_file.write(
@@ -1372,9 +1295,7 @@ jobs:
               source,
               destination
           ):
-              destination = str(
-                  destination
-              )
+              destination = str(destination)
 
               os.makedirs(
                   destination,
@@ -1392,20 +1313,18 @@ jobs:
                   timeout=1800
               )
 
-              files = []
+              result = []
 
-              for root, _, names in os.walk(
+              for root, _, files in os.walk(
                   destination
               ):
-                  for name in names:
+                  for filename in files:
                       current = os.path.join(
                           root,
-                          name
+                          filename
                       )
 
-                      if not os.path.isfile(
-                          current
-                      ):
+                      if not os.path.isfile(current):
                           continue
 
                       try:
@@ -1419,12 +1338,10 @@ jobs:
                           size
                           <= MAX_DECOMPRESSED_FILE_SIZE
                       ):
-                          files.append(
-                              current
-                          )
+                          result.append(current)
 
               return (
-                  files,
+                  result,
                   code,
                   output
               )
@@ -1446,9 +1363,7 @@ jobs:
               except Exception as exc:
                   extraction_log.append(
                       {
-                          "source": str(
-                              current_path
-                          ),
+                          "source": str(current_path),
                           "depth": depth,
                           "method": "hash",
                           "success": False,
@@ -1470,9 +1385,7 @@ jobs:
                   / (
                       current_hash[:16]
                       + "_"
-                      + safe_name(
-                          relative_name
-                      )
+                      + safe_name(relative_name)
                   )
               )
 
@@ -1498,30 +1411,22 @@ jobs:
                               destination
                           )
 
-                          generated.extend(
-                              files
-                          )
+                          generated.extend(files)
 
                           extraction_log.append(
                               {
-                                  "source": str(
-                                      current_path
-                                  ),
+                                  "source": str(current_path),
                                   "depth": depth,
                                   "method": "zip",
                                   "success": True,
-                                  "count": len(
-                                      files
-                                  )
+                                  "count": len(files)
                               }
                           )
 
                       except Exception as exc:
                           extraction_log.append(
                               {
-                                  "source": str(
-                                      current_path
-                                  ),
+                                  "source": str(current_path),
                                   "depth": depth,
                                   "method": "zip",
                                   "success": False,
@@ -1548,30 +1453,22 @@ jobs:
                               destination
                           )
 
-                          generated.extend(
-                              files
-                          )
+                          generated.extend(files)
 
                           extraction_log.append(
                               {
-                                  "source": str(
-                                      current_path
-                                  ),
+                                  "source": str(current_path),
                                   "depth": depth,
                                   "method": "tar",
                                   "success": True,
-                                  "count": len(
-                                      files
-                                  )
+                                  "count": len(files)
                               }
                           )
 
                       except Exception as exc:
                           extraction_log.append(
                               {
-                                  "source": str(
-                                      current_path
-                                  ),
+                                  "source": str(current_path),
                                   "depth": depth,
                                   "method": "tar",
                                   "success": False,
@@ -1588,9 +1485,7 @@ jobs:
                       current_path,
                       "rb"
                   ) as source:
-                      magic = source.read(
-                          16
-                      )
+                      magic = source.read(16)
 
                   if magic.startswith(
                       b"7z\xbc\xaf\x27\x1c"
@@ -1609,24 +1504,16 @@ jobs:
                           destination
                       )
 
-                      generated.extend(
-                          files
-                      )
+                      generated.extend(files)
 
                       extraction_log.append(
                           {
-                              "source": str(
-                                  current_path
-                              ),
+                              "source": str(current_path),
                               "depth": depth,
                               "method": "7z",
                               "success": code == 0,
-                              "count": len(
-                                  files
-                              ),
-                              "output": output[
-                                  -20000:
-                              ]
+                              "count": len(files),
+                              "output": output[-20000:]
                           }
                       )
 
@@ -1644,22 +1531,16 @@ jobs:
                       destination
                   )
 
-                  generated.extend(
-                      files
-                  )
+                  generated.extend(files)
 
                   if files:
                       extraction_log.append(
                           {
-                              "source": str(
-                                  current_path
-                              ),
+                              "source": str(current_path),
                               "depth": depth,
-                              "method": "stream",
+                              "method": "compressed_stream",
                               "success": True,
-                              "count": len(
-                                  files
-                              )
+                              "count": len(files)
                           }
                       )
 
@@ -1681,33 +1562,23 @@ jobs:
                       destination
                   )
 
-                  generated.extend(
-                      files
-                  )
+                  generated.extend(files)
 
                   extraction_log.append(
                       {
-                          "source": str(
-                              current_path
-                          ),
+                          "source": str(current_path),
                           "depth": depth,
                           "method": "binwalk",
                           "success": code == 0,
-                          "count": len(
-                              files
-                          ),
-                          "output": output[
-                              -20000:
-                          ]
+                          "count": len(files),
+                          "output": output[-20000:]
                       }
                   )
 
               except Exception as exc:
                   extraction_log.append(
                       {
-                          "source": str(
-                              current_path
-                          ),
+                          "source": str(current_path),
                           "depth": depth,
                           "method": "binwalk",
                           "success": False,
@@ -1716,13 +1587,11 @@ jobs:
                       }
                   )
 
-              generated_unique = []
+              result = []
               local_hashes = set()
 
               for item in generated:
-                  if not os.path.isfile(
-                      item
-                  ):
+                  if not os.path.isfile(item):
                       continue
 
                   try:
@@ -1742,18 +1611,16 @@ jobs:
                       item_hash
                   )
 
-                  generated_unique.append(
+                  result.append(
                       {
                           "path": item,
-                          "parent": str(
-                              current_path
-                          ),
+                          "parent": str(current_path),
                           "depth": depth + 1,
                           "sha256": item_hash
                       }
                   )
 
-              return generated_unique
+              return result
 
           def r2_json(
               r2,
@@ -1772,7 +1639,7 @@ jobs:
               except Exception:
                   return []
 
-          def r2_analysis(
+          def analyze_r2(
               path,
               base_name
           ):
@@ -1800,121 +1667,74 @@ jobs:
                           "-2"
                       ]
                   )
-
               except Exception as exc:
-                  result[
-                      "open_error"
-                  ] = str(
-                      exc
-                  )
-
+                  result["open_error"] = str(exc)
                   return result
 
-              result[
-                  "available"
-              ] = True
+              result["available"] = True
 
               try:
-                  result[
-                      "info"
-                  ] = r2_json(
+                  result["info"] = r2_json(
                       r2,
                       "ij"
                   )
 
-                  result[
-                      "sections"
-                  ] = r2_json(
+                  result["sections"] = r2_json(
                       r2,
                       "iSj"
                   )
 
-                  result[
-                      "symbols"
-                  ] = r2_json(
+                  result["symbols"] = r2_json(
                       r2,
                       "isj"
                   )
 
-                  result[
-                      "imports"
-                  ] = r2_json(
+                  result["imports"] = r2_json(
                       r2,
                       "iij"
                   )
 
-                  result[
-                      "exports"
-                  ] = r2_json(
+                  result["exports"] = r2_json(
                       r2,
                       "iEj"
                   )
 
-                  result[
-                      "strings"
-                  ] = r2_json(
+                  result["strings"] = r2_json(
                       r2,
                       "izzj"
                   )
 
-                  result[
-                      "entrypoints"
-                  ] = r2_json(
+                  result["entrypoints"] = r2_json(
                       r2,
                       "iej"
                   )
 
-                  try:
-                      r2.cmd(
-                          "aaa"
-                      )
-                  except Exception:
-                      pass
+                  for analysis_command in [
+                      "aaa",
+                      "aac",
+                      "aav",
+                      "aaf"
+                  ]:
+                      try:
+                          r2.cmd(
+                              analysis_command
+                          )
+                      except Exception:
+                          pass
 
-                  try:
-                      r2.cmd(
-                          "aac"
-                      )
-                  except Exception:
-                      pass
-
-                  try:
-                      r2.cmd(
-                          "aav"
-                      )
-                  except Exception:
-                      pass
-
-                  try:
-                      r2.cmd(
-                          "aaf"
-                      )
-                  except Exception:
-                      pass
-
-                  result[
-                      "functions"
-                  ] = r2_json(
+                  result["functions"] = r2_json(
                       r2,
                       "aflj"
                   )
 
                   if not isinstance(
-                      result[
-                          "functions"
-                      ],
+                      result["functions"],
                       list
                   ):
-                      result[
-                          "functions"
-                      ] = []
+                      result["functions"] = []
 
-                  result[
-                      "function_count"
-                  ] = len(
-                      result[
-                          "functions"
-                      ]
+                  result["function_count"] = len(
+                      result["functions"]
                   )
 
                   disassembly_path = (
@@ -1940,9 +1760,7 @@ jobs:
 
                       output.write(
                           json.dumps(
-                              result[
-                                  "info"
-                              ],
+                              result["info"],
                               indent=2,
                               ensure_ascii=False
                           )
@@ -1958,22 +1776,18 @@ jobs:
 
                       output.write(
                           json.dumps(
-                              result[
-                                  "entrypoints"
-                              ],
+                              result["entrypoints"],
                               indent=2,
                               ensure_ascii=False
                           )
                       )
 
                       output.write(
-                          "\n\n"
+                          "\n"
                       )
 
                       for index, function in enumerate(
-                          result[
-                              "functions"
-                          ]
+                          result["functions"]
                       ):
 
                           address = function.get(
@@ -2017,27 +1831,25 @@ jobs:
                           )
 
                           try:
-                              text = r2.cmd(
+                              disassembly = r2.cmd(
                                   f"pdf @ {address}"
                               )
                           except Exception as exc:
-                              text = (
+                              disassembly = (
                                   "DISASSEMBLY_ERROR: "
                                   + str(exc)
                                   + "\n"
                               )
 
                           output.write(
-                              text
+                              disassembly
                           )
 
                           output.write(
                               "\n"
                           )
 
-                  result[
-                      "disassembly_file"
-                  ] = str(
+                  result["disassembly_file"] = str(
                       disassembly_path
                   )
 
@@ -2056,9 +1868,7 @@ jobs:
                           "pd 2048 @ entry0"
                       )
                   except Exception as exc:
-                      entry_text = str(
-                          exc
-                      )
+                      entry_text = str(exc)
 
                   with open(
                       entry_path,
@@ -2070,18 +1880,12 @@ jobs:
                           entry_text
                       )
 
-                  result[
-                      "entry_disassembly_file"
-                  ] = str(
+                  result["entry_disassembly_file"] = str(
                       entry_path
                   )
 
               except Exception as exc:
-                  result[
-                      "analysis_error"
-                  ] = str(
-                      exc
-                  )
+                  result["analysis_error"] = str(exc)
 
               finally:
                   try:
@@ -2108,6 +1912,7 @@ jobs:
                   return result
 
               for entry in strings:
+
                   if not isinstance(
                       entry,
                       dict
@@ -2198,7 +2003,7 @@ jobs:
 
               return result
 
-          def partition_candidates(
+          def get_partition_candidates(
               strings
           ):
               keywords = [
@@ -2244,6 +2049,7 @@ jobs:
                   return []
 
               for entry in strings:
+
                   if not isinstance(
                       entry,
                       dict
@@ -2278,9 +2084,7 @@ jobs:
               parent,
               depth
           ):
-              path = str(
-                  path
-              )
+              path = str(path)
 
               file_hash = sha256_file(
                   path
@@ -2338,42 +2142,48 @@ jobs:
                   path
               )
 
-              with open(
+              ascii_path = (
                   raw_dir
-                  / "ascii_strings.txt",
+                  / "ascii_strings.txt"
+              )
+
+              utf16_path = (
+                  raw_dir
+                  / "utf16le_strings.txt"
+              )
+
+              hex_path = (
+                  raw_dir
+                  / "hex_dump.txt"
+              )
+
+              with open(
+                  ascii_path,
                   "w",
                   encoding="utf-8",
                   errors="replace"
               ) as output:
                   output.write(
-                      strings[
-                          "ascii"
-                      ]
+                      strings["ascii"]
                   )
 
               with open(
-                  raw_dir
-                  / "utf16le_strings.txt",
+                  utf16_path,
                   "w",
                   encoding="utf-8",
                   errors="replace"
               ) as output:
                   output.write(
-                      strings[
-                          "utf16le"
-                      ]
+                      strings["utf16le"]
                   )
 
               with open(
-                  raw_dir
-                  / "hex_dump.txt",
+                  hex_path,
                   "w",
                   encoding="utf-8"
               ) as output:
                   output.write(
-                      hex_dump(
-                          path
-                      )
+                      hex_dump(path)
                   )
 
               try:
@@ -2390,7 +2200,7 @@ jobs:
               except Exception:
                   high_entropy = []
 
-              r2 = r2_analysis(
+              r2 = analyze_r2(
                   path,
                   base_name
               )
@@ -2402,7 +2212,7 @@ jobs:
                   )
               )
 
-              partitions = partition_candidates(
+              partitions = get_partition_candidates(
                   r2.get(
                       "strings",
                       []
@@ -2411,11 +2221,8 @@ jobs:
 
               original_copy = None
 
-              if (
-                  size
-                  <= 64 * 1024 * 1024
-              ):
-                  target = (
+              if size <= 64 * 1024 * 1024:
+                  original = (
                       raw_dir
                       / "original.bin"
                   )
@@ -2423,17 +2230,17 @@ jobs:
                   try:
                       shutil.copy2(
                           path,
-                          target
+                          original
                       )
 
                       original_copy = str(
-                          target
+                          original
                       )
 
                   except Exception:
                       original_copy = None
 
-              data = {
+              result = {
                   "sequence": sequence,
                   "relative_name": relative_name,
                   "path": path,
@@ -2442,21 +2249,15 @@ jobs:
                   "size": size,
                   "sha256": file_hash,
                   "md5": file_md5,
-                  "file_description": info[
-                      "description"
-                  ],
+                  "file_description": info["description"],
                   "file_description_exit_code": info[
                       "description_exit_code"
                   ],
-                  "mime": info[
-                      "mime"
-                  ],
+                  "mime": info["mime"],
                   "mime_exit_code": info[
                       "mime_exit_code"
                   ],
-                  "magic_prefix": info[
-                      "magic_prefix"
-                  ],
+                  "magic_prefix": info["magic_prefix"],
                   "entropy": entropy,
                   "high_entropy_blocks": high_entropy,
                   "high_entropy_block_count": len(
@@ -2480,16 +2281,13 @@ jobs:
                       raw_dir
                   ),
                   "ascii_strings_file": str(
-                      raw_dir
-                      / "ascii_strings.txt"
+                      ascii_path
                   ),
                   "utf16le_strings_file": str(
-                      raw_dir
-                      / "utf16le_strings.txt"
+                      utf16_path
                   ),
                   "hex_dump_file": str(
-                      raw_dir
-                      / "hex_dump.txt"
+                      hex_path
                   ),
                   "original_copy": original_copy
               }
@@ -2500,7 +2298,7 @@ jobs:
                   encoding="utf-8"
               ) as output:
                   json.dump(
-                      data,
+                      result,
                       output,
                       indent=2,
                       ensure_ascii=False
@@ -2576,9 +2374,8 @@ jobs:
                       "## Fastboot Matches\n\n"
                   )
 
-                  if matches[
-                      "fastboot"
-                  ]:
+                  if matches["fastboot"]:
+
                       output.write(
                           "| Address | Keyword | String |\n"
                       )
@@ -2587,14 +2384,10 @@ jobs:
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "fastboot"
-                      ]:
+                      for item in matches["fastboot"]:
 
                           text = str(
-                              item[
-                                  "string"
-                              ]
+                              item["string"]
                           ).replace(
                               "|",
                               " "
@@ -2605,7 +2398,9 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
+
                   else:
+
                       output.write(
                           "No matches.\n"
                       )
@@ -2615,9 +2410,8 @@ jobs:
                       "## Unlock Matches\n\n"
                   )
 
-                  if matches[
-                      "unlock"
-                  ]:
+                  if matches["unlock"]:
+
                       output.write(
                           "| Address | Keyword | String |\n"
                       )
@@ -2626,14 +2420,10 @@ jobs:
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "unlock"
-                      ]:
+                      for item in matches["unlock"]:
 
                           text = str(
-                              item[
-                                  "string"
-                              ]
+                              item["string"]
                           ).replace(
                               "|",
                               " "
@@ -2644,7 +2434,9 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
+
                   else:
+
                       output.write(
                           "No matches.\n"
                       )
@@ -2654,9 +2446,8 @@ jobs:
                       "## Vendor Matches\n\n"
                   )
 
-                  if matches[
-                      "vendor"
-                  ]:
+                  if matches["vendor"]:
+
                       output.write(
                           "| Address | Keyword | String |\n"
                       )
@@ -2665,14 +2456,10 @@ jobs:
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "vendor"
-                      ]:
+                      for item in matches["vendor"]:
 
                           text = str(
-                              item[
-                                  "string"
-                              ]
+                              item["string"]
                           ).replace(
                               "|",
                               " "
@@ -2683,7 +2470,9 @@ jobs:
                               f"`{item['keyword']}` | "
                               f"`{text}` |\n"
                           )
+
                   else:
+
                       output.write(
                           "No matches.\n"
                       )
@@ -2693,9 +2482,8 @@ jobs:
                       "## OEM Matches\n\n"
                   )
 
-                  if matches[
-                      "oem"
-                  ]:
+                  if matches["oem"]:
+
                       output.write(
                           "| Address | Pattern | String |\n"
                       )
@@ -2704,14 +2492,10 @@ jobs:
                           "|---|---|---|\n"
                       )
 
-                      for item in matches[
-                          "oem"
-                      ]:
+                      for item in matches["oem"]:
 
                           text = str(
-                              item[
-                                  "string"
-                              ]
+                              item["string"]
                           ).replace(
                               "|",
                               " "
@@ -2722,7 +2506,9 @@ jobs:
                               f"`{item['pattern']}` | "
                               f"`{text}` |\n"
                           )
+
                   else:
+
                       output.write(
                           "No matches.\n"
                       )
@@ -2733,11 +2519,15 @@ jobs:
                   )
 
                   if partitions:
-                      for value in partitions:
+
+                      for item in partitions:
+
                           output.write(
-                              f"- `{value}`\n"
+                              f"- `{item}`\n"
                           )
+
                   else:
+
                       output.write(
                           "No partition candidates.\n"
                       )
@@ -2748,6 +2538,7 @@ jobs:
                   )
 
                   if high_entropy:
+
                       output.write(
                           "| Offset | Size | Entropy |\n"
                       )
@@ -2757,12 +2548,15 @@ jobs:
                       )
 
                       for block in high_entropy:
+
                           output.write(
                               f"| `0x{block['offset']:x}` | "
                               f"`{block['size']}` | "
                               f"`{block['entropy']}` |\n"
                           )
+
                   else:
+
                       output.write(
                           "No high entropy blocks.\n"
                       )
@@ -2790,22 +2584,23 @@ jobs:
 
                   output.write(
                       "\n"
-                      "## Generated Raw Files\n\n"
+                      "## Generated Files\n\n"
                   )
 
                   output.write(
-                      f"- `{raw_dir / 'ascii_strings.txt'}`\n"
+                      f"- `{ascii_path}`\n"
                   )
 
                   output.write(
-                      f"- `{raw_dir / 'utf16le_strings.txt'}`\n"
+                      f"- `{utf16_path}`\n"
                   )
 
                   output.write(
-                      f"- `{raw_dir / 'hex_dump.txt'}`\n"
+                      f"- `{hex_path}`\n"
                   )
 
                   if original_copy:
+
                       output.write(
                           f"- `{original_copy}`\n"
                       )
@@ -2813,6 +2608,7 @@ jobs:
                   if r2.get(
                       "disassembly_file"
                   ):
+
                       output.write(
                           f"- `{r2['disassembly_file']}`\n"
                       )
@@ -2820,6 +2616,7 @@ jobs:
                   if r2.get(
                       "entry_disassembly_file"
                   ):
+
                       output.write(
                           f"- `{r2['entry_disassembly_file']}`\n"
                       )
@@ -2836,9 +2633,7 @@ jobs:
                   "file_description": info[
                       "description"
                   ],
-                  "mime": info[
-                      "mime"
-                  ],
+                  "mime": info["mime"],
                   "magic_prefix": info[
                       "magic_prefix"
                   ],
@@ -2851,24 +2646,16 @@ jobs:
                       or 0
                   ),
                   "fastboot_match_count": len(
-                      matches[
-                          "fastboot"
-                      ]
+                      matches["fastboot"]
                   ),
                   "unlock_match_count": len(
-                      matches[
-                          "unlock"
-                      ]
+                      matches["unlock"]
                   ),
                   "vendor_match_count": len(
-                      matches[
-                          "vendor"
-                      ]
+                      matches["vendor"]
                   ),
                   "oem_match_count": len(
-                      matches[
-                          "oem"
-                      ]
+                      matches["oem"]
                   ),
                   "partition_candidate_count": len(
                       partitions
@@ -2894,7 +2681,8 @@ jobs:
               }
 
           def main():
-              for directory in [
+
+              directories = [
                   FILE_ROOT,
                   EXTRACTION_ROOT,
                   WORK_ROOT,
@@ -2903,7 +2691,9 @@ jobs:
                   DISASSEMBLY_ROOT,
                   RAW_ROOT,
                   LOG_ROOT
-              ]:
+              ]
+
+              for directory in directories:
                   directory.mkdir(
                       parents=True,
                       exist_ok=True
@@ -2940,6 +2730,7 @@ jobs:
                   )
 
               except Exception as exc:
+
                   print(
                       f"Initial ZIP extraction failed: {exc}"
                   )
@@ -2950,6 +2741,7 @@ jobs:
                       "w",
                       encoding="utf-8"
                   ) as output:
+
                       traceback.print_exc(
                           file=output
                       )
@@ -2959,6 +2751,7 @@ jobs:
               discovered = []
 
               for item in initial_files:
+
                   if not os.path.isfile(
                       item
                   ):
@@ -2986,47 +2779,43 @@ jobs:
                   discovered
               )
 
-              expansion_hashes = set()
+              expanded_hashes = set()
               extraction_log = []
 
               while extraction_queue:
 
                   current = extraction_queue.popleft()
 
-                  current_path = current[
-                      "path"
-                  ]
-
-                  current_depth = int(
-                      current.get(
-                          "depth",
-                          1
-                      )
-                  )
-
-                  if len(
-                      discovered
-                  ) >= MAX_FILES:
+                  if (
+                      len(discovered)
+                      >= MAX_FILES
+                  ):
                       break
 
                   relative_name = os.path.relpath(
-                      current_path,
+                      current["path"],
                       FILE_ROOT
                   )
 
                   generated = recursively_extract(
-                      current_path,
+                      current["path"],
                       relative_name,
-                      current_depth,
-                      expansion_hashes,
+                      int(
+                          current.get(
+                              "depth",
+                              1
+                          )
+                      ),
+                      expanded_hashes,
                       extraction_log
                   )
 
                   for item in generated:
 
-                      if len(
-                          discovered
-                      ) >= MAX_FILES:
+                      if (
+                          len(discovered)
+                          >= MAX_FILES
+                      ):
                           break
 
                       discovered.append(
@@ -3051,23 +2840,7 @@ jobs:
                       ensure_ascii=False
                   )
 
-              unique_file_instances = []
-
-              for item in discovered:
-                  path = item[
-                      "path"
-                  ]
-
-                  if not os.path.isfile(
-                      path
-                  ):
-                      continue
-
-                  unique_file_instances.append(
-                      item
-                  )
-
-              unique_file_instances.sort(
+              discovered.sort(
                   key=lambda item: (
                       int(
                           item.get(
@@ -3088,17 +2861,15 @@ jobs:
               failures = []
 
               total_files = len(
-                  unique_file_instances
+                  discovered
               )
 
               for index, item in enumerate(
-                  unique_file_instances,
+                  discovered,
                   1
               ):
 
-                  path = item[
-                      "path"
-                  ]
+                  path = item["path"]
 
                   relative_name = os.path.relpath(
                       path,
@@ -3107,12 +2878,13 @@ jobs:
 
                   print(
                       f"[{index}/{total_files}] "
-                      f"{relative_name}",
+                      f"Analyzing {relative_name}",
                       flush=True
                   )
 
                   try:
-                      result = analyze_file(
+
+                      summary = analyze_file(
                           path,
                           relative_name,
                           index,
@@ -3128,7 +2900,7 @@ jobs:
                       )
 
                       summaries.append(
-                          result
+                          summary
                       )
 
                   except Exception as exc:
@@ -3194,7 +2966,7 @@ jobs:
                   "max_files": MAX_FILES,
                   "max_decompressed_file_size": MAX_DECOMPRESSED_FILE_SIZE,
                   "file_count_discovered": len(
-                      unique_file_instances
+                      discovered
                   ),
                   "file_count_analyzed": len(
                       summaries
@@ -3267,61 +3039,13 @@ jobs:
                   for item in summaries:
                       writer.writerow(
                           {
-                              key: item.get(
-                                  key,
+                              field: item.get(
+                                  field,
                                   ""
                               )
-                              for key in fields
+                              for field in fields
                           }
                       )
-
-              unlock_files = [
-                  item
-                  for item in summaries
-                  if int(
-                      item.get(
-                          "unlock_match_count",
-                          0
-                      )
-                      or 0
-                  ) > 0
-              ]
-
-              fastboot_files = [
-                  item
-                  for item in summaries
-                  if int(
-                      item.get(
-                          "fastboot_match_count",
-                          0
-                      )
-                      or 0
-                  ) > 0
-              ]
-
-              vendor_files = [
-                  item
-                  for item in summaries
-                  if int(
-                      item.get(
-                          "vendor_match_count",
-                          0
-                      )
-                      or 0
-                  ) > 0
-              ]
-
-              oem_files = [
-                  item
-                  for item in summaries
-                  if int(
-                      item.get(
-                          "oem_match_count",
-                          0
-                      )
-                      or 0
-                  ) > 0
-              ]
 
               total_functions = sum(
                   int(
@@ -3402,43 +3126,43 @@ jobs:
                   )
 
                   output.write(
-                      f"- Size: `{INPUT_ZIP.stat().st_size}` bytes\n"
+                      f"- ZIP Size: `{INPUT_ZIP.stat().st_size}` bytes\n"
                   )
 
                   output.write(
-                      f"- SHA256: `{manifest['input_sha256']}`\n"
+                      f"- ZIP SHA256: `{manifest['input_sha256']}`\n"
                   )
 
                   output.write(
-                      f"- Discovered files: `{len(unique_file_instances)}`\n"
+                      f"- Discovered Files: `{len(discovered)}`\n"
                   )
 
                   output.write(
-                      f"- Analyzed files: `{len(summaries)}`\n"
+                      f"- Analyzed Files: `{len(summaries)}`\n"
                   )
 
                   output.write(
-                      f"- Failed files: `{len(failures)}`\n"
+                      f"- Failed Files: `{len(failures)}`\n"
                   )
 
                   output.write(
-                      f"- Total functions: `{total_functions}`\n"
+                      f"- Functions: `{total_functions}`\n"
                   )
 
                   output.write(
-                      f"- Fastboot matches: `{total_fastboot}`\n"
+                      f"- Fastboot Matches: `{total_fastboot}`\n"
                   )
 
                   output.write(
-                      f"- Unlock matches: `{total_unlock}`\n"
+                      f"- Unlock Matches: `{total_unlock}`\n"
                   )
 
                   output.write(
-                      f"- Vendor matches: `{total_vendor}`\n"
+                      f"- Vendor Matches: `{total_vendor}`\n"
                   )
 
                   output.write(
-                      f"- OEM matches: `{total_oem}`\n"
+                      f"- OEM Matches: `{total_oem}`\n"
                   )
 
                   output.write(
@@ -3446,139 +3170,24 @@ jobs:
                   )
 
                   output.write(
-                      "## Scope\n\n"
+                      "## Analysis Scope\n\n"
                   )
 
                   output.write(
-                      "Every regular file discovered from the input ZIP "
-                      "is analyzed without using file extensions as an "
-                      "inclusion condition. Recursive processing also "
-                      "handles nested ZIP, TAR, 7z, gzip, bzip2, XZ and "
-                      "binwalk-discovered embedded content.\n\n"
+                      "Every discovered regular file is analyzed "
+                      "without using its file extension as an "
+                      "inclusion filter. Nested ZIP, TAR, 7z, gzip, "
+                      "bzip2, XZ and binwalk-discovered files are "
+                      "recursively processed.\n\n"
                   )
 
                   output.write(
-                      "## Unlock-related Files\n\n"
-                  )
-
-                  if unlock_files:
-
-                      output.write(
-                          "| File | Matches | Functions |\n"
-                      )
-
-                      output.write(
-                          "|---|---:|---:|\n"
-                      )
-
-                      for item in unlock_files:
-
-                          output.write(
-                              f"| `{item['relative_name']}` | "
-                              f"{item['unlock_match_count']} | "
-                              f"{item['function_count']} |\n"
-                          )
-
-                  else:
-
-                      output.write(
-                          "No unlock-related matches detected.\n"
-                      )
-
-                  output.write(
-                      "\n"
-                      "## Fastboot-related Files\n\n"
-                  )
-
-                  if fastboot_files:
-
-                      output.write(
-                          "| File | Matches | Functions |\n"
-                      )
-
-                      output.write(
-                          "|---|---:|---:|\n"
-                      )
-
-                      for item in fastboot_files:
-
-                          output.write(
-                              f"| `{item['relative_name']}` | "
-                              f"{item['fastboot_match_count']} | "
-                              f"{item['function_count']} |\n"
-                          )
-
-                  else:
-
-                      output.write(
-                          "No fastboot-related matches detected.\n"
-                      )
-
-                  output.write(
-                      "\n"
-                      "## Vendor-related Files\n\n"
-                  )
-
-                  if vendor_files:
-
-                      output.write(
-                          "| File | Matches | Functions |\n"
-                      )
-
-                      output.write(
-                          "|---|---:|---:|\n"
-                      )
-
-                      for item in vendor_files:
-
-                          output.write(
-                              f"| `{item['relative_name']}` | "
-                              f"{item['vendor_match_count']} | "
-                              f"{item['function_count']} |\n"
-                          )
-
-                  else:
-
-                      output.write(
-                          "No vendor-related matches detected.\n"
-                      )
-
-                  output.write(
-                      "\n"
-                      "## OEM-related Files\n\n"
-                  )
-
-                  if oem_files:
-
-                      output.write(
-                          "| File | Matches | Functions |\n"
-                      )
-
-                      output.write(
-                          "|---|---:|---:|\n"
-                      )
-
-                      for item in oem_files:
-
-                          output.write(
-                              f"| `{item['relative_name']}` | "
-                              f"{item['oem_match_count']} | "
-                              f"{item['function_count']} |\n"
-                          )
-
-                  else:
-
-                      output.write(
-                          "No OEM-related matches detected.\n"
-                      )
-
-                  output.write(
-                      "\n"
-                      "## All Files\n\n"
+                      "## All Analyzed Files\n\n"
                   )
 
                   output.write(
-                      "| # | Depth | File | Size | SHA256 | Entropy | Functions | Unlock | Fastboot | Vendor | OEM |\n"
+                      "| # | Depth | File | Size | SHA256 | "
+                      "Entropy | Functions | Unlock | Fastboot | Vendor | OEM |\n"
                   )
 
                   output.write(
@@ -3639,117 +3248,63 @@ jobs:
                       "<meta charset='utf-8'>"
                       "<meta name='viewport' "
                       "content='width=device-width,initial-scale=1'>"
-                      "<title>QCOM Bootloader Full Recursive Analysis</title>"
+                      "<title>QCOM Bootloader Analysis</title>"
                       "<style>"
-                      "body{"
-                      "font-family:Arial,Helvetica,sans-serif;"
-                      "margin:30px;"
-                      "background:#f4f4f4;"
-                      "color:#222"
-                      "}"
-                      ".grid{"
-                      "display:grid;"
-                      "grid-template-columns:"
-                      "repeat(auto-fit,minmax(180px,1fr));"
-                      "gap:16px;"
-                      "margin-bottom:24px"
-                      "}"
-                      ".card{"
-                      "background:white;"
-                      "border:1px solid #ddd;"
-                      "border-radius:8px;"
-                      "padding:18px"
-                      "}"
-                      ".value{"
-                      "font-size:30px;"
-                      "font-weight:bold;"
-                      "margin-top:6px"
-                      "}"
-                      "table{"
-                      "border-collapse:collapse;"
-                      "width:100%;"
-                      "background:white"
-                      "}"
-                      "th,td{"
-                      "border:1px solid #ddd;"
-                      "padding:7px;"
-                      "text-align:left;"
-                      "vertical-align:top"
-                      "}"
-                      "th{"
-                      "background:#333;"
-                      "color:white"
-                      "}"
-                      "tr:nth-child(even){"
-                      "background:#fafafa"
-                      "}"
+                      "body{font-family:Arial,Helvetica,sans-serif;"
+                      "margin:30px;background:#f4f4f4;color:#222}"
+                      "table{border-collapse:collapse;width:100%;"
+                      "background:#fff}"
+                      "th,td{border:1px solid #ddd;padding:7px;"
+                      "text-align:left;vertical-align:top}"
+                      "th{background:#333;color:#fff}"
+                      "tr:nth-child(even){background:#fafafa}"
                       "</style>"
                       "</head>"
                       "<body>"
                   )
 
                   output.write(
-                      "<h1>"
-                      "QCOM Bootloader Full Recursive Analysis"
-                      "</h1>"
+                      "<h1>QCOM Bootloader Full Recursive Analysis</h1>"
                   )
 
                   output.write(
-                      "<div class='grid'>"
+                      "<ul>"
                   )
 
-                  cards = [
-                      (
-                          "Discovered",
-                          len(
-                              unique_file_instances
-                          )
-                      ),
-                      (
-                          "Analyzed",
-                          len(
-                              summaries
-                          )
-                      ),
-                      (
-                          "Failed",
-                          len(
-                              failures
-                          )
-                      ),
-                      (
-                          "Functions",
-                          total_functions
-                      ),
-                      (
-                          "Unlock",
-                          total_unlock
-                      ),
-                      (
-                          "Fastboot",
-                          total_fastboot
-                      ),
-                      (
-                          "Vendor",
-                          total_vendor
-                      ),
-                      (
-                          "OEM",
-                          total_oem
-                      )
-                  ]
-
-                  for label, value in cards:
-
-                      output.write(
-                          "<div class='card'>"
-                          f"<div>{html.escape(str(label))}</div>"
-                          f"<div class='value'>{html.escape(str(value))}</div>"
-                          "</div>"
-                      )
+                  output.write(
+                      f"<li>Discovered: {len(discovered)}</li>"
+                  )
 
                   output.write(
-                      "</div>"
+                      f"<li>Analyzed: {len(summaries)}</li>"
+                  )
+
+                  output.write(
+                      f"<li>Failed: {len(failures)}</li>"
+                  )
+
+                  output.write(
+                      f"<li>Functions: {total_functions}</li>"
+                  )
+
+                  output.write(
+                      f"<li>Unlock Matches: {total_unlock}</li>"
+                  )
+
+                  output.write(
+                      f"<li>Fastboot Matches: {total_fastboot}</li>"
+                  )
+
+                  output.write(
+                      f"<li>Vendor Matches: {total_vendor}</li>"
+                  )
+
+                  output.write(
+                      f"<li>OEM Matches: {total_oem}</li>"
+                  )
+
+                  output.write(
+                      "</ul>"
                   )
 
                   output.write(
@@ -3799,16 +3354,16 @@ jobs:
 
                       output.write(
                           "<tr>"
-                          f"<td>{html.escape(str(item['sequence']))}</td>"
-                          f"<td>{html.escape(str(item['depth']))}</td>"
-                          f"<td>{html.escape(str(item['relative_name']))}</td>"
-                          f"<td>{html.escape(str(item['size']))}</td>"
-                          f"<td>{html.escape(f'{item['entropy']:.6f}')}</td>"
-                          f"<td>{html.escape(str(item['function_count']))}</td>"
-                          f"<td>{html.escape(str(item['unlock_match_count']))}</td>"
-                          f"<td>{html.escape(str(item['fastboot_match_count']))}</td>"
-                          f"<td>{html.escape(str(item['vendor_match_count']))}</td>"
-                          f"<td>{html.escape(str(item['oem_match_count']))}</td>"
+                          f"<td>{item['sequence']}</td>"
+                          f"<td>{item['depth']}</td>"
+                          f"<td>{item['relative_name']}</td>"
+                          f"<td>{item['size']}</td>"
+                          f"<td>{item['entropy']:.6f}</td>"
+                          f"<td>{item['function_count']}</td>"
+                          f"<td>{item['unlock_match_count']}</td>"
+                          f"<td>{item['fastboot_match_count']}</td>"
+                          f"<td>{item['vendor_match_count']}</td>"
+                          f"<td>{item['oem_match_count']}</td>"
                           "</tr>"
                       )
 
@@ -3828,33 +3383,27 @@ jobs:
               )
 
               print(
-                  f"Discovered files : "
-                  f"{len(unique_file_instances)}"
+                  f"Discovered files : {len(discovered)}"
               )
 
               print(
-                  f"Analyzed files   : "
-                  f"{len(summaries)}"
+                  f"Analyzed files   : {len(summaries)}"
               )
 
               print(
-                  f"Failed files     : "
-                  f"{len(failures)}"
+                  f"Failed files     : {len(failures)}"
               )
 
               print(
-                  f"Manifest         : "
-                  f"{manifest_path}"
+                  f"Manifest         : {manifest_path}"
               )
 
               print(
-                  f"Markdown         : "
-                  f"{markdown_path}"
+                  f"Markdown         : {markdown_path}"
               )
 
               print(
-                  f"HTML             : "
-                  f"{html_path}"
+                  f"HTML             : {html_path}"
               )
 
               print(
@@ -3892,17 +3441,33 @@ jobs:
         run: |
           set -e
 
-          test -f \
+          if [ ! -f \
             "${ARTIFACT_ROOT}/analysis_manifest.json"
+          ]; then
+            echo "analysis_manifest.json was not created."
+            exit 1
+          fi
 
-          test -f \
+          if [ ! -f \
             "${ARTIFACT_ROOT}/analysis_index.csv"
+          ]; then
+            echo "analysis_index.csv was not created."
+            exit 1
+          fi
 
-          test -f \
+          if [ ! -f \
             "${ARTIFACT_ROOT}/reports/FULL_ANALYSIS_REPORT.md"
+          ]; then
+            echo "FULL_ANALYSIS_REPORT.md was not created."
+            exit 1
+          fi
 
-          test -f \
+          if [ ! -f \
             "${ARTIFACT_ROOT}/reports/index.html"
+          ]; then
+            echo "index.html was not created."
+            exit 1
+          fi
 
           python3 - <<'PYEOF'
           import json
@@ -3923,7 +3488,6 @@ jobs:
               "r",
               encoding="utf-8"
           ) as source:
-
               manifest = json.load(
                   source
               )
@@ -3932,6 +3496,8 @@ jobs:
               "input_zip",
               "input_size",
               "input_sha256",
+              "analysis_root",
+              "artifact_root",
               "file_count_discovered",
               "file_count_analyzed",
               "file_count_failed",
@@ -3965,30 +3531,10 @@ jobs:
 
           if analyzed + failed != discovered:
               raise SystemExit(
-                  "Manifest accounting mismatch: "
+                  "Manifest count mismatch: "
                   f"discovered={discovered}, "
                   f"analyzed={analyzed}, "
                   f"failed={failed}"
-              )
-
-          if not isinstance(
-              manifest[
-                  "files"
-              ],
-              list
-          ):
-              raise SystemExit(
-                  "Manifest files must be a list."
-              )
-
-          if not isinstance(
-              manifest[
-                  "failures"
-              ],
-              list
-          ):
-              raise SystemExit(
-                  "Manifest failures must be a list."
               )
 
           print(
@@ -4008,7 +3554,7 @@ jobs:
           )
           PYEOF
 
-      - name: Generate Final Diagnostics
+      - name: Collect Diagnostics
         if: always()
         shell: bash
         run: |
@@ -4039,25 +3585,54 @@ jobs:
             echo "===== LD_LIBRARY_PATH ====="
             echo "${LD_LIBRARY_PATH}"
 
-            echo "===== TOOLS ====="
-            command -v r2
-            command -v rabin2
-            command -v rasm2
-            command -v ldconfig
-            command -v python3
-            command -v file
-            command -v strings
-            command -v 7z
-            command -v binwalk
+            echo "===== COMMANDS ====="
+
+            for command_name in \
+              r2 \
+              rabin2 \
+              rasm2 \
+              ldconfig \
+              python3 \
+              file \
+              strings \
+              7z \
+              unzip \
+              tar \
+              xz \
+              gzip \
+              bzip2 \
+              binwalk
+            do
+              if command -v "${command_name}" >/dev/null 2>&1; then
+                echo "${command_name}=$(command -v "${command_name}")"
+              else
+                echo "${command_name}=NOT_FOUND"
+              fi
+            done
 
             echo "===== VERSIONS ====="
-            r2 -v
-            rabin2 -v
-            python3 --version
-            file --version | head -n 1
-            ldconfig --version | head -n 1
 
-            echo "===== ANALYSIS FILE TREE ====="
+            if command -v r2 >/dev/null 2>&1; then
+              r2 -v
+            fi
+
+            if command -v rabin2 >/dev/null 2>&1; then
+              rabin2 -v
+            fi
+
+            if command -v python3 >/dev/null 2>&1; then
+              python3 --version
+            fi
+
+            if command -v file >/dev/null 2>&1; then
+              file --version | head -n 1
+            fi
+
+            if command -v ldconfig >/dev/null 2>&1; then
+              ldconfig --version | head -n 1
+            fi
+
+            echo "===== ANALYSIS FILES ====="
 
             if [ -d "${ANALYSIS_ROOT}" ]; then
               find \
@@ -4070,7 +3645,7 @@ jobs:
               echo "ANALYSIS_ROOT does not exist"
             fi
 
-            echo "===== ARTIFACT FILE TREE ====="
+            echo "===== ARTIFACT FILES ====="
 
             if [ -d "${ARTIFACT_ROOT}" ]; then
               find \
@@ -4087,7 +3662,7 @@ jobs:
             "${ARTIFACT_ROOT}/logs/final_diagnostics.log" \
             2>&1
 
-      - name: Upload All Analysis Artifacts
+      - name: Upload All Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -4099,15 +3674,15 @@ jobs:
           compression-level: 0
           include-hidden-files: true
 
-      - name: Completion Notice
+      - name: Success Notice
         if: success()
         shell: bash
         run: |
-          echo "::notice title=QCOM Bootloader Analysis Complete::Recursive analysis, disassembly, reports and artifacts completed successfully."
+          echo "::notice title=QCOM Bootloader Analysis Complete::Recursive extraction, complete file analysis, disassembly and reporting completed."
 
       - name: Failure Notice
         if: failure()
         shell: bash
         run: |
-          echo "::error title=QCOM Bootloader Analysis Failed::The workflow failed. Generated diagnostics and artifacts were uploaded."
+          echo "::error title=QCOM Bootloader Analysis Failed::The workflow failed. Diagnostics and generated artifacts were uploaded."
           exit 1
