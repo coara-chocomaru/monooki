@@ -1,4 +1,4 @@
-name: Vbmeta Public Key Extraction and EFI Signature Verification
+name: Vbmeta Public Key Extraction and EFI Key Presence Check
 
 on:
   workflow_dispatch:
@@ -15,10 +15,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            openssl file curl unzip binutils \
-            sbsigntool python3-pip
-          pip3 install cryptography pyasn1
+          sudo apt-get install -y file curl unzip python3
 
       - name: Download and extract ZIP
         run: |
@@ -42,9 +39,9 @@ jobs:
           echo "VBMETA=$VBMETA" >> $GITHUB_ENV
           echo "EFI=$EFI" >> $GITHUB_ENV
 
-      - name: Extract public key from vbmeta (custom script)
+      - name: Extract public key and check against EFI (using user's script)
         run: |
-          cat > extract_key.py <<'EOF'
+          cat > avb_key_extract.py <<'EOF'
           #!/usr/bin/env python3
           import hashlib
           import struct
@@ -71,126 +68,52 @@ jobs:
               end = start + public_key_size
               public_key = data[start:end]
               Path("public_key4096.bin").write_bytes(public_key)
-              print(f"Public key extracted (size: {len(public_key)} bytes) to public_key4096.bin")
+              print("Authentication Block :", auth_size)
+              print("Auxiliary Block      :", aux_size)
+              print("Public Key Offset    :", hex(public_key_offset))
+              print("Public Key Size      :", public_key_size)
+              print("Saved : public_key4096.bin")
+              print("SHA1  :", hashlib.sha1(public_key).hexdigest())
+              print("SHA256:", hashlib.sha256(public_key).hexdigest())
               return public_key
 
+          def search_abl(public_key, abl_file):
+              abl = Path(abl_file).read_bytes()
+              off = abl.find(public_key)
+              if off < 0:
+                  print("Public key NOT found.")
+                  return False
+              print("Public key FOUND at offset", hex(off))
+              blob = abl[off:off + len(public_key)]
+              print("SHA1  :", hashlib.sha1(blob).hexdigest())
+              print("SHA256:", hashlib.sha256(blob).hexdigest())
+              if blob == public_key:
+                  print("MATCH")
+                  return True
+              else:
+                  print("NOT MATCH")
+                  return False
+
+          def main():
+              if len(sys.argv) != 3:
+                  print("Usage: python avb_key_extract.py vbmeta.img LinuxLoader.efi")
+                  sys.exit(1)
+              public_key = extract_public_key(sys.argv[1])
+              result = search_abl(public_key, sys.argv[2])
+              sys.exit(0 if result else 1)
+
           if __name__ == "__main__":
-              if len(sys.argv) != 2:
-                  print("Usage: extract_key.py <vbmeta_file>")
-                  sys.exit(1)
-              extract_public_key(sys.argv[1])
-          EOF
-          python3 extract_key.py "$VBMETA"
-          if [ ! -f public_key4096.bin ]; then
-            echo "ERROR: public_key4096.bin not created." | tee output/error.txt
-            exit 1
-          fi
-          ls -la public_key4096.bin
-
-      - name: Convert binary public key to PEM (Python)
-        run: |
-          python3 <<'EOF'
-          import os
-          import sys
-          from cryptography.hazmat.primitives import serialization
-          from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
-          from pyasn1.codec.der import decoder
-          from pyasn1.type import univ
-
-          data = open('public_key4096.bin', 'rb').read()
-          if len(data) == 0:
-              print("ERROR: public_key4096.bin is empty")
-              sys.exit(1)
-
-          public_key = None
-
-          # Try 1: Load as SubjectPublicKeyInfo (DER)
-          try:
-              public_key = serialization.load_der_public_key(data)
-              print("Loaded as SubjectPublicKeyInfo (DER)")
-          except Exception as e1:
-              print(f"SubjectPublicKeyInfo load failed: {e1}")
-              # Try 2: Load as RSAPublicKey (PKCS#1 DER)
-              try:
-                  seq, _ = decoder.decode(data, asn1Spec=univ.Sequence())
-                  if len(seq) >= 2:
-                      n = int(seq[0])
-                      e = int(seq[1])
-                      public_numbers = RSAPublicNumbers(e=e, n=n)
-                      public_key = public_numbers.public_key()
-                      print("Loaded as RSAPublicKey (PKCS#1 DER)")
-                  else:
-                      raise ValueError("Invalid RSAPublicKey format")
-              except Exception as e2:
-                  print(f"RSAPublicKey load failed: {e2}")
-                  sys.exit(1)
-
-          # Export to PEM
-          pem = public_key.public_bytes(
-              encoding=serialization.Encoding.PEM,
-              format=serialization.PublicFormat.SubjectPublicKeyInfo
-          )
-          os.makedirs('output', exist_ok=True)
-          with open('output/key.pem', 'wb') as f:
-              f.write(pem)
-          print("PEM public key saved to output/key.pem")
-          EOF
-          if [ ! -f output/key.pem ]; then
-            echo "ERROR: Failed to convert public key to PEM." | tee output/error.txt
-            exit 1
-          fi
-          head -n 3 output/key.pem
-
-      - name: Create certificate from public key (Python)
-        run: |
-          python3 <<'EOF'
-          import os
-          from cryptography import x509
-          from cryptography.hazmat.primitives import hashes, serialization
-          from cryptography.hazmat.primitives.asymmetric import rsa
-          from cryptography.x509.oid import NameOID
-          import datetime
-
-          with open('output/key.pem', 'rb') as f:
-              public_key = serialization.load_pem_public_key(f.read())
-
-          private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-          subject = issuer = x509.Name([
-              x509.NameAttribute(NameOID.COMMON_NAME, u"Temp Cert")
-          ])
-
-          cert = (x509.CertificateBuilder()
-                  .subject_name(subject)
-                  .issuer_name(issuer)
-                  .public_key(public_key)
-                  .serial_number(x509.random_serial_number())
-                  .not_valid_before(datetime.datetime.utcnow())
-                  .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
-                  .sign(private_key, hashes.SHA256()))
-
-          with open('output/cert.pem', 'wb') as f:
-              f.write(cert.public_bytes(serialization.Encoding.PEM))
-
-          print("Certificate created: output/cert.pem")
+              main()
           EOF
 
-      - name: Verify LinuxLoader.efi signature
-        run: |
-          set +e
-          echo "Verifying $EFI with output/cert.pem" | tee output/result.txt
-          sbverify --cert output/cert.pem "$EFI" > output/verify_output.txt 2>&1
-          STATUS=$?
-          set -e
-          
-          echo "Exit code: $STATUS" | tee -a output/result.txt
-          if [ $STATUS -eq 0 ]; then
-            echo "✅ Verification SUCCESS" | tee -a output/result.txt
+          python3 avb_key_extract.py "$VBMETA" "$EFI" 2>&1 | tee output/result.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "Script exit code: $EXIT_CODE" | tee -a output/result.txt
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Verification SUCCESS (key found and matches)" | tee -a output/result.txt
           else
-            echo "❌ Verification FAILED" | tee -a output/result.txt
+            echo "❌ Verification FAILED (key not found or mismatch)" | tee -a output/result.txt
           fi
-          echo "---- Detailed output ----" >> output/result.txt
-          cat output/verify_output.txt >> output/result.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
