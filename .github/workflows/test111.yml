@@ -1,0 +1,251 @@
+name: Qualcomm Snapdragon test-key analysis
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of zip file to download'
+        required: true
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and extract
+        run: |
+          curl -L "${{ github.event.inputs.url }}" -o firmware.zip
+          mkdir -p extracted
+          unzip -o firmware.zip -d extracted
+      - name: Analyze files
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import json
+          import hashlib
+          import struct
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          EXTRACTED_DIR = Path('extracted')
+          OUTPUT_DIR = Path('analysis-results')
+          OUTPUT_DIR.mkdir(exist_ok=True)
+
+          KNOWN_TEST_KEY_PUBKEY_SHA256 = set()
+
+          def sha256_bytes(b):
+              return hashlib.sha256(b).hexdigest()
+
+          def md5_bytes(b):
+              return hashlib.md5(b).hexdigest()
+
+          def run_cmd(cmd, input_bytes=None):
+              p = subprocess.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              return p.returncode, p.stdout.decode('utf-8', errors='replace'), p.stderr.decode('utf-8', errors='replace')
+
+          def parse_cert_der(der):
+              fd, tmpname = tempfile.mkstemp(suffix='.der')
+              os.close(fd)
+              with open(tmpname, 'wb') as f:
+                  f.write(der)
+              try:
+                  r1, out1, _ = run_cmd(['openssl','x509','-inform','DER','-in',tmpname,'-noout','-subject','-issuer','-serial','-fingerprint','-sha256'])
+                  r2, pubkey_pem, _ = run_cmd(['openssl','x509','-inform','DER','-in',tmpname,'-pubkey','-noout'])
+                  r3, out3, _ = run_cmd(['openssl','x509','-inform','DER','-in',tmpname,'-noout','-modulus'])
+              finally:
+                  os.unlink(tmpname)
+              if r1 != 0 or r2 != 0 or r3 != 0:
+                  return None
+              subject = ''
+              issuer = ''
+              serial = ''
+              fingerprint_sha256 = ''
+              for line in out1.splitlines():
+                  if line.startswith('subject='):
+                      subject = line.split('=',1)[1].strip()
+                  elif line.startswith('issuer='):
+                      issuer = line.split('=',1)[1].strip()
+                  elif line.startswith('serial='):
+                      serial = line.split('=',1)[1].strip()
+                  elif line.startswith('SHA256 Fingerprint='):
+                      fingerprint_sha256 = line.split('=',1)[1].strip()
+              modulus = ''
+              for line in out3.splitlines():
+                  if line.startswith('Modulus='):
+                      modulus = line.split('=',1)[1].strip()
+              pubkey_pem_sha256 = sha256_bytes(pubkey_pem.encode('utf-8'))
+              modulus_sha256 = sha256_bytes(modulus.encode('utf-8'))
+              der_sha256 = sha256_bytes(der)
+              is_test = False
+              match_reason = ''
+              subj_issuer_lower = (subject + ' ' + issuer).lower()
+              if 'test' in subj_issuer_lower:
+                  is_test = True
+                  match_reason = 'subject/issuer contains test'
+              elif 'android' in subj_issuer_lower:
+                  is_test = True
+                  match_reason = 'subject/issuer contains android'
+              elif pubkey_pem_sha256 in KNOWN_TEST_KEY_PUBKEY_SHA256:
+                  is_test = True
+                  match_reason = 'public key sha256 in known test key set'
+              return {
+                  'subject': subject,
+                  'issuer': issuer,
+                  'serial': serial,
+                  'fingerprint_sha256': fingerprint_sha256,
+                  'public_key_pem_sha256': pubkey_pem_sha256,
+                  'modulus_sha256': modulus_sha256,
+                  'der_sha256': der_sha256,
+                  'test_key': is_test,
+                  'match_reason': match_reason,
+                  'public_key_pem': pubkey_pem,
+                  'modulus': modulus,
+              }
+
+          def scan_certs(data):
+              certs = []
+              i = 0
+              limit = len(data)
+              max_certs = 100
+              while i < limit - 4 and len(certs) < max_certs:
+                  if data[i] == 0x30 and data[i+1] == 0x82:
+                      length = (data[i+2] << 8) | data[i+3]
+                      if length > 0 and i + 4 + length <= limit:
+                          der = data[i:i+4+length]
+                          cert_info = parse_cert_der(der)
+                          if cert_info is not None:
+                              certs.append(cert_info)
+                              i += 4 + length
+                              continue
+                  i += 1
+              return certs
+
+          def parse_avb_footer(data):
+              if len(data) < 64:
+                  return None
+              footer = data[-64:]
+              if footer[0:4] != b'AVBf':
+                  return None
+              vals = struct.unpack('<IIQQQQ28s', footer)
+              version_major, version_minor, original_image_size, vbmeta_offset, vbmeta_size, aux_data_size, reserved = vals
+              return {
+                  'version_major': version_major,
+                  'version_minor': version_minor,
+                  'original_image_size': original_image_size,
+                  'vbmeta_offset': vbmeta_offset,
+                  'vbmeta_size': vbmeta_size,
+                  'aux_data_size': aux_data_size,
+                  'footer_sha256': sha256_bytes(footer)
+              }
+
+          report = {}
+          non_test_entries = []
+          for path in sorted(EXTRACTED_DIR.rglob('*')):
+              if not path.is_file():
+                  continue
+              rel = str(path.relative_to(EXTRACTED_DIR))
+              data = path.read_bytes()
+              file_size = len(data)
+              sha256 = sha256_bytes(data)
+              md5 = md5_bytes(data)
+              file_type = ''
+              try:
+                  r, out, _ = run_cmd(['file', '-b', str(path)])
+                  if r == 0:
+                      file_type = out.strip()
+              except Exception:
+                  pass
+              certs = scan_certs(data)
+              avb_footer = parse_avb_footer(data)
+              root_hash = sha256
+              avb_info = None
+              if avb_footer:
+                  avb_info = avb_footer
+                  vbmeta_size = avb_footer['vbmeta_size']
+                  vbmeta_offset = avb_footer['vbmeta_offset']
+                  if vbmeta_size > 0 and vbmeta_offset >= 0 and vbmeta_offset + vbmeta_size <= len(data):
+                      vbmeta_data = data[vbmeta_offset:vbmeta_offset+vbmeta_size]
+                      root_hash = sha256_bytes(vbmeta_data)
+                      avb_info['vbmeta_sha256'] = root_hash
+                  else:
+                      avb_info['vbmeta_sha256'] = None
+              entry = {
+                  'relative_path': rel,
+                  'size': file_size,
+                  'sha256': sha256,
+                  'md5': md5,
+                  'file_type': file_type,
+                  'root_hash': root_hash,
+                  'avb_footer': avb_info,
+                  'certificates': certs,
+              }
+              is_test_file = False
+              for c in certs:
+                  if c.get('test_key'):
+                      is_test_file = True
+                      break
+              entry['test_key'] = is_test_file
+              report[rel] = entry
+              if not is_test_file:
+                  non_test_entries.append(entry)
+
+          with open(OUTPUT_DIR / 'report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+
+          with open(OUTPUT_DIR / 'report.txt', 'w') as f:
+              for rel, entry in report.items():
+                  f.write(f"File: {rel}\n")
+                  f.write(f"  Size: {entry['size']} bytes\n")
+                  f.write(f"  Type: {entry['file_type']}\n")
+                  f.write(f"  SHA256: {entry['sha256']}\n")
+                  f.write(f"  MD5: {entry['md5']}\n")
+                  f.write(f"  Root Hash: {entry['root_hash']}\n")
+                  if entry['avb_footer']:
+                      af = entry['avb_footer']
+                      f.write(f"  AVB Footer: version {af['version_major']}.{af['version_minor']}, original_image_size={af['original_image_size']}, vbmeta_offset={af['vbmeta_offset']}, vbmeta_size={af['vbmeta_size']}, aux_data_size={af['aux_data_size']}, footer_sha256={af['footer_sha256']}\n")
+                      if 'vbmeta_sha256' in af and af['vbmeta_sha256']:
+                          f.write(f"  VBMeta SHA256: {af['vbmeta_sha256']}\n")
+                  f.write(f"  Test Key: {'YES' if entry['test_key'] else 'NO'}\n")
+                  if entry['certificates']:
+                      for idx, c in enumerate(entry['certificates']):
+                          f.write(f"  Certificate {idx+1}:\n")
+                          f.write(f"    Subject: {c['subject']}\n")
+                          f.write(f"    Issuer: {c['issuer']}\n")
+                          f.write(f"    Serial: {c['serial']}\n")
+                          f.write(f"    Fingerprint SHA256: {c['fingerprint_sha256']}\n")
+                          f.write(f"    Public Key PEM SHA256: {c['public_key_pem_sha256']}\n")
+                          f.write(f"    Modulus SHA256: {c['modulus_sha256']}\n")
+                          f.write(f"    DER SHA256: {c['der_sha256']}\n")
+                          f.write(f"    Test Key: {'YES' if c['test_key'] else 'NO'}\n")
+                          if c['match_reason']:
+                              f.write(f"    Match Reason: {c['match_reason']}\n")
+                  f.write('\n')
+
+          with open(OUTPUT_DIR / 'not-test-key.txt', 'w') as f:
+              if non_test_entries:
+                  f.write("Files not identified as test-key:\n\n")
+                  for entry in non_test_entries:
+                      f.write(f"File: {entry['relative_path']}\n")
+                      f.write(f"  SHA256: {entry['sha256']}\n")
+                      f.write(f"  MD5: {entry['md5']}\n")
+                      f.write(f"  Root Hash: {entry['root_hash']}\n")
+                      f.write(f"  Type: {entry['file_type']}\n")
+                      f.write(f"  Test Key: NO\n")
+                      if entry['certificates']:
+                          for idx, c in enumerate(entry['certificates']):
+                              f.write(f"  Certificate {idx+1}:\n")
+                              f.write(f"    Subject: {c['subject']}\n")
+                              f.write(f"    Issuer: {c['issuer']}\n")
+                              f.write(f"    Serial: {c['serial']}\n")
+                              f.write(f"    Fingerprint SHA256: {c['fingerprint_sha256']}\n")
+                              f.write(f"    Public Key PEM SHA256: {c['public_key_pem_sha256']}\n")
+                              f.write(f"    Modulus SHA256: {c['modulus_sha256']}\n")
+                              f.write(f"    DER SHA256: {c['der_sha256']}\n")
+                      f.write('\n')
+              else:
+                  f.write("No non-test-key files found.\n")
+          PY
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-results
+          path: analysis-results
