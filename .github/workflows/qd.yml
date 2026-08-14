@@ -17,10 +17,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             openssl file curl unzip binutils \
-            sbsigntool python3-pip wget
+            sbsigntool python3-pip git
           pip3 install cryptography pyasn1
-          # Download avbtool from AOSP master
-          wget https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/master/avbtool.py
+
+      - name: Clone avbtool from AOSP mirror
+        run: |
+          git clone --depth 1 https://github.com/aosp-mirror/platform_external_avb.git /tmp/avb
+          cp /tmp/avb/avbtool.py .
           chmod +x avbtool.py
 
       - name: Download and extract ZIP
@@ -34,12 +37,12 @@ jobs:
         run: |
           VBMETA=$(find input/files -type f \( -iname "*vbmeta*" -o -iname "vbmeta.img" \) | head -n 1)
           if [ -z "$VBMETA" ]; then
-            echo "ERROR: vbmeta file not found in the extracted archive." | tee output/error.txt
+            echo "ERROR: vbmeta file not found." | tee output/error.txt
             exit 1
           fi
           EFI=$(find input/files -type f -iname "LinuxLoader.efi" | head -n 1)
           if [ -z "$EFI" ]; then
-            echo "ERROR: LinuxLoader.efi not found in the extracted archive." | tee -a output/error.txt
+            echo "ERROR: LinuxLoader.efi not found." | tee -a output/error.txt
             exit 1
           fi
           echo "VBMETA=$VBMETA" >> $GITHUB_ENV
@@ -49,14 +52,14 @@ jobs:
         run: |
           ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem
           if [ $? -ne 0 ]; then
-            echo "ERROR: Failed to extract public key from vbmeta." | tee output/error.txt
+            echo "ERROR: Failed to extract public key." | tee output/error.txt
             exit 1
           fi
           echo "Public key extracted to output/key.pem"
 
       - name: Verify LinuxLoader.efi signature using extracted public key
         run: |
-          echo "Verifying $EFI with public key output/key.pem" | tee output/result.txt
+          echo "Verifying $EFI with output/key.pem" | tee output/result.txt
           sbverify --key output/key.pem "$EFI" > output/verify_output.txt 2>&1
           STATUS=$?
           echo "Exit code: $STATUS" | tee -a output/result.txt
