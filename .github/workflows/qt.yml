@@ -1,0 +1,310 @@
+name: Qualcomm Test-Key Alysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'ZIP URL to download and analyze'
+        required: true
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl file curl unzip python3 binutils
+
+      - name: Download and extract ZIP
+        run: |
+          mkdir -p input output
+          curl -L "${{ github.event.inputs.url }}" -o input/firmware.zip
+          unzip -o input/firmware.zip -d input/files || true
+
+      - name: Analyze files
+        run: |
+          python3 <<'PY'
+          import os
+          import hashlib
+          import subprocess
+          import tempfile
+          import shutil
+          import re
+          import sys
+
+          INPUT_DIR = 'input/files'
+          OUTPUT_DIR = 'output'
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          def md5_file(path):
+              h = hashlib.md5()
+              with open(path, 'rb') as f:
+                  for chunk in iter(lambda: f.read(65536), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def sha1_file(path):
+              h = hashlib.sha1()
+              with open(path, 'rb') as f:
+                  for chunk in iter(lambda: f.read(65536), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  for chunk in iter(lambda: f.read(65536), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def detect_test_key_strings(data):
+              data_lower = data.lower()
+              patterns = [
+                  b'test key',
+                  b'qualcomm test',
+                  b'qct test',
+                  b'engineering test',
+                  b'ou=engineering',
+                  b'ou=testing',
+                  b'qct engineering',
+                  b'android test key',
+                  b'cn=test',
+                  b'test root',
+                  b'test ca',
+                  b'engineering build',
+                  b'debug key'
+              ]
+              for p in patterns:
+                  if p in data_lower:
+                      return True
+              return False
+
+          def extract_certs_from_data(data, workdir):
+              certs = []
+              patterns = [b'\x30\x82', b'\x30\x83']
+              for pat in patterns:
+                  idx = 0
+                  while True:
+                      idx = data.find(pat, idx)
+                      if idx == -1:
+                          break
+                      length_bytes_len = 2 if pat == b'\x30\x82' else 3
+                      if idx + 2 + length_bytes_len > len(data):
+                          break
+                      length = int.from_bytes(data[idx+2:idx+2+length_bytes_len], 'big')
+                      total_len = 2 + length_bytes_len + length
+                      if idx + total_len > len(data):
+                          idx += 1
+                          continue
+                      candidate = data[idx:idx+total_len]
+                      if length < 100 or length > 65536:
+                          idx += 1
+                          continue
+                      tmp_der = os.path.join(workdir, f'cert_{idx}_{pat.hex()}.der')
+                      with open(tmp_der, 'wb') as f:
+                          f.write(candidate)
+                      try:
+                          res = subprocess.run(
+                              ['openssl', 'x509', '-inform', 'DER', '-in', tmp_der, '-noout',
+                               '-subject', '-issuer', '-fingerprint', '-sha1', '-fingerprint', '-sha256', '-serial'],
+                              capture_output=True, text=True, timeout=15
+                          )
+                          if res.returncode != 0:
+                              idx += 1
+                              continue
+                          out = res.stdout
+                          subject = ''
+                          issuer = ''
+                          sha1_fp = ''
+                          sha256_fp = ''
+                          serial = ''
+                          for line in out.splitlines():
+                              if line.startswith('subject='):
+                                  subject = line.split('=', 1)[1]
+                              elif line.startswith('issuer='):
+                                  issuer = line.split('=', 1)[1]
+                              elif line.startswith('SHA1 Fingerprint='):
+                                  sha1_fp = line.split('=', 1)[1]
+                              elif line.startswith('SHA256 Fingerprint='):
+                                  sha256_fp = line.split('=', 1)[1]
+                              elif line.startswith('serial='):
+                                  serial = line.split('=', 1)[1]
+                          res_text = subprocess.run(
+                              ['openssl', 'x509', '-inform', 'DER', '-in', tmp_der, '-noout', '-text'],
+                              capture_output=True, text=True, timeout=15
+                          )
+                          key_bits = ''
+                          key_alg = ''
+                          if res_text.returncode == 0:
+                              m = re.search(r'Public-Key: \((\d+) bit\)', res_text.stdout)
+                              if m:
+                                  key_bits = m.group(1)
+                              m_alg = re.search(r'Public Key Algorithm: (\w+)', res_text.stdout)
+                              if m_alg:
+                                  key_alg = m_alg.group(1)
+                              if 'RSA Public-Key' in res_text.stdout:
+                                  key_alg = 'RSA'
+                              elif 'EC Public-Key' in res_text.stdout:
+                                  key_alg = 'EC'
+                          root_hash = ''
+                          if subject and issuer and subject == issuer:
+                              root_hash = sha256_bytes(candidate)
+                          certs.append({
+                              'offset': idx,
+                              'subject': subject,
+                              'issuer': issuer,
+                              'serial': serial,
+                              'sha1': sha1_fp,
+                              'sha256': sha256_fp,
+                              'key_alg': key_alg,
+                              'key_bits': key_bits,
+                              'root_hash': root_hash
+                          })
+                      except Exception:
+                          pass
+                      idx += 1
+              return certs
+
+          def write_block(fh, block):
+              fh.write('\n'.join(block) + '\n\n')
+
+          report_path = os.path.join(OUTPUT_DIR, 'report.txt')
+          test_path = os.path.join(OUTPUT_DIR, 'test-key.txt')
+          not_test_path = os.path.join(OUTPUT_DIR, 'not-test-key.txt')
+
+          total_files = 0
+          test_files = 0
+          not_test_files = 0
+
+          with open(report_path, 'w', encoding='utf-8') as report_fh, \
+               open(test_path, 'w', encoding='utf-8') as test_fh, \
+               open(not_test_path, 'w', encoding='utf-8') as not_test_fh:
+
+              report_fh.write('Qualcomm Snapdragon Test-Key Analysis Report\n')
+              report_fh.write('=============================================\n\n')
+              test_fh.write('Files classified as TEST-KEY\n')
+              test_fh.write('=============================\n\n')
+              not_test_fh.write('Files classified as NOT-TEST-KEY\n')
+              not_test_fh.write('=================================\n\n')
+
+              for root, dirs, files in os.walk(INPUT_DIR):
+                  for fname in files:
+                      fpath = os.path.join(root, fname)
+                      rel = os.path.relpath(fpath, INPUT_DIR)
+                      total_files += 1
+
+                      size = os.path.getsize(fpath)
+                      md5 = md5_file(fpath)
+                      sha1 = sha1_file(fpath)
+                      sha256 = sha256_file(fpath)
+
+                      filetype_res = subprocess.run(['file', '-b', fpath], capture_output=True, text=True)
+                      filetype = filetype_res.stdout.strip() if filetype_res.returncode == 0 else 'unknown'
+
+                      try:
+                          with open(fpath, 'rb') as f:
+                              data = f.read()
+                      except Exception:
+                          data = b''
+
+                      test_detected = detect_test_key_strings(data)
+
+                      workdir = tempfile.mkdtemp()
+                      certs = extract_certs_from_data(data, workdir)
+                      shutil.rmtree(workdir, ignore_errors=True)
+
+                      cert_test_detected = any(
+                          ('test' in c['subject'].lower() or 'test' in c['issuer'].lower() or
+                           'engineering' in c['subject'].lower() or 'engineering' in c['issuer'].lower())
+                          for c in certs
+                      )
+                      is_test_key = test_detected or cert_test_detected
+
+                      block = []
+                      block.append(f'File: {rel}')
+                      block.append(f'Path: {fpath}')
+                      block.append(f'Size: {size} bytes')
+                      block.append(f'MD5: {md5}')
+                      block.append(f'SHA1: {sha1}')
+                      block.append(f'SHA256 (root_hash): {sha256}')
+                      block.append(f'File Type: {filetype}')
+
+                      if 'ELF' in filetype:
+                          readelf_h = subprocess.run(['readelf', '-h', fpath], capture_output=True, text=True)
+                          if readelf_h.returncode == 0:
+                              block.append('ELF Header:')
+                              block.append(readelf_h.stdout)
+                          readelf_n = subprocess.run(['readelf', '-n', fpath], capture_output=True, text=True)
+                          if readelf_n.returncode == 0:
+                              block.append('ELF Notes:')
+                              block.append(readelf_n.stdout)
+
+                      strings_sig = []
+                      try:
+                          strings_out = subprocess.run(['strings', fpath], capture_output=True, text=True).stdout
+                          for line in strings_out.splitlines():
+                              if any(kw in line.lower() for kw in [
+                                  'certificate', 'signature', 'sha1', 'sha256',
+                                  'rsa', 'ecdsa', 'key', 'test', 'engineering',
+                                  'root', 'hash', 'serial'
+                              ]):
+                                  if len(line) < 300:
+                                      strings_sig.append(line)
+                      except Exception:
+                          pass
+                      if strings_sig:
+                          block.append('Relevant strings (first 50):')
+                          block.extend(strings_sig[:50])
+
+                      if certs:
+                          block.append(f'Extracted Certificates: {len(certs)}')
+                          for i, c in enumerate(certs):
+                              block.append(f'  Certificate {i+1}:')
+                              block.append(f'    Offset: {c["offset"]}')
+                              block.append(f'    Subject: {c["subject"]}')
+                              block.append(f'    Issuer: {c["issuer"]}')
+                              block.append(f'    Serial: {c["serial"]}')
+                              block.append(f'    SHA1: {c["sha1"]}')
+                              block.append(f'    SHA256: {c["sha256"]}')
+                              block.append(f'    Key Algorithm: {c["key_alg"]}')
+                              block.append(f'    Key Bits: {c["key_bits"]}')
+                              if c['root_hash']:
+                                  block.append(f'    Root Certificate SHA256: {c["root_hash"]}')
+                                  block.append(f'    Root Certificate: yes')
+                      else:
+                          block.append('Extracted Certificates: 0')
+
+                      classification = 'TEST-KEY' if is_test_key else 'NOT-TEST-KEY'
+                      block.append(f'Classification: {classification}')
+
+                      write_block(report_fh, block)
+                      if is_test_key:
+                          test_files += 1
+                          write_block(test_fh, block)
+                      else:
+                          not_test_files += 1
+                          write_block(not_test_fh, block)
+
+              report_fh.write(f'\nTotal files analyzed: {total_files}\n')
+              report_fh.write(f'Test-key files: {test_files}\n')
+              report_fh.write(f'Non-test-key files: {not_test_files}\n')
+
+              test_fh.write(f'\nTotal test-key files: {test_files}\n')
+              not_test_fh.write(f'\nTotal non-test-key files: {not_test_files}\n')
+
+          print(f'Total files analyzed: {total_files}')
+          print(f'Test-key files: {test_files}')
+          print(f'Non-test-key files: {not_test_files}')
+
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualcomm-analysis-${{ github.run_id }}
+          path: output/
