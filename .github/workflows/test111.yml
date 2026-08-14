@@ -3,8 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/images.zip'
-        required: true
+        description: 'Firmware ZIP URL'
+        type: string
+        required: false
+        default: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/images.zip'
 jobs:
   analyze:
     runs-on: ubuntu-latest
