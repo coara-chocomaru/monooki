@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/m.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
 
 jobs:
   verify:
@@ -17,13 +17,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             openssl file curl unzip binutils \
-            sbsigntool python3-pip git
+            sbsigntool python3-pip wget
           pip3 install cryptography pyasn1
 
-      - name: Clone avbtool from AOSP mirror
+      - name: Download avbtool
         run: |
-          git clone --depth 1 https://github.com/aosp-mirror/platform_external_avb.git /tmp/avb
-          cp /tmp/avb/avbtool.py .
+          # Try main branch first, fallback to master
+          for branch in main master; do
+            echo "Attempting to download avbtool.py from $branch branch..."
+            wget -O avbtool.py "https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/$branch/avbtool.py" && break
+          done
+          if [ ! -f avbtool.py ]; then
+            echo "ERROR: Failed to download avbtool.py from both main and master branches."
+            exit 1
+          fi
           chmod +x avbtool.py
 
       - name: Download and extract ZIP
