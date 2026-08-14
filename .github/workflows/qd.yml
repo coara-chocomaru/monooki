@@ -1,0 +1,75 @@
+name: Vbmeta Public Key Extraction and EFI Signature Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'ZIP URL to download and analyze'
+        required: true
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/m.zip'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openssl file curl unzip binutils \
+            sbsigntool python3-pip wget
+          pip3 install cryptography pyasn1
+          # Download avbtool from AOSP master
+          wget https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/master/avbtool.py
+          chmod +x avbtool.py
+
+      - name: Download and extract ZIP
+        run: |
+          mkdir -p input output
+          curl -L "${{ github.event.inputs.url }}" -o input/firmware.zip
+          unzip -o input/firmware.zip -d input/files || true
+
+      - name: Locate vbmeta and LinuxLoader.efi
+        id: locate
+        run: |
+          VBMETA=$(find input/files -type f \( -iname "*vbmeta*" -o -iname "vbmeta.img" \) | head -n 1)
+          if [ -z "$VBMETA" ]; then
+            echo "ERROR: vbmeta file not found in the extracted archive." | tee output/error.txt
+            exit 1
+          fi
+          EFI=$(find input/files -type f -iname "LinuxLoader.efi" | head -n 1)
+          if [ -z "$EFI" ]; then
+            echo "ERROR: LinuxLoader.efi not found in the extracted archive." | tee -a output/error.txt
+            exit 1
+          fi
+          echo "VBMETA=$VBMETA" >> $GITHUB_ENV
+          echo "EFI=$EFI" >> $GITHUB_ENV
+
+      - name: Extract public key from vbmeta
+        run: |
+          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Failed to extract public key from vbmeta." | tee output/error.txt
+            exit 1
+          fi
+          echo "Public key extracted to output/key.pem"
+
+      - name: Verify LinuxLoader.efi signature using extracted public key
+        run: |
+          echo "Verifying $EFI with public key output/key.pem" | tee output/result.txt
+          sbverify --key output/key.pem "$EFI" > output/verify_output.txt 2>&1
+          STATUS=$?
+          echo "Exit code: $STATUS" | tee -a output/result.txt
+          if [ $STATUS -eq 0 ]; then
+            echo "✅ Verification SUCCESS" | tee -a output/result.txt
+          else
+            echo "❌ Verification FAILED" | tee -a output/result.txt
+          fi
+          echo "---- Detailed output ----" >> output/result.txt
+          cat output/verify_output.txt >> output/result.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-result-${{ github.run_id }}
+          path: output/
