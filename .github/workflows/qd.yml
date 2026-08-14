@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/n.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/m.zip'
 
 jobs:
   verify:
@@ -56,20 +56,27 @@ jobs:
 
       - name: Extract public key from vbmeta
         run: |
-          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.der
+          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem
           if [ $? -ne 0 ]; then
             echo "ERROR: Failed to extract public key." | tee output/error.txt
             exit 1
           fi
-          # Convert DER to PEM format (sbverify requires PEM)
-          openssl x509 -inform DER -in output/key.der -outform PEM -out output/key.pem
-          echo "Public key extracted and converted to PEM: output/key.pem"
+          echo "Public key extracted to output/key.pem"
+
+      - name: Create certificate from public key
+        run: |
+          # ダミーの自己署名証明書を生成し、その公開鍵を抽出したものに置き換える
+          openssl genrsa -out temp.key 2048
+          openssl req -new -x509 -key temp.key -out temp.crt -days 1 -subj "/CN=Temp"
+          openssl x509 -in temp.crt -set_pubkey output/key.pem -out output/cert.pem
+          rm temp.key temp.crt
+          echo "Certificate created: output/cert.pem"
 
       - name: Verify LinuxLoader.efi signature
         run: |
           set +e
-          echo "Verifying $EFI with output/key.pem" | tee output/result.txt
-          sbverify --cert output/key.pem "$EFI" > output/verify_output.txt 2>&1
+          echo "Verifying $EFI with output/cert.pem" | tee output/result.txt
+          sbverify --cert output/cert.pem "$EFI" > output/verify_output.txt 2>&1
           STATUS=$?
           set -e
           
