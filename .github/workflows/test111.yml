@@ -9,7 +9,7 @@ on:
         default: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/images.zip'
   push:
     branches:
-      - test
+      - main
   pull_request:
     branches:
       - main
@@ -145,22 +145,25 @@ jobs:
               return certs
 
           def parse_avb_footer(data):
-              if len(data) < 64:
+              if len(data) < 68:
                   return None
-              footer = data[-64:]
+              footer = data[-68:]
               if footer[0:4] != b'AVBf':
                   return None
-              vals = struct.unpack('<IIQQQQ28s', footer)
-              version_major, version_minor, original_image_size, vbmeta_offset, vbmeta_size, aux_data_size, reserved = vals
-              return {
-                  'version_major': version_major,
-                  'version_minor': version_minor,
-                  'original_image_size': original_image_size,
-                  'vbmeta_offset': vbmeta_offset,
-                  'vbmeta_size': vbmeta_size,
-                  'aux_data_size': aux_data_size,
-                  'footer_sha256': sha256_bytes(footer)
-              }
+              try:
+                  vals = struct.unpack('<IIQQQQ28s', footer)
+                  version_major, version_minor, original_image_size, vbmeta_offset, vbmeta_size, aux_data_size, reserved = vals
+                  return {
+                      'version_major': version_major,
+                      'version_minor': version_minor,
+                      'original_image_size': original_image_size,
+                      'vbmeta_offset': vbmeta_offset,
+                      'vbmeta_size': vbmeta_size,
+                      'aux_data_size': aux_data_size,
+                      'footer_sha256': sha256_bytes(footer)
+                  }
+              except struct.error:
+                  return None
 
           report = {}
           non_test_entries = []
