@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/m.zip'
 
 jobs:
   verify:
