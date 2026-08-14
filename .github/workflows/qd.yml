@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/n.zip'
 
 jobs:
   verify:
@@ -18,7 +18,7 @@ jobs:
           sudo apt-get install -y \
             openssl file curl unzip binutils \
             sbsigntool python3-pip
-          pip3 install cryptography
+          pip3 install cryptography pyasn1
 
       - name: Download and extract ZIP
         run: |
@@ -71,7 +71,7 @@ jobs:
               end = start + public_key_size
               public_key = data[start:end]
               Path("public_key4096.bin").write_bytes(public_key)
-              print("Public key extracted to public_key4096.bin")
+              print(f"Public key extracted (size: {len(public_key)} bytes) to public_key4096.bin")
               return public_key
 
           if __name__ == "__main__":
@@ -85,48 +85,61 @@ jobs:
             echo "ERROR: public_key4096.bin not created." | tee output/error.txt
             exit 1
           fi
+          ls -la public_key4096.bin
 
-      - name: Convert binary public key to PEM
+      - name: Convert binary public key to PEM (Python)
         run: |
-          # Try to interpret as DER-encoded SubjectPublicKeyInfo
-          openssl pkey -pubin -inform DER -in public_key4096.bin -outform PEM -out output/key.pem 2>/dev/null || \
-          # If that fails, try to treat as raw RSA public key (PKCS#1)
-          openssl rsa -pubin -inform DER -RSAPublicKey_in -in public_key4096.bin -outform PEM -out output/key.pem 2>/dev/null || \
-          # Fallback: use Python to create PEM from raw key
           python3 <<'EOF'
+          import os
           import sys
           from cryptography.hazmat.primitives import serialization
-          from cryptography.hazmat.primitives.asymmetric import rsa
-          from cryptography.hazmat.backends import default_backend
-          import struct
+          from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+          from pyasn1.codec.der import decoder
+          from pyasn1.type import univ
 
-          # Attempt to parse as DER SEQUENCE (SubjectPublicKeyInfo)
           data = open('public_key4096.bin', 'rb').read()
+          if len(data) == 0:
+              print("ERROR: public_key4096.bin is empty")
+              sys.exit(1)
+
+          public_key = None
+
+          # Try 1: Load as SubjectPublicKeyInfo (DER)
           try:
-              # Try to load as SubjectPublicKeyInfo
               public_key = serialization.load_der_public_key(data)
-          except Exception:
-              # Try to load as PKCS#1 RSAPublicKey
+              print("Loaded as SubjectPublicKeyInfo (DER)")
+          except Exception as e1:
+              print(f"SubjectPublicKeyInfo load failed: {e1}")
+              # Try 2: Load as RSAPublicKey (PKCS#1 DER)
               try:
-                  from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
-                  # DER-encoded RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }
-                  # We'll use pyasn1 or manual parsing, but for simplicity we fallback to openssl
+                  seq, _ = decoder.decode(data, asn1Spec=univ.Sequence())
+                  if len(seq) >= 2:
+                      n = int(seq[0])
+                      e = int(seq[1])
+                      public_numbers = RSAPublicNumbers(e=e, n=n)
+                      public_key = public_numbers.public_key()
+                      print("Loaded as RSAPublicKey (PKCS#1 DER)")
+                  else:
+                      raise ValueError("Invalid RSAPublicKey format")
+              except Exception as e2:
+                  print(f"RSAPublicKey load failed: {e2}")
                   sys.exit(1)
-              except Exception:
-                  sys.exit(1)
+
+          # Export to PEM
           pem = public_key.public_bytes(
               encoding=serialization.Encoding.PEM,
               format=serialization.PublicFormat.SubjectPublicKeyInfo
           )
+          os.makedirs('output', exist_ok=True)
           with open('output/key.pem', 'wb') as f:
               f.write(pem)
-          print("Converted to PEM using Python")
+          print("PEM public key saved to output/key.pem")
           EOF
           if [ ! -f output/key.pem ]; then
             echo "ERROR: Failed to convert public key to PEM." | tee output/error.txt
             exit 1
           fi
-          echo "PEM public key saved to output/key.pem"
+          head -n 3 output/key.pem
 
       - name: Create certificate from public key (Python)
         run: |
