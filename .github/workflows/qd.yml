@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/n.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
 
 jobs:
   verify:
@@ -22,13 +22,12 @@ jobs:
 
       - name: Download avbtool
         run: |
-          # Try main branch first, fallback to master
           for branch in main master; do
             echo "Attempting to download avbtool.py from $branch branch..."
             wget -O avbtool.py "https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/$branch/avbtool.py" && break
           done
           if [ ! -f avbtool.py ]; then
-            echo "ERROR: Failed to download avbtool.py from both main and master branches."
+            echo "ERROR: Failed to download avbtool.py."
             exit 1
           fi
           chmod +x avbtool.py
@@ -64,11 +63,15 @@ jobs:
           fi
           echo "Public key extracted to output/key.pem"
 
-      - name: Verify LinuxLoader.efi signature using extracted public key
+      - name: Verify LinuxLoader.efi signature
         run: |
+          # シェルのエラー終了を一時的に無効化（検証が失敗しても続行）
+          set +e
           echo "Verifying $EFI with output/key.pem" | tee output/result.txt
           sbverify --key output/key.pem "$EFI" > output/verify_output.txt 2>&1
           STATUS=$?
+          set -e  # 再び有効化（以降のコマンドでエラーがあれば停止）
+          
           echo "Exit code: $STATUS" | tee -a output/result.txt
           if [ $STATUS -eq 0 ]; then
             echo "✅ Verification SUCCESS" | tee -a output/result.txt
