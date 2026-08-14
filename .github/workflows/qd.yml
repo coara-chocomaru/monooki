@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/n.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
 
 jobs:
   verify:
@@ -17,20 +17,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             openssl file curl unzip binutils \
-            sbsigntool python3-pip wget
-          pip3 install cryptography pyasn1
-
-      - name: Download avbtool
-        run: |
-          for branch in main master; do
-            echo "Attempting to download avbtool.py from $branch branch..."
-            wget -O avbtool.py "https://raw.githubusercontent.com/aosp-mirror/platform_external_avb/$branch/avbtool.py" && break
-          done
-          if [ ! -f avbtool.py ]; then
-            echo "ERROR: Failed to download avbtool.py."
-            exit 1
-          fi
-          chmod +x avbtool.py
+            sbsigntool python3-pip
+          pip3 install cryptography
 
       - name: Download and extract ZIP
         run: |
@@ -54,31 +42,91 @@ jobs:
           echo "VBMETA=$VBMETA" >> $GITHUB_ENV
           echo "EFI=$EFI" >> $GITHUB_ENV
 
-      - name: Extract public key from vbmeta
-        id: extract_key
+      - name: Extract public key from vbmeta (custom script)
         run: |
-          # 実行前に出力ディレクトリを確認
-          ls -la output/
-          # avbtool 実行（標準エラーもキャプチャ）
-          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem 2>&1 | tee output/avb_output.txt
-          EXIT_CODE=$?
-          echo "avbtool exit code: $EXIT_CODE"
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "ERROR: avbtool extract_public_key failed." | tee -a output/error.txt
+          cat > extract_key.py <<'EOF'
+          #!/usr/bin/env python3
+          import hashlib
+          import struct
+          import sys
+          from pathlib import Path
+
+          HEADER_SIZE = 256
+
+          def be32(data, off):
+              return struct.unpack_from(">I", data, off)[0]
+
+          def be64(data, off):
+              return struct.unpack_from(">Q", data, off)[0]
+
+          def extract_public_key(vbmeta_file):
+              data = Path(vbmeta_file).read_bytes()
+              if data[:4] != b"AVB0":
+                  raise RuntimeError("Not a vbmeta image.")
+              auth_size = be64(data, 12)
+              aux_size = be64(data, 20)
+              public_key_offset = be64(data, 64)
+              public_key_size = be64(data, 72)
+              start = HEADER_SIZE + auth_size + public_key_offset
+              end = start + public_key_size
+              public_key = data[start:end]
+              Path("public_key4096.bin").write_bytes(public_key)
+              print("Public key extracted to public_key4096.bin")
+              return public_key
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 2:
+                  print("Usage: extract_key.py <vbmeta_file>")
+                  sys.exit(1)
+              extract_public_key(sys.argv[1])
+          EOF
+          python3 extract_key.py "$VBMETA"
+          if [ ! -f public_key4096.bin ]; then
+            echo "ERROR: public_key4096.bin not created." | tee output/error.txt
             exit 1
           fi
-          # ファイルが生成されたか確認
+
+      - name: Convert binary public key to PEM
+        run: |
+          # Try to interpret as DER-encoded SubjectPublicKeyInfo
+          openssl pkey -pubin -inform DER -in public_key4096.bin -outform PEM -out output/key.pem 2>/dev/null || \
+          # If that fails, try to treat as raw RSA public key (PKCS#1)
+          openssl rsa -pubin -inform DER -RSAPublicKey_in -in public_key4096.bin -outform PEM -out output/key.pem 2>/dev/null || \
+          # Fallback: use Python to create PEM from raw key
+          python3 <<'EOF'
+          import sys
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.backends import default_backend
+          import struct
+
+          # Attempt to parse as DER SEQUENCE (SubjectPublicKeyInfo)
+          data = open('public_key4096.bin', 'rb').read()
+          try:
+              # Try to load as SubjectPublicKeyInfo
+              public_key = serialization.load_der_public_key(data)
+          except Exception:
+              # Try to load as PKCS#1 RSAPublicKey
+              try:
+                  from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+                  # DER-encoded RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }
+                  # We'll use pyasn1 or manual parsing, but for simplicity we fallback to openssl
+                  sys.exit(1)
+              except Exception:
+                  sys.exit(1)
+          pem = public_key.public_bytes(
+              encoding=serialization.Encoding.PEM,
+              format=serialization.PublicFormat.SubjectPublicKeyInfo
+          )
+          with open('output/key.pem', 'wb') as f:
+              f.write(pem)
+          print("Converted to PEM using Python")
+          EOF
           if [ ! -f output/key.pem ]; then
-            echo "ERROR: output/key.pem was not created." | tee -a output/error.txt
-            echo "Contents of output/:" | tee -a output/error.txt
-            ls -la output/ | tee -a output/error.txt
+            echo "ERROR: Failed to convert public key to PEM." | tee output/error.txt
             exit 1
           fi
-          # ファイル内容を確認（PEMかどうか）
-          echo "First 5 lines of key.pem:"
-          head -n 5 output/key.pem
-          file output/key.pem
-          echo "Public key extracted successfully."
+          echo "PEM public key saved to output/key.pem"
 
       - name: Create certificate from public key (Python)
         run: |
@@ -90,12 +138,7 @@ jobs:
           from cryptography.x509.oid import NameOID
           import datetime
 
-          KEY_PATH = 'output/key.pem'
-          if not os.path.exists(KEY_PATH):
-              print(f"ERROR: {KEY_PATH} does not exist.")
-              exit(1)
-
-          with open(KEY_PATH, 'rb') as f:
+          with open('output/key.pem', 'rb') as f:
               public_key = serialization.load_pem_public_key(f.read())
 
           private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
