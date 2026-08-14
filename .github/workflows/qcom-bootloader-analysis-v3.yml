@@ -2,9 +2,7 @@ name: QCOM Bootloader Full Disassembly & Analysis3 (XBL & ABL, Multi-Angle)
 
 on:
   push:
-    branches: [ "main", "dev" ]
-  pull_request:
-    branches: [ "main" ]
+]
   workflow_dispatch:
 
 jobs:
