@@ -55,29 +55,49 @@ jobs:
           echo "EFI=$EFI" >> $GITHUB_ENV
 
       - name: Extract public key from vbmeta
+        id: extract_key
         run: |
-          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem
-          if [ $? -ne 0 ]; then
-            echo "ERROR: Failed to extract public key." | tee output/error.txt
+          # 実行前に出力ディレクトリを確認
+          ls -la output/
+          # avbtool 実行（標準エラーもキャプチャ）
+          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem 2>&1 | tee output/avb_output.txt
+          EXIT_CODE=$?
+          echo "avbtool exit code: $EXIT_CODE"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "ERROR: avbtool extract_public_key failed." | tee -a output/error.txt
             exit 1
           fi
-          echo "Public key extracted to output/key.pem"
+          # ファイルが生成されたか確認
+          if [ ! -f output/key.pem ]; then
+            echo "ERROR: output/key.pem was not created." | tee -a output/error.txt
+            echo "Contents of output/:" | tee -a output/error.txt
+            ls -la output/ | tee -a output/error.txt
+            exit 1
+          fi
+          # ファイル内容を確認（PEMかどうか）
+          echo "First 5 lines of key.pem:"
+          head -n 5 output/key.pem
+          file output/key.pem
+          echo "Public key extracted successfully."
 
       - name: Create certificate from public key (Python)
         run: |
           python3 <<'EOF'
+          import os
           from cryptography import x509
           from cryptography.hazmat.primitives import hashes, serialization
           from cryptography.hazmat.primitives.asymmetric import rsa
           from cryptography.x509.oid import NameOID
           import datetime
-          import os
 
-          # Load the extracted public key (PEM)
-          with open('output/key.pem', 'rb') as f:
+          KEY_PATH = 'output/key.pem'
+          if not os.path.exists(KEY_PATH):
+              print(f"ERROR: {KEY_PATH} does not exist.")
+              exit(1)
+
+          with open(KEY_PATH, 'rb') as f:
               public_key = serialization.load_pem_public_key(f.read())
 
-          # Generate a dummy private key just to sign the certificate
           private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
           subject = issuer = x509.Name([
