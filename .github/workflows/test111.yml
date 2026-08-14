@@ -1,4 +1,4 @@
-name: Qualcomm Test-Key Analysis
+name: Qualcomm Test-Key Alysis
 
 on:
   workflow_dispatch:
