@@ -7,13 +7,24 @@ on:
         type: string
         required: false
         default: 'https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/images.zip'
+  push:
+    branches:
+      - test
+  pull_request:
+    branches:
+      - main
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
       - name: Download and extract
         run: |
-          curl -L "${{ github.event.inputs.url }}" -o firmware.zip
+          URL="${{ github.event.inputs.url }}"
+          if [ -z "$URL" ]; then
+            URL="https://github.com/coara-chocomaru/monooki/releases/download/%E3%81%A6%E3%81%99%E3%81%A899/images.zip"
+          fi
+          curl -L "$URL" -o firmware.zip
           mkdir -p extracted
           unzip -o firmware.zip -d extracted
       - name: Analyze files
@@ -33,6 +44,19 @@ jobs:
           OUTPUT_DIR.mkdir(exist_ok=True)
 
           KNOWN_TEST_KEY_PUBKEY_SHA256 = set()
+
+          TEST_PATTERNS = [
+              'test',
+              'android',
+              'qualcomm',
+              'qcom',
+              'debug',
+              'eng',
+              'userdebug',
+              'sdk',
+              'generic',
+              'oem',
+          ]
 
           def sha256_bytes(b):
               return hashlib.sha256(b).hexdigest()
@@ -80,13 +104,12 @@ jobs:
               is_test = False
               match_reason = ''
               subj_issuer_lower = (subject + ' ' + issuer).lower()
-              if 'test' in subj_issuer_lower:
-                  is_test = True
-                  match_reason = 'subject/issuer contains test'
-              elif 'android' in subj_issuer_lower:
-                  is_test = True
-                  match_reason = 'subject/issuer contains android'
-              elif pubkey_pem_sha256 in KNOWN_TEST_KEY_PUBKEY_SHA256:
+              for pattern in TEST_PATTERNS:
+                  if pattern in subj_issuer_lower:
+                      is_test = True
+                      match_reason = f'subject/issuer contains pattern: {pattern}'
+                      break
+              if not is_test and pubkey_pem_sha256 in KNOWN_TEST_KEY_PUBKEY_SHA256:
                   is_test = True
                   match_reason = 'public key sha256 in known test key set'
               return {
