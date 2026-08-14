@@ -6,7 +6,7 @@ on:
       url:
         description: 'ZIP URL to download and analyze'
         required: true
-        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish_b.zip'
+        default: 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/test/n.zip'
 
 jobs:
   verify:
@@ -56,21 +56,22 @@ jobs:
 
       - name: Extract public key from vbmeta
         run: |
-          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.pem
+          ./avbtool.py extract_public_key --image "$VBMETA" --output output/key.der
           if [ $? -ne 0 ]; then
             echo "ERROR: Failed to extract public key." | tee output/error.txt
             exit 1
           fi
-          echo "Public key extracted to output/key.pem"
+          # Convert DER to PEM format (sbverify requires PEM)
+          openssl x509 -inform DER -in output/key.der -outform PEM -out output/key.pem
+          echo "Public key extracted and converted to PEM: output/key.pem"
 
       - name: Verify LinuxLoader.efi signature
         run: |
-          # シェルのエラー終了を一時的に無効化（検証が失敗しても続行）
           set +e
           echo "Verifying $EFI with output/key.pem" | tee output/result.txt
-          sbverify --key output/key.pem "$EFI" > output/verify_output.txt 2>&1
+          sbverify --cert output/key.pem "$EFI" > output/verify_output.txt 2>&1
           STATUS=$?
-          set -e  # 再び有効化（以降のコマンドでエラーがあれば停止）
+          set -e
           
           echo "Exit code: $STATUS" | tee -a output/result.txt
           if [ $STATUS -eq 0 ]; then
