@@ -49,7 +49,7 @@ jobs:
 
       - name: Thorough AVB analysis for target partitions
         run: |
-          PARTITIONS="boot dtbo odm vendor vendor_boot vbmeta vbmeta_system"
+          PARTITIONS="boot dtbo vendor system vbmeta recovery"
           {
             echo "=== AVB Full Analysis Summary ==="
             echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
